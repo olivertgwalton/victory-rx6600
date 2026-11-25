@@ -1278,6 +1278,10 @@ impl State {
         self.targets.clear();
         let mut views = Vec::with_capacity(handles.len());
         let mut keys = Vec::with_capacity(handles.len());
+        // The bound formats, for pipelines made at their draws
+        // (`crate::pipeline::note_targets`).
+        let mut formats: Vec<DXGI_FORMAT> = Vec::new();
+        let mut samples = 1u32;
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -1297,11 +1301,16 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
+                    formats.push(desc.Format);
                     views.push((None, Some(desc)));
                     keys.push((0, record.key()));
                 }
                 continue;
             };
+            // SAFETY: a plain query of a live resource.
+            let texture_desc = unsafe { texture.GetDesc() };
+            samples = texture_desc.SampleDesc.Count.max(1);
+            formats.push(record.desc().map(|d| d.Format).filter(|f| f.0 != 0).unwrap_or(texture_desc.Format));
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
@@ -1310,8 +1319,13 @@ impl State {
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
+        let mut depth_format = DXGI_FORMAT(0);
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
+            // SAFETY: a plain query of a live resource.
+            let texture_desc = unsafe { texture.GetDesc() };
+            depth_format = record.depth_desc().map(|d| d.Format).filter(|f| f.0 != 0).unwrap_or(texture_desc.Format);
+            samples = samples.max(texture_desc.SampleDesc.Count);
             self.depth = record.resource as usize;
             self.depth_state = depth_state(texture, record.depth_desc().as_ref());
             if crate::resource::depth_and_unordered(record.resource) {
@@ -1321,6 +1335,7 @@ impl State {
             crate::capture::note_target(record.resource);
             Some((texture, record))
         });
+        crate::pipeline::note_targets(&formats, depth_format, samples);
         let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))

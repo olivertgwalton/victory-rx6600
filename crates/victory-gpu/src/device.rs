@@ -369,6 +369,63 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
+    // 0x1c8 makes a graphics pipeline: words 1-4 are its register image and
+    // vertex layout (address, bytes each); from word 5 on, a slot of four
+    // words per program (code, bytes, section table, bytes), empty slots
+    // zero; each table names its shipped container by hash, and the
+    // container says its stage. The target formats come from the draws
+    // (`crate::pipeline::hand_out_native_graphics`).
+    #[cfg(windows)]
+    if SLOT == 0x1c8 && !desc.is_null() && std::env::var_os("VICTORY_NATIVE_PIPELINES").is_none_or(|v| v != "0") {
+        let mut head = [0u8; 25 * 8];
+        if crate::host::read_into(desc, &mut head) {
+            let word = |i: usize| u64::from_le_bytes(head[8 * i..8 * i + 8].try_into().unwrap());
+            let block = |at: u64, len: u64| -> Vec<u8> {
+                let mut b = vec![0u8; (len as usize).min(1 << 16)];
+                if at == 0 || b.is_empty() || !crate::host::read_into(at as *const u8, &mut b) {
+                    b.clear();
+                }
+                b
+            };
+            let (regs, layout) = (block(word(1), word(2)), block(word(3), word(4)));
+            let mut stages: Vec<(&'static str, Vec<u8>)> = Vec::new();
+            let mut missing = false;
+            let mut slot = 5;
+            while slot + 3 < 25 {
+                let (code, table, size) = (word(slot), word(slot + 2), word(slot + 3) as usize);
+                if code != 0 && table != 0 && size > 0 && size < 1 << 16 {
+                    let bytes = block(table, size as u64);
+                    if let Some(hash) = crate::native::hash_in(&bytes) {
+                        match crate::native::container(&hash).and_then(|c| Some((crate::native::stage_of(&c)?, c))) {
+                            Some(stage) => stages.push(stage),
+                            None => missing = true,
+                        }
+                    } else if std::env::var_os("VICTORY_NATIVE_DUMP").is_some() {
+                        let words: Vec<String> = bytes.chunks(4).take(48).map(|w| format!("{:08x}", u32::from_le_bytes(w.try_into().unwrap_or([0; 4])))).collect();
+                        let code_head = block(code, 64);
+                        let ch: Vec<String> = code_head.chunks(4).map(|w| format!("{:08x}", u32::from_le_bytes(w.try_into().unwrap()))).collect();
+                        tracing::warn!(slot, code = format_args!("{code:#x}"), bytes = word(slot + 1), size, table = words.join(" "), code_head = ch.join(" "), "native graphics: a slot's table without a hash");
+                    }
+                }
+                slot += 4;
+            }
+            static MADE: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+            let drawable = stages.iter().any(|(s, _)| matches!(*s, "vertex" | "mesh"));
+            if !missing && drawable && !regs.is_empty() {
+                let n = MADE[0].fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 4 || n.is_power_of_two() {
+                    let names: Vec<&str> = stages.iter().map(|(s, _)| *s).collect();
+                    tracing::info!(n, stages = ?names, regs = regs.len(), layout = layout.len(), "the title's graphics pipeline method: made from its shipped containers");
+                }
+                return crate::pipeline::hand_out_native_graphics(stages, regs, layout, _iid, out);
+            }
+            let n = MADE[1].fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 4 || n.is_power_of_two() {
+                let names: Vec<&str> = stages.iter().map(|(s, _)| *s).collect();
+                tracing::warn!(n, missing, stages = ?names, "the title's graphics pipeline method: left out (a stage without a shipped container, or no vertex or mesh stage)");
+            }
+        }
+    }
     // 0x218 makes a compute pipeline: its program's section table is the
     // description's fourth pair (words 7 and 8), which names the shipped
     // container by its hash (`crate::native`). `VICTORY_NATIVE_PIPELINES=0`

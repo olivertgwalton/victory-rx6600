@@ -138,9 +138,30 @@ pub(crate) fn container(digest: &[u8; 16]) -> Option<Vec<u8>> {
 }
 
 /// The program hash in a stage's section table: the 16 bytes after the
-/// record head `ffffffff 00000000 43000000`.
+/// record head `ffffffff 00000000 43000000`, or, in the short tables of
+/// some graphics programs (`00000002 00000024 00000046 00008440 00000043`),
+/// after their first aligned `43` word.
 pub(crate) fn hash_in(table: &[u8]) -> Option<[u8; 16]> {
     const HEAD: [u8; 12] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0x43, 0, 0, 0];
-    let at = table.windows(12).position(|w| w == HEAD)? + 12;
+    let at = match table.windows(12).position(|w| w == HEAD) {
+        Some(at) => at + 12,
+        None => table.chunks_exact(4).position(|w| w == [0x43, 0, 0, 0])? * 4 + 4,
+    };
     table.get(at..at + 16)?.try_into().ok()
+}
+
+/// The pipeline stage a container's native program runs as, named as the
+/// title's other pipeline methods name stages (`crate::pipeline`).
+pub(crate) fn stage_of(container: &[u8]) -> Option<&'static str> {
+    use victory_shader::{Container, FourCC, HwStage};
+    let c = Container::parse(container).ok()?;
+    let programs = victory_shader::native_programs(c.part(FourCC::DXIL)?.data).ok()?;
+    Some(match programs.first()?.stage {
+        HwStage::Ls | HwStage::Es | HwStage::Vs => "vertex",
+        HwStage::Ps => "pixel",
+        HwStage::Hs => "hull",
+        HwStage::Gs => "geometry",
+        HwStage::Ms => "mesh",
+        HwStage::Cs => "compute",
+    })
 }

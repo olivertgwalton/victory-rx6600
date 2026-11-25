@@ -1541,3 +1541,149 @@ mod tests {
         let _ = offsets(&inputs);
     }
 }
+
+/// GFX10 `CB_BLENDn_CONTROL` blend factors as D3D12's.
+fn gfx_blend(factor: u32) -> D3D12_BLEND {
+    match factor {
+        0 => D3D12_BLEND_ZERO,
+        1 => D3D12_BLEND_ONE,
+        2 => D3D12_BLEND_SRC_COLOR,
+        3 => D3D12_BLEND_INV_SRC_COLOR,
+        4 => D3D12_BLEND_SRC_ALPHA,
+        5 => D3D12_BLEND_INV_SRC_ALPHA,
+        6 => D3D12_BLEND_DEST_ALPHA,
+        7 => D3D12_BLEND_INV_DEST_ALPHA,
+        8 => D3D12_BLEND_DEST_COLOR,
+        9 => D3D12_BLEND_INV_DEST_COLOR,
+        10 => D3D12_BLEND_SRC_ALPHA_SAT,
+        13 | 19 => D3D12_BLEND_BLEND_FACTOR,
+        14 | 20 => D3D12_BLEND_INV_BLEND_FACTOR,
+        15 => D3D12_BLEND_SRC1_COLOR,
+        16 => D3D12_BLEND_INV_SRC1_COLOR,
+        17 => D3D12_BLEND_SRC1_ALPHA,
+        18 => D3D12_BLEND_INV_SRC1_ALPHA,
+        _ => D3D12_BLEND_ONE,
+    }
+}
+
+/// GFX10 blend combine functions as D3D12's.
+fn gfx_blend_op(f: u32) -> D3D12_BLEND_OP {
+    match f {
+        1 => D3D12_BLEND_OP_SUBTRACT,
+        2 => D3D12_BLEND_OP_MIN,
+        3 => D3D12_BLEND_OP_MAX,
+        4 => D3D12_BLEND_OP_REV_SUBTRACT,
+        _ => D3D12_BLEND_OP_ADD,
+    }
+}
+
+impl GraphicsState {
+    /// The state of a pipeline the title made with its own method (device
+    /// method 0x1c8, `crate::native`), from the description's two blocks:
+    ///
+    /// - `regs`: the GFX10 register image the console runtime keeps for the
+    ///   pipeline. Its layout varies with the stages; the eight
+    ///   `CB_BLENDn_CONTROL` words are found by their shape (bit 31,
+    ///   `DISABLE_ROP3`, set in each, fields in range), followed by
+    ///   `CB_TARGET_MASK`.
+    /// - `layout`: the vertex input: element count at 0x4c, then per
+    ///   element a u32 name length, the name (NUL included), and six u32
+    ///   (semantic index, DXGI format, slot, offset, class, step rate),
+    ///   packed; the topology type in bits 16-23 of the word at 0x24.
+    ///
+    /// The target formats, depth format and sample count are those bound
+    /// when it draws (the image keeps none). shortcut: no culling, and a
+    /// bound depth buffer is tested greater-or-equal (this title's depth is
+    /// reversed) and not written; the register words for those are not
+    /// placed yet.
+    pub(crate) fn native(regs: &[u8], layout: &[u8], targets: &[DXGI_FORMAT], depth: DXGI_FORMAT, samples: u32) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        let words: Vec<u32> = regs.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let blend_word = |w: u32| {
+            w & 0x8000_0000 != 0
+                && (w & 0x1f) <= 20
+                && (w >> 8 & 0x1f) <= 20
+                && (w >> 16 & 0x1f) <= 20
+                && (w >> 24 & 0x1f) <= 20
+                && (w >> 5 & 7) <= 4
+                && (w >> 21 & 7) <= 4
+        };
+        let at = (0..words.len().saturating_sub(8)).find(|&i| words[i..i + 8].iter().all(|&w| blend_word(w)) && words[i + 8] != 0);
+        if let Some(i) = at {
+            let mask = words[i + 8];
+            g.blend.IndependentBlendEnable = true.into();
+            for (n, target) in g.blend.RenderTarget.iter_mut().enumerate() {
+                let w = words[i + n];
+                let separate = w >> 29 & 1 != 0;
+                let (src, op, dst) = (w & 0x1f, w >> 5 & 7, w >> 8 & 0x1f);
+                let (asrc, aop, adst) = if separate { (w >> 16 & 0x1f, w >> 21 & 7, w >> 24 & 0x1f) } else { (src, op, dst) };
+                target.BlendEnable = (w >> 30 & 1 != 0).into();
+                target.SrcBlend = gfx_blend(src);
+                target.DestBlend = gfx_blend(dst);
+                target.BlendOp = gfx_blend_op(op);
+                target.SrcBlendAlpha = gfx_blend(asrc);
+                target.DestBlendAlpha = gfx_blend(adst);
+                target.BlendOpAlpha = gfx_blend_op(aop);
+                target.RenderTargetWriteMask = (mask >> (4 * n) & 0xf) as u8;
+            }
+            // Dual-source factors (the pixel shader's second output): D3D12
+            // takes them with independent blending off, target 0's for all.
+            let dual = |b: D3D12_BLEND| {
+                matches!(b, D3D12_BLEND_SRC1_COLOR | D3D12_BLEND_INV_SRC1_COLOR | D3D12_BLEND_SRC1_ALPHA | D3D12_BLEND_INV_SRC1_ALPHA)
+            };
+            let t0 = g.blend.RenderTarget[0];
+            if [t0.SrcBlend, t0.DestBlend, t0.SrcBlendAlpha, t0.DestBlendAlpha].into_iter().any(dual) {
+                g.blend.IndependentBlendEnable = false.into();
+            }
+        }
+        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        let tested = depth.0 != 0;
+        g.depth.DepthEnable = tested.into();
+        g.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        g.depth.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+        g.depth.StencilEnable = false.into();
+        // The vertex input.
+        let u32_at = |o: usize| layout.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+        if let Some(t) = u32_at(0x24).map(|w| w >> 16 & 0xff).filter(|t| (1..=4).contains(t)) {
+            g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(t as i32);
+        }
+        let count = u32_at(0x4c).unwrap_or(0).min(32) as usize;
+        let mut at = 0x50;
+        let mut elements = Vec::new();
+        for _ in 0..count {
+            let Some(len) = u32_at(at).map(|l| l as usize).filter(|&l| (1..=64).contains(&l)) else { break };
+            let Some(name) = layout.get(at + 4..at + 4 + len) else { break };
+            let name = CStr::from_bytes_until_nul(name).ok().map(|c| c.to_owned());
+            let f = at + 4 + len;
+            let (Some(index), Some(format), Some(slot), Some(offset), Some(class), Some(step)) =
+                (u32_at(f), u32_at(f + 4), u32_at(f + 8), u32_at(f + 12), u32_at(f + 16), u32_at(f + 20))
+            else {
+                break;
+            };
+            let Some(name) = name else { break };
+            elements.push((name, index, format, slot, offset, class, step));
+            at = f + 24;
+        }
+        g.names = elements.iter().map(|e| e.0.clone()).collect();
+        g.inputs = elements
+            .iter()
+            .zip(&g.names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                SemanticIndex: e.1,
+                Format: DXGI_FORMAT(crate::resource::pc_format(e.2) as i32),
+                InputSlot: e.3,
+                AlignedByteOffset: e.4,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION(e.5 as i32),
+                InstanceDataStepRate: e.6,
+            })
+            .collect();
+        g.targets.NumRenderTargets = targets.len().min(8) as u32;
+        for (slot, f) in g.targets.RTFormats.iter_mut().zip(targets) {
+            *slot = *f;
+        }
+        g.depth_format = depth;
+        g.samples = DXGI_SAMPLE_DESC { Count: samples.max(1), Quality: 0 };
+        g
+    }
+}

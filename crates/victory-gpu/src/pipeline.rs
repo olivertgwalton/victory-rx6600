@@ -16,6 +16,8 @@
 //! our null command-list limits keep from running.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+#[cfg(windows)]
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use std::collections::HashMap;
 use std::mem::offset_of;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -429,8 +431,43 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Made by the title's own method (`crate::native`): its state blocks,
+    /// and a host pipeline for each set of targets it draws to.
+    #[cfg(windows)]
+    native: Option<Box<NativeGraphics>>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
+
+/// Render target formats, their count, depth format and samples, as bound.
+#[cfg(windows)]
+type Bound = ([i32; 8], u32, i32, u32);
+
+/// A pipeline the title made with device method 0x1c8: its register image
+/// and vertex layout, and its host pipelines by the targets bound.
+#[cfg(windows)]
+pub(crate) struct NativeGraphics {
+    regs: Vec<u8>,
+    layout: Vec<u8>,
+    variants: std::sync::Mutex<Vec<(Bound, Arc<make::Pending>)>>,
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// The targets the list this thread records has bound (`draw.rs`).
+    static BOUND: std::cell::Cell<Bound> = const { std::cell::Cell::new(([0; 8], 0, 0, 1)) };
+}
+
+/// The render targets (host formats), depth format and sample count the
+/// list being recorded on this thread draws to: native graphics pipelines
+/// are made for them.
+#[cfg(windows)]
+pub(crate) fn note_targets(formats: &[DXGI_FORMAT], depth: DXGI_FORMAT, samples: u32) {
+    let mut f = [0i32; 8];
+    for (slot, x) in f.iter_mut().zip(formats) {
+        *slot = x.0;
+    }
+    BOUND.set((f, formats.len().min(8) as u32, depth.0, samples.max(1)));
+}
 
 /// Stage names, in description order.
 const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geometry"];
@@ -464,7 +501,29 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    make::ready(&pipeline(this).host)
+    let p = pipeline(this);
+    if let Some(n) = &p.native {
+        let bound = BOUND.get();
+        let pending = {
+            let mut v = n.variants.lock().unwrap_or_else(|e| e.into_inner());
+            match v.iter().find(|(b, _)| *b == bound) {
+                Some((_, pending)) => pending.clone(),
+                None => {
+                    let targets: Vec<DXGI_FORMAT> = bound.0[..bound.1 as usize].iter().map(|&f| DXGI_FORMAT(f)).collect();
+                    let g = host::GraphicsState::native(&n.regs, &n.layout, &targets, DXGI_FORMAT(bound.2), bound.3);
+                    let pending = Arc::new(make::Pending::new(p.shaders.clone(), Some(Box::new(g))));
+                    v.push((bound, pending.clone()));
+                    pending
+                }
+            }
+        };
+        let made = make::ready(&pending)?;
+        // SAFETY: the Pending stays in `variants` (never removed) as long as
+        // the pipeline, so its host pipeline outlives the references draws
+        // keep, as with `host` below.
+        return Some(unsafe { &*std::ptr::from_ref(made) });
+    }
+    make::ready(&p.host)
 }
 
 /// Host pipelines queued and not made yet.
@@ -573,6 +632,24 @@ fn hand_out(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    hand_out_with(
+        shaders,
+        #[cfg(windows)]
+        graphics,
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    )
+}
+
+fn hand_out_with(
+    shaders: Vec<Arc<Shader>>,
+    #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    #[cfg(windows)] native: Option<Box<NativeGraphics>>,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
@@ -596,6 +673,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        native,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -646,6 +725,24 @@ pub(crate) extern "system" fn create_compute(
 
 /// A compute pipeline made from a container's bytes (the title's own
 /// pipeline method, `crate::native`).
+/// A graphics pipeline made from its stages' containers and the state
+/// blocks of the title's own method (device method 0x1c8, `crate::native`).
+#[cfg(windows)]
+pub(crate) fn hand_out_native_graphics(
+    stages: Vec<(&'static str, Vec<u8>)>,
+    regs: Vec<u8>,
+    layout: Vec<u8>,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    const ORDER: [&str; 7] = ["amplification", "mesh", "vertex", "pixel", "domain", "hull", "geometry"];
+    let mut stages = stages;
+    stages.sort_by_key(|(s, _)| ORDER.iter().position(|o| o == s).unwrap_or(ORDER.len()));
+    let shaders = stages.iter().map(|(s, c)| shader(s, c)).collect();
+    let native = Box::new(NativeGraphics { regs, layout, variants: std::sync::Mutex::new(Vec::new()) });
+    hand_out_with(shaders, None, Some(native), iid, out)
+}
+
 pub(crate) fn hand_out_compute(container: &[u8], iid: *const Iid, out: *mut This) -> HRESULT {
     hand_out(
         vec![shader("compute", container)],
