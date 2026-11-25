@@ -34,6 +34,7 @@ mod lightprobe;
 mod texlate;
 #[cfg(windows)]
 mod texstore;
+mod native;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]

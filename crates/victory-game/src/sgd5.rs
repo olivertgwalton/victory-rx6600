@@ -85,6 +85,19 @@ pub fn is_sgd5(file: &[u8]) -> bool {
     memchr::memmem::find(file, MAGIC).is_some()
 }
 
+/// The record whose marker is at `at` in `file` (a range read back from a
+/// file at an offset [`Record::offset`] gave, with `at` bytes before it).
+pub fn record_at(file: &[u8], at: usize) -> Option<Record<'_>> {
+    record(file, at)
+}
+
+impl Record<'_> {
+    /// The record's bytes from its marker on (marker, sizes and stream).
+    pub fn len_from_marker(&self) -> usize {
+        self.packed.len() + 12
+    }
+}
+
 /// Every record in an SGD5 file, in file order.
 pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
     memchr::memmem::find_iter(file, &MARKER).filter_map(|at| record(file, at))

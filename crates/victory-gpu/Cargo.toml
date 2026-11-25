@@ -17,6 +17,8 @@ victory-formats.workspace = true
 victory-pipeline.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
 victory-telemetry.workspace = true
+victory-game.workspace = true
+memchr.workspace = true
 
 [build-dependencies]
 blake3.workspace = true

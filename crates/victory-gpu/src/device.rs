@@ -369,6 +369,42 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
+    // 0x218 makes a compute pipeline: its program's section table is the
+    // description's fourth pair (words 7 and 8), which names the shipped
+    // container by its hash (`crate::native`). `VICTORY_NATIVE_PIPELINES=0`
+    // leaves the method unwritten, as before.
+    #[cfg(windows)]
+    if SLOT == 0x218 && !desc.is_null() && std::env::var_os("VICTORY_NATIVE_PIPELINES").is_none_or(|v| v != "0") {
+        let mut head = [0u8; 9 * 8];
+        if crate::host::read_into(desc, &mut head) {
+            let word = |i: usize| u64::from_le_bytes(head[8 * i..8 * i + 8].try_into().unwrap());
+            let (table, size) = (word(7) as usize, word(8) as usize);
+            let mut bytes = vec![0u8; size.min(1 << 16)];
+            if table != 0
+                && size > 0
+                && crate::host::read_into(table as *const u8, &mut bytes)
+                && let Some(hash) = crate::native::hash_in(&bytes)
+            {
+                static MADE: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+                let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+                match crate::native::container(&hash) {
+                    Some(container) => {
+                        let n = MADE[0].fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 4 || n.is_power_of_two() {
+                            tracing::info!(n, hash = hex, "the title's compute pipeline method: made from its shipped container");
+                        }
+                        return crate::pipeline::hand_out_compute(&container, _iid, out);
+                    }
+                    None => {
+                        let n = MADE[1].fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 4 || n.is_power_of_two() {
+                            tracing::warn!(n, hash = hex, "the title's compute pipeline method: no shipped container has this hash");
+                        }
+                    }
+                }
+            }
+        }
+    }
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
         // pointer is known to be mapped.
