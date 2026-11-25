@@ -388,6 +388,11 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
                 b
             };
             let (regs, layout) = (block(word(1), word(2)), block(word(3), word(4)));
+            if std::env::var_os("VICTORY_NATIVE_DUMP").is_some() && calls % 97 == 1 {
+                let hex = |b: &[u8]| b.chunks(4).map(|w| format!("{:08x}", u32::from_le_bytes(w.try_into().unwrap_or([0; 4])))).collect::<Vec<_>>().join(" ");
+                let more = block(desc as u64, 64 * 8);
+                tracing::warn!(calls, desc = hex(&more), regs = hex(&regs), "native graphics: description dump");
+            }
             let mut stages: Vec<(&'static str, Vec<u8>)> = Vec::new();
             let mut missing = false;
             let mut slot = 5;

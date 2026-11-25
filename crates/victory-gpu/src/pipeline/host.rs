@@ -1599,49 +1599,107 @@ impl GraphicsState {
     pub(crate) fn native(regs: &[u8], layout: &[u8], targets: &[DXGI_FORMAT], depth: DXGI_FORMAT, samples: u32) -> GraphicsState {
         let mut g = GraphicsState::default();
         let words: Vec<u32> = regs.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
-        let blend_word = |w: u32| {
-            w & 0x8000_0000 != 0
-                && (w & 0x1f) <= 20
-                && (w >> 8 & 0x1f) <= 20
-                && (w >> 16 & 0x1f) <= 20
-                && (w >> 24 & 0x1f) <= 20
-                && (w >> 5 & 7) <= 4
-                && (w >> 21 & 7) <= 4
-        };
-        let at = (0..words.len().saturating_sub(8)).find(|&i| words[i..i + 8].iter().all(|&w| blend_word(w)) && words[i + 8] != 0);
-        if let Some(i) = at {
-            let mask = words[i + 8];
-            g.blend.IndependentBlendEnable = true.into();
-            for (n, target) in g.blend.RenderTarget.iter_mut().enumerate() {
-                let w = words[i + n];
-                let separate = w >> 29 & 1 != 0;
-                let (src, op, dst) = (w & 0x1f, w >> 5 & 7, w >> 8 & 0x1f);
-                let (asrc, aop, adst) = if separate { (w >> 16 & 0x1f, w >> 21 & 7, w >> 24 & 0x1f) } else { (src, op, dst) };
-                target.BlendEnable = (w >> 30 & 1 != 0).into();
-                target.SrcBlend = gfx_blend(src);
-                target.DestBlend = gfx_blend(dst);
-                target.BlendOp = gfx_blend_op(op);
-                target.SrcBlendAlpha = gfx_blend(asrc);
-                target.DestBlendAlpha = gfx_blend(adst);
-                target.BlendOpAlpha = gfx_blend_op(aop);
-                target.RenderTargetWriteMask = (mask >> (4 * n) & 0xf) as u8;
-            }
-            // Dual-source factors (the pixel shader's second output): D3D12
-            // takes them with independent blending off, target 0's for all.
-            let dual = |b: D3D12_BLEND| {
-                matches!(b, D3D12_BLEND_SRC1_COLOR | D3D12_BLEND_INV_SRC1_COLOR | D3D12_BLEND_SRC1_ALPHA | D3D12_BLEND_INV_SRC1_ALPHA)
-            };
-            let t0 = g.blend.RenderTarget[0];
-            if [t0.SrcBlend, t0.DestBlend, t0.SrcBlendAlpha, t0.DestBlendAlpha].into_iter().any(dual) {
-                g.blend.IndependentBlendEnable = false.into();
-            }
-        }
-        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        // The image's context registers come in one order whatever its
+        // length: CB_COLOR_CONTROL (ROP3 0xcc) anchors them, then, in words
+        // after it, PA_CL_CLIP_CNTL +8, PA_SU_SC_MODE_CNTL +9, the polygon
+        // offset's clamp, scale and offset +12..+14, DB_DEPTH_CONTROL +15,
+        // DB_STENCIL_CONTROL +16, DB_STENCILREFMASK and its back twin +17,
+        // +18, CB_BLEND0..7_CONTROL +21..+28 and CB_TARGET_MASK +29.
+        let anchor = (0..words.len().saturating_sub(30)).find(|&i| words[i] & 0xffff_ff8e == 0x00cc_0000 && words[i + 9] & 0xffc0_0000 == 0);
         let tested = depth.0 != 0;
-        g.depth.DepthEnable = tested.into();
-        g.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-        g.depth.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
-        g.depth.StencilEnable = false.into();
+        let Some(c) = anchor else {
+            // Unknown image: draw without depth or blending rather than not at all.
+            g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+            g.depth.DepthEnable = false.into();
+            g.depth.StencilEnable = false.into();
+            return g.finish(layout, targets, depth, samples);
+        };
+        let color_on = words[c] >> 4 & 7 != 0;
+        let mask = if color_on { words[c + 29] } else { 0 };
+        g.blend.IndependentBlendEnable = true.into();
+        for (n, target) in g.blend.RenderTarget.iter_mut().enumerate() {
+            let w = words[c + 21 + n];
+            let separate = w >> 29 & 1 != 0;
+            let (src, op, dst) = (w & 0x1f, w >> 5 & 7, w >> 8 & 0x1f);
+            let (asrc, aop, adst) = if separate { (w >> 16 & 0x1f, w >> 21 & 7, w >> 24 & 0x1f) } else { (src, op, dst) };
+            target.BlendEnable = (w >> 30 & 1 != 0).into();
+            target.SrcBlend = gfx_blend(src);
+            target.DestBlend = gfx_blend(dst);
+            target.BlendOp = gfx_blend_op(op);
+            target.SrcBlendAlpha = gfx_blend(asrc);
+            target.DestBlendAlpha = gfx_blend(adst);
+            target.BlendOpAlpha = gfx_blend_op(aop);
+            target.RenderTargetWriteMask = (mask >> (4 * n) & 0xf) as u8;
+        }
+        // Dual-source factors (the pixel shader's second output): D3D12
+        // takes them with independent blending off, target 0's for all.
+        let dual = |b: D3D12_BLEND| {
+            matches!(b, D3D12_BLEND_SRC1_COLOR | D3D12_BLEND_INV_SRC1_COLOR | D3D12_BLEND_SRC1_ALPHA | D3D12_BLEND_INV_SRC1_ALPHA)
+        };
+        let t0 = g.blend.RenderTarget[0];
+        if [t0.SrcBlend, t0.DestBlend, t0.SrcBlendAlpha, t0.DestBlendAlpha].into_iter().any(dual) {
+            g.blend.IndependentBlendEnable = false.into();
+        }
+        // Rasterizer: PA_SU_SC_MODE_CNTL (CULL_FRONT 0, CULL_BACK 1, FACE 2
+        // with 0 counter-clockwise front, POLY_MODE 3-4, front type 5-7,
+        // polygon offset front 11 / back 12) and PA_CL_CLIP_CNTL's
+        // ZCLIP_NEAR/FAR_DISABLE (26, 27).
+        let mode = words[c + 9];
+        g.rasterizer.CullMode = match (mode & 1 != 0, mode >> 1 & 1 != 0) {
+            (_, _) if std::env::var_os("VICTORY_NATIVE_CULL").is_some_and(|v| v == "0") => D3D12_CULL_MODE_NONE,
+            (true, false) => D3D12_CULL_MODE_FRONT,
+            (false, true) => D3D12_CULL_MODE_BACK,
+            _ => D3D12_CULL_MODE_NONE,
+        };
+        g.rasterizer.FrontCounterClockwise = (mode >> 2 & 1 == 0).into();
+        if mode >> 3 & 3 != 0 && mode >> 5 & 7 == 1 {
+            g.rasterizer.FillMode = D3D12_FILL_MODE_WIREFRAME;
+        }
+        if mode >> 11 & 3 != 0 {
+            let f = |i: usize| f32::from_bits(words[c + i]);
+            g.rasterizer.DepthBiasClamp = f(12);
+            g.rasterizer.SlopeScaledDepthBias = f(13) / 16.0;
+            g.rasterizer.DepthBias = f(14).round() as i32;
+        }
+        g.rasterizer.DepthClipEnable = (words[c + 8] >> 26 & 3 == 0).into();
+        // DB_DEPTH_CONTROL: STENCIL_ENABLE 0, Z_ENABLE 1, Z_WRITE_ENABLE 2,
+        // DEPTH_BOUNDS_ENABLE 3, ZFUNC 4-6, BACKFACE_ENABLE 7, STENCILFUNC
+        // 8-10, STENCILFUNC_BF 20-22; the hardware's compares are D3D12's
+        // less one. DB_STENCIL_CONTROL: fail, z-pass, z-fail 4 bits each,
+        // then the back's.
+        let dc = words[c + 15];
+        let func = |f: u32| D3D12_COMPARISON_FUNC((f & 7) as i32 + 1);
+        g.depth.DepthEnable = (tested && dc >> 1 & 1 != 0).into();
+        g.depth.DepthWriteMask = if dc >> 2 & 1 != 0 { D3D12_DEPTH_WRITE_MASK_ALL } else { D3D12_DEPTH_WRITE_MASK_ZERO };
+        g.depth.DepthFunc = func(dc >> 4);
+        g.depth_bounds = tested && dc >> 3 & 1 != 0;
+        g.depth.StencilEnable = (tested && dc & 1 != 0).into();
+        let op = |o: u32| match o & 0xf {
+            1 => D3D12_STENCIL_OP_ZERO,
+            2 | 3 | 4 => D3D12_STENCIL_OP_REPLACE,
+            5 => D3D12_STENCIL_OP_INCR_SAT,
+            6 => D3D12_STENCIL_OP_DECR_SAT,
+            7 => D3D12_STENCIL_OP_INVERT,
+            8 => D3D12_STENCIL_OP_INCR,
+            9 => D3D12_STENCIL_OP_DECR,
+            _ => D3D12_STENCIL_OP_KEEP,
+        };
+        let sc = words[c + 16];
+        let face = |shift: u32, f: u32| D3D12_DEPTH_STENCILOP_DESC {
+            StencilFailOp: op(sc >> shift),
+            StencilPassOp: op(sc >> (shift + 4)),
+            StencilDepthFailOp: op(sc >> (shift + 8)),
+            StencilFunc: func(f),
+        };
+        g.depth.FrontFace = face(0, dc >> 8);
+        g.depth.BackFace = if dc >> 7 & 1 != 0 { face(12, dc >> 20) } else { g.depth.FrontFace };
+        g.depth.StencilReadMask = (words[c + 17] >> 8) as u8;
+        g.depth.StencilWriteMask = (words[c + 17] >> 16) as u8;
+        g.finish(layout, targets, depth, samples)
+    }
+
+    fn finish(mut self, layout: &[u8], targets: &[DXGI_FORMAT], depth: DXGI_FORMAT, samples: u32) -> GraphicsState {
+        let g = &mut self;
         // The vertex input.
         let u32_at = |o: usize| layout.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
         if let Some(t) = u32_at(0x24).map(|w| w >> 16 & 0xff).filter(|t| (1..=4).contains(t)) {
@@ -1684,6 +1742,6 @@ impl GraphicsState {
         }
         g.depth_format = depth;
         g.samples = DXGI_SAMPLE_DESC { Count: samples.max(1), Quality: 0 };
-        g
+        self
     }
 }
