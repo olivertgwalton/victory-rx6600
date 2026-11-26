@@ -283,6 +283,11 @@ struct Views {
     pages: BTreeMap<(usize, u64), Vec<usize>>,
     /// Of those, how many are shown more than once.
     pages_twice: usize,
+    /// The addresses of the 64 KiB pages shown at more than one address
+    /// (each of those addresses): [`shown_elsewhere`] looks at these alone,
+    /// not at every page of a range (it is asked at every write-tracking
+    /// scan, over ranges of hundreds of MiB with a handful of such pages).
+    aliased: std::collections::BTreeSet<usize>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
     /// Our own view of a whole section, by its handle (0: the host gave
@@ -296,6 +301,7 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     views: BTreeMap::new(),
     pages: BTreeMap::new(),
     pages_twice: 0,
+    aliased: std::collections::BTreeSet::new(),
     sections: Vec::new(),
     whole: Vec::new(),
 });
@@ -364,7 +370,11 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
             let shown = v.pages.entry((section, offset + (k * K64) as u64)).or_default();
             shown.push(at + k * K64);
             let twice = shown.len() == 2;
+            let all = (shown.len() >= 2).then(|| shown.clone());
             v.pages_twice += usize::from(twice);
+            if let Some(all) = all {
+                v.aliased.extend(all);
+            }
         }
     }
     // This view is writable from now on: a guard over the same bytes at
@@ -399,6 +409,12 @@ pub(crate) fn views_gone(at: usize, len: usize) {
                     v.pages.remove(&key);
                 }
                 v.pages_twice = v.pages_twice.saturating_sub(usize::from(before >= 2 && after < 2));
+                v.aliased.remove(&page);
+                if after == 1
+                    && let Some(&alone) = v.pages.get(&key).and_then(|p| p.first())
+                {
+                    v.aliased.remove(&alone);
+                }
             }
         }
     }
@@ -413,16 +429,18 @@ pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize
     if start >= end || v.pages_twice == 0 {
         return out;
     }
-    let first = v.views.range(..=start).next_back().filter(|(base, view)| *base + view.0 > start).map(|(base, _)| *base);
-    for (&base, &(bytes, section, offset)) in v.views.range(first.unwrap_or(start)..end) {
-        let from = start.max(base) & !(K64 - 1);
-        for page in (from..end.min(base + bytes)).step_by(K64) {
-            let Some(shown) = v.pages.get(&(section, offset + (page - base) as u64)) else {
-                continue;
-            };
-            if (2..=crate::watch::MANY_VIEWS).contains(&shown.len()) {
-                out.push((page, shown.iter().copied().filter(|&at| at != page).collect()));
-            }
+    for &page in v.aliased.range(start & !(K64 - 1)..end) {
+        let Some((&base, &(bytes, section, offset))) = v.views.range(..=page).next_back() else {
+            continue;
+        };
+        if page >= base + bytes {
+            continue;
+        }
+        let Some(shown) = v.pages.get(&(section, offset + (page - base) as u64)) else {
+            continue;
+        };
+        if (2..=crate::watch::MANY_VIEWS).contains(&shown.len()) {
+            out.push((page, shown.iter().copied().filter(|&at| at != page).collect()));
         }
     }
     out

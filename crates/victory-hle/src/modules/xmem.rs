@@ -959,6 +959,9 @@ pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
         return;
     }
     for (at, bytes) in shown_at(pages, offset, len) {
+        // (Written through a view of ours: the kernel's tracking of the
+        // title's views did not see it.)
+        victory_gpu::written_through_own_view(at, bytes);
         if stream_notice() {
             victory_gpu::kernel_will_write(at, bytes);
         } else {

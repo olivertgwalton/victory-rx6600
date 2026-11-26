@@ -30,6 +30,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Condvar, Mutex, RwLock};
 
+pub(crate) mod kernel_track;
+
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.
@@ -3151,6 +3153,7 @@ impl Guards {
     /// A write fault opened `block`.
     fn opened(&self, block: usize) {
         const MANY: usize = 1 << 13;
+        kernel_track::faulted(block);
         let rest = rest();
         let mut opened = self.opened.lock().unwrap_or_else(|e| e.into_inner());
         if opened.len() >= MANY {
@@ -3530,6 +3533,8 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let known = g.clean.word(word) & !BESIDE.word(word) | g.absent.word(word);
         written.extend(BitsOf(!known & in_word(word * 64, first, last)).map(|bit| word * 64 + bit));
     }
+    let hot = kernel_track::hot_in(first, last);
+    let mut to_kernel = Vec::new();
     let mut run: Option<(usize, usize)> = None;
     for &block in &written {
         if let Some((from, to)) = run
@@ -3543,8 +3548,18 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             g = guards_timed();
         }
         // Told as written by this, and read by the caller after.
-        if BESIDE.take(block) {
+        let beside = BESIDE.take(block);
+        if beside {
             put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        if left_to_kernel(&g, &hot, block) {
+            if let Some((from, to)) = run.take() {
+                protect(&g, from, to);
+            }
+            if !beside {
+                to_kernel.push(block);
+            }
+            continue;
         }
         if g.protected.contains(block) {
             // Read-only by way of another view of its page, or not clean
@@ -3569,9 +3584,30 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         protect(&g, from, to);
     }
     drop(g);
+    told_by_kernel(&mut written, &to_kernel);
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Asked, first, last, written.len() as u64);
     Some(written)
+}
+
+/// Whether the guards leave `block`, not clean, to the kernel's tracking
+/// ([`kernel_track`]): one of the hot blocks `hot` (in order), not read-only
+/// by our hand (a block is hot from the fault that opened it), and not one
+/// whose state the runtime is changing.
+fn left_to_kernel(g: &Guards, hot: &[usize], block: usize) -> bool {
+    !hot.is_empty() && hot.binary_search(&block).is_ok() && !g.protected.contains(block) && !g.foreign.contains(&block) && !g.left_alone(block)
+}
+
+/// Takes out of `written` the blocks of `to_kernel` the kernel says nobody
+/// wrote since they were last asked about (with the guards' lock not held).
+fn told_by_kernel(written: &mut Vec<usize>, to_kernel: &[usize]) {
+    if to_kernel.is_empty() {
+        return;
+    }
+    let quiet = kernel_track::quiet(to_kernel);
+    if !quiet.is_empty() {
+        written.retain(|block| !quiet.contains(block));
+    }
 }
 
 /// The rest of [`guard`] with renderer port #6: the lock shared, and a
@@ -3599,6 +3635,8 @@ fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::ti
         let known = g.clean.word(word) & !BESIDE.word(word) | g.absent.word(word);
         written.extend(BitsOf(!known & in_word(word * 64, first, last)).map(|bit| word * 64 + bit));
     }
+    let hot = kernel_track::hot_in(first, last);
+    let mut to_kernel = Vec::new();
     let mut run: Option<(usize, usize)> = None;
     for &block in &written {
         if let Some((from, to)) = run
@@ -3608,8 +3646,18 @@ fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::ti
             run = None;
         }
         // Told as written by this, and read by the caller after.
-        if BESIDE.take(block) {
+        let beside = BESIDE.take(block);
+        if beside {
             put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        if left_to_kernel(&g, &hot, block) {
+            if let Some((from, to)) = run.take() {
+                protect_claimed(&g, from, to);
+            }
+            if !beside {
+                to_kernel.push(block);
+            }
+            continue;
         }
         if g.protected.contains(block) {
             if let Some((from, to)) = run.take() {
@@ -3633,6 +3681,7 @@ fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::ti
         protect_claimed(&g, from, to);
     }
     drop(g);
+    told_by_kernel(&mut written, &to_kernel);
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Asked, first, last, written.len() as u64);
     written
@@ -4940,6 +4989,8 @@ fn forget_views(first: usize, last: usize) {
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
 fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'static, Guards> {
+    // What the kernel tracked there is another mapping now.
+    kernel_track::forget(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -8007,5 +8058,21 @@ mod rearm_tests {
         assert_eq!(NOT_REARMED.load(Relaxed), before + 2);
         // SAFETY: our allocation.
         unsafe { VirtualFree(page as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
+/// The runtime wrote `[at, at + len)` through a view of its own (xmem's
+/// physical pages, DirectStorage's page destinations): no page-table entry
+/// the kernel tracks for us saw it, so its pages, and their other views, are
+/// journaled as written here.
+pub fn written_through_own_view(at: usize, len: usize) {
+    let pages = kernel_track::wrote(at, at.saturating_add(len));
+    if pages.is_empty() {
+        return;
+    }
+    let mut j = journal_mut();
+    let now = next_asking();
+    for page in pages {
+        j.notes.note(page, WHOLE, now);
     }
 }

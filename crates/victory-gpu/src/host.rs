@@ -3905,6 +3905,7 @@ impl RelayBack {
 /// For the frame-rate line, with [`late`]: what the line of flights did
 /// per frame since the last one.
 fn late_line(frames: f64) {
+    crate::watch::kernel_track::line(frames);
     if !late() {
         return;
     }
