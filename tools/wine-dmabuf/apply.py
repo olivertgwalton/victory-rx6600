@@ -10,19 +10,23 @@ as a dma-buf, with no copy:
                      wraps a dma-buf fd imports it as
                      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, after
                      vkGetMemoryFdPropertiesKHR accepts the memory type, and
-                     fails with VK_ERROR_INVALID_EXTERNAL_HANDLE otherwise.
+                     fails with VK_ERROR_INVALID_EXTERNAL_HANDLE otherwise;
+                     a buffer for Win32-handle memory also declares
+                     DMA_BUF_BIT_EXT, so it may be bound to such an import,
+                     and one for host allocations keeps that bit (it was
+                     dropped, and the buffer declared no type at all).
 
 Run in the Wine source directory. Applying twice changes nothing.
 """
 import sys
 
-def patch(path, old, new, marker):
+def patch(path, old, new, marker, times=1):
     s = open(path).read()
     if marker in s:
         print(f"{path}: already patched")
         return
-    if s.count(old) != 1:
-        sys.exit(f"{path}: expected text found {s.count(old)} times")
+    if s.count(old) != times:
+        sys.exit(f"{path}: expected text found {s.count(old)} times, not {times}")
     open(path, "w").write(s.replace(old, new))
     print(f"{path}: patched")
 
@@ -94,3 +98,31 @@ patch("dlls/win32u/vulkan.c",
         else fd_info.handleType = get_host_external_memory_type();
 """,
       "dma-buf import refused")
+
+patch("dlls/win32u/vulkan.c",
+      """        case VK_STRUCTURE_TYPE_DEDICATED_ALLOCATION_BUFFER_CREATE_INFO_NV: break;
+        case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO:
+            external_info = (VkExternalMemoryBufferCreateInfo *)*next;
+            external_info->handleTypes = map_external_memory_handle_types( external_info->handleTypes );
+            break;
+""",
+      """        case VK_STRUCTURE_TYPE_DEDICATED_ALLOCATION_BUFFER_CREATE_INFO_NV: break;
+        case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO:
+            external_info = (VkExternalMemoryBufferCreateInfo *)*next;
+            {
+                /* Win32 handles are imported as the host's type or, wrapping a
+                 * dma-buf, as one (vkAllocateMemory): a buffer for such memory
+                 * may be bound to either, and RADV takes both together. Host
+                 * allocations (VK_EXT_external_memory_host) keep their bits. */
+                const UINT host_bits = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT |
+                                       VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT;
+                UINT types = external_info->handleTypes;
+
+                external_info->handleTypes = map_external_memory_handle_types( types & ~host_bits ) | (types & host_bits);
+                if ((types & EXTERNAL_MEMORY_WIN32_BITS) && device->extensions.has_VK_EXT_external_memory_dma_buf)
+                    external_info->handleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            }
+            break;
+""",
+      "may be bound to either",
+      times=2)  # vkCreateBuffer and vkGetDeviceBufferMemoryRequirements

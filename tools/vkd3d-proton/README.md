@@ -10,6 +10,5 @@ vkd3d-proton (upstream `cae8353` plus GE's patches), each once, by subject.
   `crate::dmabuf::export` is the process's own section pages, with no copy.
   Failure is returned, not covered with an allocation of its own (which
   `OpenExistingHeapFromFileMapping` does under Wine: the probe's "section in
-  place" reads false). Known gap: the heap's global buffer is created
-  without `VkExternalMemoryBufferCreateInfo`, which RADV does not check but
-  the validation layer would flag.
+  place" reads false). The heap's global buffer declares the import's
+  handle type (`vkd3d_create_buffer_external`).

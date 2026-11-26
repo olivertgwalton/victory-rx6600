@@ -1,4 +1,4 @@
-From 42c46aa40ef92e0b1ca0c44df6bdcc6f1834bf87 Mon Sep 17 00:00:00 2001
+From 8374c877fa45539961e2fc134668ba3b8c65728c Mon Sep 17 00:00:00 2001
 From: Oliver Walton <olivertgwalton03@gmail.com>
 Date: Thu, 26 Nov 2026 17:31:21 +0000
 Subject: [PATCH] vkd3d: Open shared heaps from dma-buf handles
@@ -14,9 +14,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  libs/vkd3d/device.c        | 25 +++++++++++++++++++
  libs/vkd3d/heap.c          | 50 ++++++++++++++++++++++++++++++++++++--
- libs/vkd3d/memory.c        |  1 +
- libs/vkd3d/vkd3d_private.h |  4 +++
- 4 files changed, 78 insertions(+), 2 deletions(-)
+ libs/vkd3d/memory.c        | 25 ++++++++++++++++---
+ libs/vkd3d/resource.c      | 16 ++++++++++--
+ libs/vkd3d/vkd3d_private.h |  8 ++++++
+ 5 files changed, 117 insertions(+), 7 deletions(-)
 
 diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
 index 6aa9234c..e9759f96 100644
@@ -134,10 +135,62 @@ index 341e3e5f..d6fda706 100644
 +    return S_OK;
 +}
 diff --git a/libs/vkd3d/memory.c b/libs/vkd3d/memory.c
-index 45300738..393ef457 100644
+index 45300738..fb28533a 100644
 --- a/libs/vkd3d/memory.c
 +++ b/libs/vkd3d/memory.c
-@@ -2335,6 +2335,7 @@ HRESULT vkd3d_allocate_heap_memory(struct d3d12_device *device, struct vkd3d_mem
+@@ -858,7 +858,8 @@ static HRESULT vkd3d_select_memory_flags(struct d3d12_device *device, const D3D1
+     return S_OK;
+ }
+ 
+-static HRESULT vkd3d_create_global_buffer(struct d3d12_device *device, VkDeviceSize size, const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, VkBuffer *vk_buffer)
++static HRESULT vkd3d_create_global_buffer(struct d3d12_device *device, VkDeviceSize size, const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags,
++        VkExternalMemoryHandleTypeFlags external_types, VkBuffer *vk_buffer)
+ {
+     D3D12_RESOURCE_DESC1 resource_desc;
+ 
+@@ -878,7 +879,7 @@ static HRESULT vkd3d_create_global_buffer(struct d3d12_device *device, VkDeviceS
+             heap_properties->Type != D3D12_HEAP_TYPE_READBACK)
+         resource_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+ 
+-    return vkd3d_create_buffer(device, heap_properties, heap_flags, &resource_desc, "global-buffer", vk_buffer);
++    return vkd3d_create_buffer_external(device, heap_properties, heap_flags, &resource_desc, "global-buffer", external_types, vk_buffer);
+ }
+ 
+ static void vkd3d_report_memory_budget(struct d3d12_device *device)
+@@ -1386,6 +1387,22 @@ static bool vkd3d_is_imported_allocation(const struct vkd3d_allocate_memory_info
+     return false;
+ }
+ 
++/* The handle type of the memory an allocation imports by handle, or 0: a
++ * buffer bound to such memory must declare it. */
++static VkExternalMemoryHandleTypeFlags vkd3d_imported_handle_types(const struct vkd3d_allocate_memory_info *info)
++{
++    const VkBaseInStructure *next = info->pNext;
++
++    while (next)
++    {
++        if (next->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR)
++            return ((const VkImportMemoryWin32HandleInfoKHR *)next)->handleType;
++        next = next->pNext;
++    }
++
++    return 0;
++}
++
+ static bool d3d12_device_aligns_bda_64k(struct d3d12_device *device)
+ {
+     /* Only seems to affect Turnip for now at least.
+@@ -1488,7 +1505,8 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
+              * and derive the exact memory requirements from that. Any buffer
+              * resources are just going to use this buffer with an offset. */
+             if (FAILED(hr = vkd3d_create_global_buffer(device, padded_memory_requirement_size,
+-                    &info->heap_properties, info->heap_flags, &allocation->resource.vk_buffer)))
++                    &info->heap_properties, info->heap_flags,
++                    vkd3d_imported_handle_types(info), &allocation->resource.vk_buffer)))
+                 return hr;
+         }
+ 
+@@ -2335,6 +2353,7 @@ HRESULT vkd3d_allocate_heap_memory(struct d3d12_device *device, struct vkd3d_mem
      alloc_info.heap_properties = info->heap_desc.Properties;
      alloc_info.heap_flags = info->heap_desc.Flags;
      alloc_info.host_ptr = info->host_ptr;
@@ -145,8 +198,45 @@ index 45300738..393ef457 100644
      alloc_info.vk_memory_priority = info->vk_memory_priority;
      alloc_info.explicit_global_buffer_usage = info->explicit_global_buffer_usage;
  
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 39e4b0b6..91c4db19 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -169,6 +169,15 @@ static inline VkDeviceSize adjust_sparse_buffer_size(VkDeviceSize size)
+ HRESULT vkd3d_create_buffer(struct d3d12_device *device,
+         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags,
+         const D3D12_RESOURCE_DESC1 *desc, const char *tag, VkBuffer *vk_buffer)
++{
++    return vkd3d_create_buffer_external(device, heap_properties, heap_flags, desc, tag, 0, vk_buffer);
++}
++
++/* vkd3d_create_buffer() for memory of external_types (imported), if not 0. */
++HRESULT vkd3d_create_buffer_external(struct d3d12_device *device,
++        const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags,
++        const D3D12_RESOURCE_DESC1 *desc, const char *tag,
++        VkExternalMemoryHandleTypeFlags external_types, VkBuffer *vk_buffer)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+     VkBufferDeviceAddressAlignmentAllocateInfoVALVE alignment_info;
+@@ -187,11 +196,14 @@ HRESULT vkd3d_create_buffer(struct d3d12_device *device,
+ 
+     /* This is only used by OpenExistingHeapFrom*,
+      * and external host memory is the only way for us to do CROSS_ADAPTER. */
+-    if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER)
++    if (!external_types && (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER))
++        external_types = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
++
++    if (external_types)
+     {
+         external_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+         external_info.pNext = NULL;
+-        external_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
++        external_info.handleTypes = external_types;
+         vk_prepend_struct(&buffer_info, &external_info);
+     }
+ 
 diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
-index e63dc7b7..f329ea63 100644
+index e63dc7b7..f0580753 100644
 --- a/libs/vkd3d/vkd3d_private.h
 +++ b/libs/vkd3d/vkd3d_private.h
 @@ -822,6 +822,8 @@ struct vkd3d_allocate_heap_memory_info
@@ -167,6 +257,17 @@ index e63dc7b7..f329ea63 100644
  HRESULT d3d12_device_validate_custom_heap_type(struct d3d12_device *device,
          const D3D12_HEAP_PROPERTIES *heap_properties);
  
+@@ -1317,6 +1321,10 @@ void vkd3d_free_device_memory(struct d3d12_device *device,
+ HRESULT vkd3d_allocate_internal_buffer_memory(struct d3d12_device *device, VkBuffer vk_buffer,
+         VkMemoryPropertyFlags type_flags, VkMemoryAllocateFlags allocate_flags,
+         struct vkd3d_device_memory_allocation *allocation);
++HRESULT vkd3d_create_buffer_external(struct d3d12_device *device,
++        const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags,
++        const D3D12_RESOURCE_DESC1 *desc, const char *tag,
++        VkExternalMemoryHandleTypeFlags external_types, VkBuffer *vk_buffer);
+ HRESULT vkd3d_create_buffer(struct d3d12_device *device,
+         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags,
+         const D3D12_RESOURCE_DESC1 *desc, const char *tag, VkBuffer *vk_buffer);
 -- 
 2.56.1
 
