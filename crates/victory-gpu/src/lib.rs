@@ -23,6 +23,10 @@ mod budget;
 mod wine_dxc;
 #[cfg(windows)]
 mod uffd;
+#[cfg(windows)]
+mod unixlib;
+#[cfg(windows)]
+pub(crate) mod dmabuf;
 mod lightprobe;
 #[cfg(windows)]
 mod texlate;

@@ -13,84 +13,27 @@
 //! hands it pages shown at one address alone. Off unless `VICTORY_UFFD=1`
 //! (and the library is found, through `WINEDLLPATH`).
 
-use std::ffi::c_void;
 use std::sync::OnceLock;
 
-use windows::Win32::Foundation::HANDLE;
-use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
-use windows::Win32::System::Threading::GetCurrentProcess;
-use windows::core::{s, w};
+use crate::unixlib::{Lib, UFFD_INIT as INIT, UFFD_SCAN as SCAN, UFFD_TRACK as TRACK, UFFD_UNTRACK as UNTRACK};
 
-type Dispatcher = unsafe extern "system" fn(u64, u32, *mut c_void) -> i32;
-type Query = unsafe extern "system" fn(HANDLE, *const c_void, u32, *mut c_void, usize, *mut usize) -> i32;
-
-/// `MemoryWineUnixFuncs`: the Unix library of a builtin module.
-const MEMORY_WINE_UNIX_FUNCS: u32 = 1000;
-const INIT: u32 = 0;
-const TRACK: u32 = 1;
-const UNTRACK: u32 = 2;
-const SCAN: u32 = 3;
-
-struct Lib {
-    handle: u64,
-    /// ntdll's `__wine_unix_call_dispatcher`, a pointer to the function.
-    dispatcher: *const Dispatcher,
-}
-
-// SAFETY: the handle and ntdll's dispatcher are process-wide and the Unix
-// side takes no lock of ours.
-unsafe impl Send for Lib {}
-// SAFETY: as above.
-unsafe impl Sync for Lib {}
-
-impl Lib {
-    fn call(&self, code: u32, args: &mut [u64]) -> bool {
-        // SAFETY: ntdll's dispatcher with our library's handle; `args` is
-        // the layout the Unix side reads and writes for `code`.
-        unsafe { (*self.dispatcher)(self.handle, code, args.as_mut_ptr().cast()) == 0 }
-    }
-}
-
+/// The library, with its userfaultfd made, if `VICTORY_UFFD=1`.
 fn lib() -> Option<&'static Lib> {
-    static LIB: OnceLock<Option<Lib>> = OnceLock::new();
-    LIB.get_or_init(|| {
-        if std::env::var_os("VICTORY_UFFD").is_none_or(|v| v != "1") || !crate::wine_dxc::under_wine() {
-            return None;
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        if std::env::var_os("VICTORY_UFFD").is_none_or(|v| v != "1") {
+            return false;
         }
-        // SAFETY: loading our builtin and asking ntdll for its Unix library;
-        // the export and the query are Wine's own (Wine 9 and later).
-        let lib = unsafe {
-            let Ok(dll) = LoadLibraryW(w!("victory_unix.dll")) else {
-                tracing::info!("write tracking in the kernel: victory_unix.dll not found (WINEDLLPATH); the write watch and guards answer");
-                return None;
-            };
-            let nt = GetModuleHandleW(w!("ntdll.dll")).ok()?;
-            let query: Query = std::mem::transmute(GetProcAddress(nt, s!("NtQueryVirtualMemory"))?);
-            let dispatcher = GetProcAddress(nt, s!("__wine_unix_call_dispatcher"))? as *const Dispatcher;
-            let mut handle = 0u64;
-            let status = query(
-                GetCurrentProcess(),
-                dll.0 as *const c_void,
-                MEMORY_WINE_UNIX_FUNCS,
-                (&raw mut handle).cast(),
-                size_of::<u64>(),
-                std::ptr::null_mut(),
-            );
-            if status != 0 {
-                tracing::warn!(status = format!("{status:#x}"), "write tracking in the kernel: victory_unix.dll has no Unix library");
-                return None;
-            }
-            Lib { handle, dispatcher }
-        };
+        let Some(lib) = crate::unixlib::lib() else { return false };
         let mut a = [0u64; 1];
         if !lib.call(INIT, &mut a) {
             tracing::warn!(error = a[0] as i64, "write tracking in the kernel: no userfaultfd (vm.unprivileged_userfaultfd, or an older kernel)");
-            return None;
+            return false;
         }
         tracing::info!(features = format!("{:#x}", a[0]), "write tracking in the kernel: userfaultfd write-protect and PAGEMAP_SCAN");
-        Some(lib)
-    })
-    .as_ref()
+        true
+    });
+    if on { crate::unixlib::lib() } else { None }
 }
 
 /// Whether the kernel tracks writes for us.

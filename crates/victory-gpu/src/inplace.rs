@@ -261,9 +261,15 @@ fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
 /// A buffer of `size` bytes at `offset` (a multiple of 64 KiB) of an
 /// opened heap, which shaders may read and write, in the common state.
 pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size: u64) -> windows::core::Result<ID3D12Resource> {
-    let mut placed: Option<ID3D12Resource> = None;
     // The heap is cross-adapter shared, so the buffer must say so too.
-    let flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    place_with(device, heap, offset, size, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+}
+
+/// [`place`] with flags of the caller's: a heap opened from a dma-buf
+/// ([`crate::dmabuf::open_heap`]) is shared but not cross-adapter, and a
+/// cross-adapter buffer in it would be one for host pointers.
+pub(crate) fn place_with(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size: u64, flags: D3D12_RESOURCE_FLAGS) -> windows::core::Result<ID3D12Resource> {
+    let mut placed: Option<ID3D12Resource> = None;
     // SAFETY: plain creation in a live heap.
     unsafe { device.CreatePlacedResource(heap, offset, &buffer_desc(size, flags), D3D12_RESOURCE_STATE_COMMON, None, &mut placed)? };
     placed.ok_or_else(windows::core::Error::empty)
@@ -883,6 +889,12 @@ pub(crate) struct Probe {
     /// A section made with `SEC_RESERVE` (as `xmem` makes the page pool)
     /// was refused.
     pub(crate) reserved_section_refused: bool,
+    /// A committed section's pages as a dma-buf ([`crate::dmabuf`]): the
+    /// GPU reads what the CPU wrote through a view, the CPU reads what the
+    /// GPU wrote, and the pinned pages are given back when the heap goes.
+    pub(crate) dmabuf_reads: bool,
+    pub(crate) dmabuf_writes: bool,
+    pub(crate) dmabuf_released: bool,
 }
 
 /// Tries the openings on memory of the probe's own, made the way `xmem`
@@ -914,14 +926,24 @@ pub(crate) fn probe(device: &ID3D12Device, memory: &dyn Fn() -> Option<[u64; 4]>
     unsafe {
         private(&mut p, &mut rig);
         section(&mut p, &mut rig);
+        dma_buf(&mut p, &mut rig);
         if mb > 0 {
             cost(&mut p, &mut rig, memory, mb);
         }
     }
     p.lines.push(format!(
         "VERDICT: private memory in place: reads {}, writes {}; the page pool's section in place: reads {}, writes {}, whatever the views do {}; \
-         a reserved section is refused {} (the pool must be made committed to be opened)",
-        p.part_reads, p.part_writes, p.section_reads, p.section_writes, p.section_outlives_views, p.reserved_section_refused
+         a reserved section is refused {} (the pool must be made committed to be opened); \
+         a section as a dma-buf: reads {}, writes {}, pinned pages given back {}",
+        p.part_reads,
+        p.part_writes,
+        p.section_reads,
+        p.section_writes,
+        p.section_outlives_views,
+        p.reserved_section_refused,
+        p.dmabuf_reads,
+        p.dmabuf_writes,
+        p.dmabuf_released
     ));
     p
 }
@@ -1076,6 +1098,90 @@ unsafe fn section(p: &mut Probe, rig: &mut Rig) {
         // The placeholder was split in two: each half is released.
         mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE);
         mem::VirtualFree(hole.add(8 * K64).cast(), 0, mem::MEM_RELEASE);
+    }
+}
+
+/// A committed section's pages handed to the card as a dma-buf
+/// ([`crate::dmabuf::open_heap`]), and a buffer placed on them: the same
+/// checks as for the other openings, the time it takes, and GTT before,
+/// with the heap and after it went.
+unsafe fn dma_buf(p: &mut Probe, rig: &mut Rig) {
+    const SIZE: usize = 256 * K64;
+    // SAFETY (the whole function): the section and the view made below,
+    // `SIZE` bytes, and buffers inside them.
+    unsafe {
+        let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, SIZE as u32, std::ptr::null());
+        let view = if handle.is_null() { mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: std::ptr::null_mut() } } else { mem::MapViewOfFile(handle, mem::FILE_MAP_WRITE, 0, 0, SIZE) };
+        if view.Value.is_null() {
+            p.lines.push("a section as a dma-buf: none to try with".to_owned());
+            if !handle.is_null() {
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+            }
+            return;
+        }
+        let base = view.Value.cast::<u8>();
+        let gtt = crate::dmabuf::gtt_kib;
+        let mb = |k: Option<u64>| k.map_or("?".to_owned(), |k| format!("{:.1}", k as f64 / 1024.0));
+        let before = gtt();
+        let started = std::time::Instant::now();
+        let opened = crate::dmabuf::open_heap(&rig.device, handle as usize, 0, SIZE as u64);
+        let took = started.elapsed().as_secs_f64() * 1000.0;
+        let with = gtt();
+        match &opened {
+            Err(e) => p.lines.push(format!("a section as a dma-buf (OpenSharedHandle of a udmabuf): REFUSED: {e}")),
+            Ok(heap) => {
+                p.lines.push(format!("a section as a dma-buf (OpenSharedHandle of a udmabuf): ok, {} MiB in {took:.1} ms", SIZE >> 20));
+                p.lines.push(format!("  {}", describe(heap)));
+                let placed = place_with(&rig.device, heap, K64 as u64, 4 * K64 as u64, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+                p.lines.push(format!("  a buffer placed in it (unordered access): {}", hr(&placed)));
+                if let Ok(buffer) = &placed {
+                    let memory = base.add(K64);
+                    fill(memory, 4 * K64, 9);
+                    let first = rig.fetch(buffer, 0, 4 * K64).is_ok_and(|got| same(memory, &got));
+                    fill(memory, 4 * K64, 101);
+                    let second = rig.fetch(buffer, 0, 4 * K64).is_ok_and(|got| same(memory, &got));
+                    p.dmabuf_reads = first && second;
+                    let new: Vec<u8> = (0..K64).map(|i| (i as u8) ^ 0x6c).collect();
+                    let copied = rig.store(buffer, 4096, &new).is_ok() && same(memory.add(4096), &new);
+                    memory.cast::<[u32; 3]>().write([40, 2, 0]);
+                    let shaded = rig.shade(buffer.GetGPUVirtualAddress());
+                    let shader = shaded.is_ok() && memory.cast::<[u32; 3]>().read()[2] == 42;
+                    p.dmabuf_writes = copied && shader;
+                    p.lines.push(format!(
+                        "  the GPU reads the view's bytes {first}, and those the CPU wrote afterwards with no call between {second}; \
+                         the CPU reads through the view what the GPU wrote: by a copy {copied}, by a shader through unordered access {shader} ({})",
+                        hr(&shaded)
+                    ));
+                }
+                drop(placed);
+            }
+        }
+        drop(opened);
+        let after = gtt();
+        // Given back: what the heap held (the section's pages, pinned) is
+        // no longer held, to within a page table's worth.
+        let held = matches!((before, with), (Some(b), Some(w)) if w >= b + (SIZE as u64 >> 10) / 2);
+        p.dmabuf_released = held && matches!((before, after), (Some(b), Some(a)) if a <= b + 256);
+        p.lines.push(format!(
+            "  the PC's memory the card holds for this process (drm-total-gtt): {} MiB before, {} with the heap, {} after it went",
+            mb(before),
+            mb(with),
+            mb(after)
+        ));
+        // A refusal is an answer, not a heap of other memory: a range past
+        // the section's end.
+        let past = crate::dmabuf::open_heap(&rig.device, handle as usize, SIZE as u64, SIZE as u64);
+        p.lines.push(format!(
+            "  a range past the section's end: {}",
+            match &past {
+                Ok(_) => "OPENED (it should be refused)".to_owned(),
+                Err(e) => format!("refused: {e}"),
+            }
+        ));
+        drop(past);
+        mem::UnmapViewOfFile(view);
+        windows_sys::Win32::Foundation::CloseHandle(handle);
     }
 }
 
