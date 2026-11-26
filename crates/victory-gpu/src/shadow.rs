@@ -1535,6 +1535,10 @@ fn spin(there: impl Fn() -> bool) {
 
 /// How many threads are kept for [`wide`].
 fn wide_threads() -> usize {
+    // `VICTORY_WIDE_THREADS`: so many (1 to 16) instead.
+    if let Some(n) = std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        return n.clamp(1, 16);
+    }
     std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
 }
 
