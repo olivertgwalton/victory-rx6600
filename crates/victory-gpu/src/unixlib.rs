@@ -25,6 +25,7 @@ pub(crate) const UFFD_UNTRACK: u32 = 2;
 pub(crate) const UFFD_SCAN: u32 = 3;
 pub(crate) const DMABUF: u32 = 4;
 pub(crate) const GTT: u32 = 5;
+pub(crate) const DMABUF_LIST: u32 = 6;
 
 pub(crate) struct Lib {
     handle: u64,

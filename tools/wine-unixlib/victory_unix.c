@@ -149,6 +149,67 @@ failed:
     return STATUS_UNSUCCESSFUL;
 }
 
+struct udmabuf_create_item { unsigned int memfd, pad; u64 offset, size; };
+struct udmabuf_create_list { unsigned int flags, count; struct udmabuf_create_item list[1024]; };
+#define UDMABUF_CREATE_LIST 0x40087543UL /* _IOW('u', 0x43, struct udmabuf_create_list) (header only) */
+#define MOST_ITEMS 1024 /* udmabuf's list_limit, by default */
+
+/* dmabuf_list: args = { u64 items, u64 count, u64 out_handle, i64
+ * out_error, u64 out_step, u64 out_index } - one dma-buf of `count` pieces
+ * in order, each { u64 section, u64 offset, u64 len } (whole pages): its
+ * bytes are the pieces' one after another, so a range of title memory made
+ * of views of several sections, or of one section out of order, is one
+ * dma-buf laid out as the title sees it. Steps as dmabuf's, out_index the
+ * piece that failed; 6: too many pieces. Each section's memfd is sealed
+ * against shrinking. */
+static NTSTATUS dmabuf_list(void *args) {
+    u64 *a = args;
+    const u64 *items = (const u64 *)a[0];
+    u64 count = a[1];
+    static struct udmabuf_create_list create;
+    HANDLE handles[64];
+    int fds[64];
+    long nfds = 0, r = 0, dev, buf;
+    HANDLE handle = 0;
+    a[2] = 0;
+    a[5] = 0;
+    if (count == 0 || count > MOST_ITEMS) { a[3] = (u64)-7; a[4] = 6; return STATUS_UNSUCCESSFUL; }
+    for (u64 i = 0; i < count; i++) {
+        HANDLE section = (HANDLE)items[3 * i];
+        long k = 0;
+        while (k < nfds && handles[k] != section) k++;
+        if (k == nfds) {
+            if (nfds == 64) { a[3] = (u64)-7; a[4] = 6; a[5] = i; goto failed; }
+            int fd = -1;
+            if ((r = wine_server_handle_to_fd(section, 0, &fd, 0))) { a[3] = (u64)r; a[4] = 1; a[5] = i; goto failed; }
+            handles[nfds] = section;
+            fds[nfds++] = fd;
+            if ((r = sys3(SYS_fcntl, fd, F_ADD_SEALS, F_SEAL_SHRINK)) < 0) { a[3] = (u64)r; a[4] = 2; a[5] = i; goto failed; }
+        }
+        create.list[i].memfd = (unsigned int)fds[k];
+        create.list[i].pad = 0;
+        create.list[i].offset = items[3 * i + 1];
+        create.list[i].size = items[3 * i + 2];
+    }
+    create.flags = UDMABUF_FLAGS_CLOEXEC;
+    create.count = (unsigned int)count;
+    if ((dev = sys3(SYS_open, (long)"/dev/udmabuf", 02 | 02000000, 0)) < 0) { a[3] = (u64)dev; a[4] = 3; goto failed; }
+    buf = sys3(SYS_ioctl, dev, UDMABUF_CREATE_LIST, (long)&create);
+    sys3(SYS_close, dev, 0, 0);
+    if (buf < 0) { a[3] = (u64)buf; a[4] = 4; goto failed; }
+    r = wine_server_fd_to_handle((int)buf, GENERIC_ALL, 0, &handle);
+    sys3(SYS_close, buf, 0, 0);
+    if (r) { a[3] = (u64)r; a[4] = 5; goto failed; }
+    for (long k = 0; k < nfds; k++) sys3(SYS_close, fds[k], 0, 0);
+    a[2] = (u64)handle;
+    a[3] = 0;
+    a[4] = 0;
+    return STATUS_SUCCESS;
+failed:
+    for (long k = 0; k < nfds; k++) sys3(SYS_close, fds[k], 0, 0);
+    return STATUS_UNSUCCESSFUL;
+}
+
 /* The value after `key` on one of the lines of `text` (n bytes), or -1. */
 static long field(const char *text, long n, const char *key) {
     long k = 0;
@@ -220,4 +281,4 @@ static NTSTATUS gtt(void *args) {
 }
 
 typedef NTSTATUS (*unixlib_entry_t)(void *);
-__attribute__((visibility("default"))) const unixlib_entry_t __wine_unix_call_funcs[] = {init, track, untrack, scan, dmabuf, gtt};
+__attribute__((visibility("default"))) const unixlib_entry_t __wine_unix_call_funcs[] = {init, track, untrack, scan, dmabuf, gtt, dmabuf_list};

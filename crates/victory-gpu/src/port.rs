@@ -71,18 +71,40 @@ const MOST: u64 = 512 << 20;
 /// `VICTORY_PORT_CONSTANTS`: `1` turns renderer port #1 on (title buffers
 /// and windows of title memory in the title's 32-bit graphics memory, view
 /// memory that is one stretch of a section, used in place); unset or
-/// anything else: off, everything as before.
+/// anything else: off, everything as before. `VICTORY_DMABUF=1` turns it on
+/// too, its regions opened as dma-bufs ([`dma_buf`]).
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Read once, here: the switch of renderer port #1.
-    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1") || dma_buf())
 }
 
-/// A stretch of title memory opened as a heap through a view of ours.
+/// Whether regions are the section's pages handed to the card as a dma-buf
+/// (`crate::dmabuf`, `VICTORY_DMABUF=1`) rather than a heap opened from an
+/// address through a view of ours. Under Wine the second is a host-pointer
+/// import of a memfd's pages, which RADV refuses, and vkd3d-proton then
+/// gives the heap memory of its own: the card would not see the title's
+/// bytes at all (the in-place probe's "section in place: reads false").
+///
+/// Measured (1080p, 240 s, RX 6600 XT): the title's 174 MB graphics heap is
+/// one dma-buf of 2 pieces, frames look as before, and 10 MB a frame less
+/// goes up; but the card reads it over the bus (14 GB/s), and its time grows
+/// 7 -> 12 ms: release 18.8 -> 17.9 fps, diagnostics 16.2 -> 18.0 (their
+/// uploads cost more). Off unless asked for.
+pub(crate) fn dma_buf() -> bool {
+    crate::dmabuf::on()
+}
+
+/// A stretch of title memory opened as a heap: through a view of ours, or
+/// the section's pages as a dma-buf, with their share of the budget for
+/// pinned memory (given back when the region is forgotten: the heap may
+/// outlive it a little, while lists that hold it finish).
 struct Region {
     start: u64,
     end: u64,
     heap: ID3D12Heap,
+    flags: D3D12_RESOURCE_FLAGS,
+    _pin: Option<crate::dmabuf::Pin>,
 }
 
 // SAFETY: D3D12 heaps are free-threaded.
@@ -161,7 +183,8 @@ pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Pl
         }
     };
     let region = &regions[i];
-    let buffer = crate::inplace::place(device, &region.heap, at - region.start, end - at).map_err(|e| (6, format!("no buffer placed in the region: {e}")))?;
+    let buffer = crate::inplace::place_with(device, &region.heap, at - region.start, end - at, region.flags)
+        .map_err(|e| (6, format!("no buffer placed in the region: {e}")))?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
     Ok(Placed { buffer, heap: region.heap.clone(), gpu, bias: start - at })
@@ -170,6 +193,9 @@ pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Pl
 /// Opens the stretch around `[at, end)` (64 KiB aligned) as a heap through
 /// a view of ours of the same pages.
 fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usize, String)> {
+    if dma_buf() {
+        return open_region_dma_buf(device, at, end);
+    }
     let Some((first, bytes, section, offset)) = stretch(at as usize, (end - at) as usize) else {
         return Err((3, format!("not one stretch of a section: {:?}", cover(at as usize, (end - at) as usize))));
     };
@@ -216,13 +242,52 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
             );
             // shortcut: the view stays mapped for good (the heap holds its
             // pages while anything names it).
-            Ok(Region { start: first, end: first + bytes, heap })
+            Ok(Region {
+                start: first,
+                end: first + bytes,
+                heap,
+                flags: D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                _pin: None,
+            })
         }
         Err(e) => {
             unmap();
             Err((5, format!("refused by the host: {e}")))
         }
     }
+}
+
+/// [`open_region`] as a dma-buf: the pages shown at `[at, end)`, whatever
+/// sections and offsets they come from, handed to the card in the order the
+/// title sees them ([`crate::inplace::pieces`]), so a buffer at an offset of
+/// the heap is the title's memory at that offset of the range. Just the
+/// range asked for, grown to the whole buffer by the caller: no stretch to
+/// look for, and nothing pinned beyond it.
+fn open_region_dma_buf(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usize, String)> {
+    let bytes = end - at;
+    if bytes > MOST {
+        return Err((3, format!("{bytes:#x} bytes, over the most of a region")));
+    }
+    let Some(pieces) = crate::inplace::pieces(at as usize, bytes as usize) else {
+        return Err((3, format!("not all in views: {:?}", cover(at as usize, bytes as usize))));
+    };
+    // The title's own views say whether the pages are committed: a dma-buf
+    // of pages never committed would make (and pin) them.
+    if !committed(at as usize, bytes as usize) {
+        return Err((4, "pages of the range are not committed".to_owned()));
+    }
+    let (heap, pin) = crate::dmabuf::open_heap_pinned(device, &pieces).map_err(|e| (5, e))?;
+    let (pinned, budget) = crate::dmabuf::pinned();
+    tracing::info!(
+        start = format_args!("{at:#x}"),
+        bytes,
+        pieces = pieces.len(),
+        sections = pieces.iter().map(|p| p.0).collect::<std::collections::BTreeSet<_>>().len(),
+        pinned_mib = pinned >> 20,
+        budget_mib = budget >> 20,
+        "renderer port 1: title graphics memory handed to the card as a dma-buf, laid out as the title sees it"
+    );
+    Ok(Region { start: at, end, heap, flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, _pin: Some(pin) })
 }
 
 /// Whether every page of `[at, at + len)` is committed.
@@ -292,12 +357,16 @@ pub(crate) fn log(frames: f64) {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     let per: Vec<f64> = STATS[9..].iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
-        "renderer port 1 (VICTORY_PORT_CONSTANTS=1): {} regions of the title's graphics memory in place ({} MB), {} title buffers and windows placed in them \
+        "renderer port 1 (VICTORY_PORT_CONSTANTS=1, VICTORY_DMABUF=1: as dma-bufs {}): {} regions of the title's graphics memory in place ({} MB, {} MiB pinned \
+         of {}), {} title buffers and windows placed in them \
          (no host copy, nothing sent up or fetched back for them); per frame on the CPU: {:.0} fills read out of them ({:.1} KB), {:.1} buffer copies \
          touching them ({:.1} KB); since the start refused: {} not one stretch of a section, {} not committed, {} by the host, {} no buffer; {} regions \
          forgotten (other pages mapped there)",
+        dma_buf(),
         s[0],
         s[1] >> 20,
+        crate::dmabuf::pinned().0 >> 20,
+        crate::dmabuf::pinned().1 >> 20,
         s[2],
         per[0],
         per[1] / 1024.0,

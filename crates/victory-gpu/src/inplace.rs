@@ -542,6 +542,34 @@ pub(crate) fn shown_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
     runs
 }
 
+/// The views that show `[at, at + len)`, in order, as pieces of sections:
+/// `(section, offset, bytes)`, neighbours that go on in the same section
+/// joined; `None` if a part of it is in no view. What a dma-buf laid out as
+/// the title sees the range is made of (`crate::dmabuf::export_list`).
+pub(crate) fn pieces(at: usize, len: usize) -> Option<Vec<(usize, u64, u64)>> {
+    let end = at.checked_add(len)?;
+    let v = views();
+    let (&base, _) = v.views.range(..=at).next_back()?;
+    let mut out: Vec<(usize, u64, u64)> = Vec::new();
+    let mut reached = at;
+    for (&start, &(bytes, section, offset)) in v.views.range(base..end) {
+        let (from, to) = (start.max(at), (start + bytes).min(end));
+        if to <= from {
+            continue;
+        }
+        if from != reached {
+            return None;
+        }
+        let piece = (section, offset + (from - start) as u64, (to - from) as u64);
+        match out.last_mut() {
+            Some(last) if last.0 == piece.0 && last.1 + last.2 == piece.1 => last.2 += piece.2,
+            _ => out.push(piece),
+        }
+        reached = to;
+    }
+    (reached == end).then_some(out)
+}
+
 /// How the views cover `[at, at + len)`.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum Cover {
