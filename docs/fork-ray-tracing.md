@@ -135,6 +135,42 @@ dispatches, faults and what came.
   of two boxes entered at the same distance, and the result for a ray exactly
   through an edge.
 
+## On an RX 6600 XT under Proton (2026-11-26)
+
+Fedora, Linux 7.3, RX 6600 XT 8 GB (RDNA2, RADV), GE-Proton 11-14 with the
+view-tree wineserver, patched vkd3d-proton; diagnostics build, Series X
+profile at 1080p, the opening (prison dorm and window), runs of 4 minutes.
+
+- **It runs.** Three runs with `VICTORY_BVH_BUILDER=1`, no device loss and
+  no crash; every builder program got a host pipeline; lamp-lit rooms get
+  their fill light, as on the RX 7900 XTX. The first run compiles the
+  thousand or so hit-shading programs that are otherwise left out.
+- **It is 4.7 times slower:** 283 ms a frame against 60.6 without the
+  builder (frames 950-1670 against 948-4325, same keys). The Series S
+  profile does not help (290 ms). The card is the wall: the thread that
+  submits waits for it 159-278 ms a frame; 1,451 MB of title memory by
+  address are on the card (1,075 MB with the Series S profile) and the 8 GB
+  are full.
+- **Where the card's time goes** (`VICTORY_GPU_TIMING=1`, run bvh3t: 300 ms
+  of title lists a frame, 275 ms of it indirect dispatches): the traversal
+  programs, each run once a frame:
+
+| program | ms a frame | on the RX 7900 XTX (light-13) |
+|---|---:|---:|
+| `CS_RaytraceVBuffer_RayBinning_ShaderBinning_Mixed_WithFar` | 55.4 | 7.9 |
+| `CS_ScreenProbes_TraceRays_RayBinning_BVH_Mixed_ShaderBinning_WithFar` | 55.0 | 6.4 |
+| `CS_IrradianceCache_GatherVBuffer_WithFar` | 29.8 | 3.5 |
+| `CS_Primary_GatherVBuffer_WithFar` | 27.7 | 2.3 |
+| `CS_GatherAlphaVBuffer_WithFar` | 24.6 | |
+| `CS_RTDistantShadowTrace32_Tiled` | 7.9 | |
+| `CS_IrradianceCache_ShadowTrace_WithFar` | 4.1 | |
+
+  Seven to twelve times the bigger card's, about its ratio of shader
+  throughput and cache: the cost is the emulated node test and the
+  traversal loops in compute, not a fault of the layer's memory by address.
+  On a card of this size the builder is for looking at the lighting, not
+  for playing; the stand-in (`VICTORY_AMBIENT`) stays the default.
+
 ## Without rays: the stand-in (`crates/victory-gpu/src/ambient.rs`)
 
 Without structures every ray misses. The title's program that resolves the
