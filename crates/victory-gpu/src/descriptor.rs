@@ -299,6 +299,27 @@ pub(crate) fn sync_heaps() {
     if !sync_on() {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    {
+        static ROUNDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static LAST: std::sync::Mutex<[u64; 6]> = std::sync::Mutex::new([0; 6]);
+        if ROUNDS.fetch_add(1, Relaxed) % 400 == 399 {
+            let now: [u64; 6] = std::array::from_fn(|i| host::MIRROR_NS[i].load(Relaxed));
+            let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            let d: [u64; 6] = std::array::from_fn(|i| now[i] - last[i]);
+            *last = now;
+            let per = |i: usize| d[i] as f64 / d[5].max(1) as f64;
+            tracing::info!(
+                calls = d[5],
+                "slot mirrors, ns a call: {:.0} waiting for the slot's lock, {:.0} noting, {:.0} making, {:.0} stale slots, {:.0} in all",
+                per(0),
+                per(1),
+                per(2),
+                per(3),
+                per(4)
+            );
+        }
+    }
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut views, mut bytes) = (0u64, 0u64);

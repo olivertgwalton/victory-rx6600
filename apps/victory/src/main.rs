@@ -4,6 +4,8 @@
 //! the user's cache directory (outside the repository).
 
 mod agility;
+#[cfg(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"))]
+mod fastmem;
 mod census;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]

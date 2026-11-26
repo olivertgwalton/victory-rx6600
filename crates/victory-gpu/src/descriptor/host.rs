@@ -13,6 +13,16 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// Diagnostics: nanoseconds in [`HostHeap::mirror`] since the start, by
+/// part: waiting for the slot's lock, noting buffers and placed views, making
+/// the host descriptor, the stale slots after, all of it; and the calls.
+#[cfg(feature = "diagnostics")]
+pub(crate) static MIRROR_NS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+#[cfg(feature = "diagnostics")]
+fn mirror_ns(part: usize, since: std::time::Instant) {
+    MIRROR_NS[part].fetch_add(since.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
 /// a set of 70,000 under its lock kept everyone who writes slots waiting for
 /// 5 ms of a frame, timeline thin-6).
@@ -23,6 +33,13 @@ impl Slots {
         let mut bits = Vec::new();
         bits.resize_with(count.div_ceil(64), Default::default);
         Slots(bits)
+    }
+
+    /// Whether `slot` is in the set.
+    fn has(&self, slot: u32) -> bool {
+        self.0
+            .get(slot as usize / 64)
+            .is_some_and(|bits| bits.load(std::sync::atomic::Ordering::Acquire) & (1 << (slot % 64)) != 0)
     }
 
     fn put(&self, slot: u32) {
@@ -212,6 +229,24 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// The slots that may have an entry in [`HostHeap::placed`]: set under
+    /// its lock when [`HostHeap::note_buffer`] adds one, cleared there when
+    /// it forgets one (an entry another slot's view made stale leaves its
+    /// bit set: the next look takes the lock, as before). A slot whose bit
+    /// is clear and whose new view is no placed texture has nothing there to
+    /// forget, and does not take the lock: 20,000 slots a frame were made so,
+    /// six threads at a time behind that one lock, and under Wine each
+    /// handover of a contended lock is a sleep and a wake-up in the kernel
+    /// (11 ms of a frame for the heaps' records against 15 ms on one thread).
+    in_placed: Slots,
+    /// The slots that may be in [`HostHeap::textures`]' queue: set under its
+    /// lock wherever one is put in, cleared where [`HostHeap::queue_texture`]
+    /// takes one out (taken out elsewhere, the bit stays: the next look takes
+    /// the lock). A slot that gets no texture view and whose bit is clear has
+    /// nothing to take out and does not take the lock, which every slot made
+    /// took before: the heaps' records waited 2.5 microseconds a slot for
+    /// slots' locks held by threads that waited for this one.
+    in_textures: Slots,
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -1617,6 +1652,8 @@ impl HostHeap {
             strides,
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
+            in_placed: Slots::new(count as usize),
+            in_textures: Slots::new(count as usize),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
@@ -1906,6 +1943,7 @@ impl HostHeap {
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         for &slot in &slots {
+            self.in_textures.put(slot);
             textures.changed(slot, frame, frame + 1);
         }
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
@@ -1931,6 +1969,7 @@ impl HostHeap {
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         for &slot in &slots {
+            self.in_textures.put(slot);
             textures.changed(slot, frame, frame + 1);
         }
         slots.len()
@@ -1992,6 +2031,7 @@ impl HostHeap {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
         for &slot in &slots {
+            self.in_textures.put(slot);
             textures.changed(slot, frame, frame);
         }
         slots.len()
@@ -2020,6 +2060,7 @@ impl HostHeap {
             return [held, slots.len(), 0];
         }
         for &slot in &slots {
+            self.in_textures.put(slot);
             textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
         }
         [held, slots.len(), slots.len()]
@@ -2102,6 +2143,7 @@ impl HostHeap {
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         for &slot in &slots {
+            self.in_textures.put(slot);
             textures.changed(slot, frame, frame + 1);
         }
         crate::tiles::STATS[10].fetch_add(slots.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2631,6 +2673,9 @@ impl HostHeap {
         // Made now by a draw of this frame that read it through a table:
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
+        if !(texture && !read_now) && !self.in_textures.has(index) {
+            return;
+        }
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         if texture && !read_now {
             let due = if lately && !seen {
@@ -2640,8 +2685,10 @@ impl HostHeap {
                 0
             };
             textures.written(index, frame, due, seen);
+            self.in_textures.put(index);
         } else {
             textures.remove(index);
+            self.in_textures.remove(index);
         }
     }
 
@@ -2715,7 +2762,9 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        let stale = if placed_view.is_none() && !self.in_placed.has(index) {
+            Vec::new()
+        } else {
             use std::sync::atomic::Ordering::Relaxed;
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let span = placed_view.and_then(|(resource, start, first, held)| {
@@ -2728,12 +2777,14 @@ impl HostHeap {
                     placed.rule = stale_rule();
                     let stale = placed.note(index, start, end, !seen);
                     placed.shows(index, first, held);
+                    self.in_placed.put(index);
                     // (Under the lock of `placed`: a later write of one of
                     // them comes by here before it makes the slot.)
                     stale.into_iter().map(|slot| (slot, self.made.get(slot).unwrap_or(0))).collect()
                 }
                 None => {
                     placed.forget(index);
+                    self.in_placed.remove(index);
                     Vec::new()
                 }
             }
@@ -3246,7 +3297,23 @@ impl HostHeap {
         {
             return Some(view);
         }
+        #[cfg(feature = "diagnostics")]
+        let all = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        MIRROR_NS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        struct Whole(std::time::Instant);
+        #[cfg(feature = "diagnostics")]
+        impl Drop for Whole {
+            fn drop(&mut self) {
+                mirror_ns(4, self.0);
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        let _whole = Whole(all);
         let held = self.made.lock(index);
+        #[cfg(feature = "diagnostics")]
+        mirror_ns(0, all);
         let shown = self.made.get(index).unwrap_or(0);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
@@ -3268,7 +3335,11 @@ impl HostHeap {
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
             // (When this slot's lock is let go: a lock at a time.)
+            #[cfg(feature = "diagnostics")]
+            let noting = std::time::Instant::now();
             let stale = self.note_buffer(index, Some(&view), for_draw);
+            #[cfg(feature = "diagnostics")]
+            mirror_ns(1, noting);
             // A view of a texture object that has no host copy yet waits
             // for it, as buffer views wait for a draw: the slot is made
             // when the texture is first used (`super::make_waiting`), or
@@ -3315,6 +3386,8 @@ impl HostHeap {
             }
             self.quick_is(index, 0);
             self.made.set(index, if later { 0 } else { key });
+            #[cfg(feature = "diagnostics")]
+            let making = std::time::Instant::now();
             let kept = if later {
                 None
             } else {
@@ -3323,6 +3396,8 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.at(index));
             }
+            #[cfg(feature = "diagnostics")]
+            mirror_ns(2, making);
             if kept.is_some() || !self.sampler {
                 self.put(index);
             }
@@ -3330,7 +3405,11 @@ impl HostHeap {
             self.keep(index, kept.flatten());
             self.quick_is(index, if later { 0 } else { key });
             drop(held);
+            #[cfg(feature = "diagnostics")]
+            let unmaking = std::time::Instant::now();
             self.unmake_stale(index, stale);
+            #[cfg(feature = "diagnostics")]
+            mirror_ns(3, unmaking);
         }
         Some(view)
     }
