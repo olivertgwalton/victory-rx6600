@@ -263,6 +263,8 @@ struct Pool<B> {
     most: usize,
     /// A lower `most` a setting may give.
     cap: fn() -> usize,
+    /// No new block is asked for before this time after one was refused
+    /// ([`Pool::grow`]).
     retry_growth_at: u64,
 }
 
@@ -345,6 +347,9 @@ impl<B: Clone> Pool<B> {
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
     }
 
+    /// A new block from `make`, unless one was refused less than 500 ms ago
+    /// (codec-d/cool_fox 08e4574d: a refused 64 MiB block is not asked for
+    /// again for each small texture; the blocks there are still used).
     fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
         if now < self.retry_growth_at {
             return None;
@@ -378,6 +383,8 @@ impl<B: Clone> Pool<B> {
         self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
     }
 
+    /// [`Pool::rested`] with at most `limit` empty blocks kept; `sweep`: the
+    /// empty blocks are looked at even if no piece came back.
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
         let mut any = false;
         while let Some(&(ready, piece)) = self.resting.front()
@@ -557,6 +564,103 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     }
 }
 
+/// Whether textures of 64 KiB and less are placed at multiples of 4 KiB in
+/// their block, where the host allows it (`VICTORY_POOL_SMALL=1`; otherwise
+/// at multiples of 64 KiB, as every other texture).
+///
+/// The two device losses of the night of 2026-11-25 with the pool in the
+/// report (runs steps-ab2 and start-3) faulted in the same kind of texture:
+/// 256x256, block-compressed, 7 levels, placed at a 4 KiB multiple that is no
+/// 64 KiB one (offsets 0x406000 and 0x3fe6000 of their blocks), never used
+/// before, read by the card the moment its slot was made; the descriptor's
+/// base of both lies 0xa000 into the piece, on a 64 KiB multiple, and its
+/// first level of 32 KiB from there ends 0x2000 past the piece. Why the card
+/// faulted there is not proven; textures at 64 KiB multiples have none of
+/// that, for some memory (at most 60 KiB a small texture).
+fn small_placement() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_POOL_SMALL") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_SMALL").is_some_and(|v| v != "0"))
+}
+
+/// Diagnostics: whether the card reads a pooled texture inside the piece it
+/// was placed in. A block's address is taken as the lowest of its textures'
+/// descriptor bases less their pieces' starts (a texture's first level may
+/// lie past its piece's start, never before it); a texture whose first level
+/// the card would read from past its piece's end is said loudly.
+#[cfg(feature = "diagnostics")]
+fn where_the_card_reads(heap: &ID3D12Heap, texture: &ID3D12Resource, piece: Piece) {
+    static BLOCKS: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    let Some(base) = crate::book::address(texture) else { return };
+    let Some(seen) = base.checked_sub(piece.start) else { return };
+    let raw = heap.as_raw() as usize;
+    let block = {
+        let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        match blocks.iter_mut().find(|b| b.0 == raw) {
+            Some(b) => {
+                b.1 = b.1.min(seen);
+                b.1
+            }
+            None => {
+                if blocks.len() >= 4096 {
+                    blocks.remove(0);
+                }
+                blocks.push((raw, seen));
+                seen
+            }
+        }
+    };
+    let into = base - block - piece.start;
+    // SAFETY: a live texture.
+    let desc = unsafe { texture.GetDesc() };
+    // The first level's bytes, as a copy would have them.
+    let mut level = 0u64;
+    if let Some(host) = crate::host::made_host() {
+        // SAFETY: plain query of a valid description.
+        unsafe { host.device.GetCopyableFootprints(&desc, 0, 1, 0, None, None, None, Some(&raw mut level)) };
+    }
+    if into + level > piece.len {
+        let n = SAID.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 50 || n.is_power_of_two() {
+            // (Debug only: it assumes a texture's address is its block's
+            // start and its piece's offset, which this driver does not
+            // keep: 56 false alarms in run pool-1.)
+            tracing::debug!(
+                times = n,
+                base = format_args!("{base:#x}"),
+                piece_start = format_args!("{:#x}", piece.start),
+                piece_len = format_args!("{:#x}", piece.len),
+                into = format_args!("{into:#x}"),
+                first_level_bytes = format_args!("{level:#x}"),
+                width = desc.Width,
+                height = desc.Height,
+                levels = desc.MipLevels,
+                format = desc.Format.0,
+                "POOL: the card reads a pooled texture's first level past the end of the piece it was placed in"
+            );
+        }
+    }
+    // Every placement offset and where the first level lies, a few of them.
+    static SHOWN: AtomicU64 = AtomicU64::new(0);
+    if into > 0 && SHOWN.fetch_add(1, Ordering::Relaxed) < 40 {
+        tracing::info!(
+            into = format_args!("{into:#x}"),
+            piece_start = format_args!("{:#x}", piece.start),
+            piece_len = format_args!("{:#x}", piece.len),
+            width = desc.Width,
+            height = desc.Height,
+            levels = desc.MipLevels,
+            format = desc.Format.0,
+            alignment = desc.Alignment,
+            "pool: a texture's first level lies past its piece's start"
+        );
+    }
+}
+
 /// Textures made in the last second ([`fresh`]), and when.
 static RECENT: Mutex<VecDeque<(usize, u64)>> = Mutex::new(VecDeque::new());
 
@@ -569,11 +673,99 @@ pub(crate) fn fresh(texture: &ID3D12Resource) -> bool {
 
 fn made_now(texture: &ID3D12Resource) {
     let now = now();
-    let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
-    while recent.front().is_some_and(|r| r.1 + 1000 < now) {
-        recent.pop_front();
+    let raw = texture.as_raw() as usize;
+    {
+        let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+        while recent.front().is_some_and(|r| r.1 + 1000 < now) {
+            recent.pop_front();
+        }
+        recent.push_back((raw, now));
     }
-    recent.push_back((texture.as_raw() as usize, now));
+    unseen_now(raw);
+}
+
+/// Host texture `raw` (its `as_raw`) is new: slots that show it wait until
+/// every submission begun before now has finished ([`begun_before`]).
+fn unseen_now(raw: usize) {
+    let begun = crate::host::submissions().0;
+    NEWEST_BEGUN.fetch_max(begun, Ordering::Relaxed);
+    let mut unseen = UNSEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let finished = crate::host::submissions().1;
+    // Those every submission begun before them has left behind are no
+    // one's concern any more (and a raw pointer may come again).
+    unseen.retain(|_, b| unseen_by(*b, finished));
+    // (Asked twice, by the pool and by the host copy: the later number.)
+    let at = unseen.entry(raw).or_insert(begun);
+    *at = (*at).max(begun);
+}
+
+/// Every host texture, not only those cut from blocks, is new to the
+/// submissions begun before it was made ([`begun_before`]): under Wine
+/// (`VICTORY_PUBLISH_SAFE=0`: blocks only, as elsewhere). A committed or
+/// reserved texture is memory newer than those submissions, as a block's
+/// piece is: on amdgpu a memory object made after a submission began is not
+/// valid for it, and a slot that submission reads by index, switched to
+/// such a texture, faults inside it. The owner's tree lost the device so
+/// (run play-va1, 2026-11-25: a permission fault inside a live 4096x4096
+/// host texture made the moment the hung submission began) until every
+/// fresh texture's slot write waited (`VICTORY_PUBLISH_SAFE` there). Here
+/// only the pool's were known: a texture over half a block, with a clear
+/// value, several samples or the swizzle the pool leaves out, one the pool
+/// refused, and every target were shown at once.
+pub(crate) fn unseen_any(texture: &ID3D12Resource) {
+    if publish_safe() {
+        UNSEEN_ANY.fetch_add(1, Ordering::Relaxed);
+        unseen_now(texture.as_raw() as usize);
+    }
+}
+
+/// Host textures [`unseen_any`] noted, since the start.
+pub(crate) static UNSEEN_ANY: AtomicU64 = AtomicU64::new(0);
+
+/// Whether every host texture's slot waits as a pooled one's does
+/// ([`unseen_any`]): under Wine, unless `VICTORY_PUBLISH_SAFE=0`.
+pub(crate) fn publish_safe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::wine::on_wine() && std::env::var_os("VICTORY_PUBLISH_SAFE").is_none_or(|v| v != "0"))
+}
+
+/// Whether a texture made when submissions up to `begun` had begun is still
+/// new to one that may run, with every submission up to `finished` done.
+/// A submission begun later was sent after the texture's memory was made,
+/// so no look at what is in the air now is needed, and none can start
+/// between such a look and the slot's write (the window the owner's first
+/// rule had).
+fn unseen_by(begun: u64, finished: u64) -> bool {
+    begun > finished
+}
+
+/// Pooled textures made while submissions begun before them may still run:
+/// the submissions begun when each was made.
+static UNSEEN: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, u64>>> = std::sync::LazyLock::new(Default::default);
+/// The newest of those numbers (nothing to look up once it has finished).
+static NEWEST_BEGUN: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a texture was made in a block while a submission begun before
+/// it may still run ([`begun_before`]).
+pub(crate) fn any_unseen() -> bool {
+    NEWEST_BEGUN.load(Ordering::Relaxed) > crate::host::submissions().1
+}
+
+/// The submissions begun when `texture` was made in a block, if one of
+/// those may still be on the card: lists already sent then must not find it
+/// in a slot they read by index ([`crate::descriptor::host::show_new_later`]).
+/// Every device loss with the pool in the report (runs n08, n11, n15,
+/// steps-ab2, start-3 and the user's play-1125-2107) was a page fault at the
+/// first byte of a texture made that very millisecond, its title slot
+/// changed "at once" while lists sent before it read that slot by index.
+pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
+    if !any_unseen() {
+        return None;
+    }
+    let finished = crate::host::submissions().1;
+    let raw = texture.as_raw() as usize;
+    let unseen = UNSEEN.lock().unwrap_or_else(|e| e.into_inner());
+    unseen.get(&raw).copied().filter(|&begun| unseen_by(begun, finished))
 }
 
 /// Makes `texture` give `piece` back when the last reference to it goes.
@@ -615,10 +807,11 @@ pub(crate) unsafe fn texture(
         return None;
     }
     // Small textures lie at multiples of 4 KiB where the host allows it
-    // (the top mip is 64 KiB at most): 64 KiB each otherwise.
+    // (the top mip is 64 KiB at most) and [`small_placement`] says so: 64 KiB
+    // each otherwise.
     // SAFETY: the caller's description.
     let mut d = unsafe { *desc };
-    d.Alignment = u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT);
+    d.Alignment = if small_placement() { u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) } else { 0 };
     // SAFETY: plain queries.
     let mut info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
     if info.SizeInBytes == u64::MAX || info.Alignment != d.Alignment {
@@ -672,6 +865,7 @@ pub(crate) unsafe fn texture(
             #[cfg(feature = "diagnostics")]
             {
                 crate::book::made(&made, || "a texture in a block".into());
+                where_the_card_reads(&heap, &made, piece);
                 crate::book::block(&heap, &made, piece.start, BLOCK);
                 crate::book::note(made.as_raw() as usize, || {
                     let block = lock(&TEXTURES).blocks.get(piece.block).and_then(Option::as_ref).map(|b| (b.made, b.since));
@@ -775,6 +969,70 @@ pub(crate) unsafe fn target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A texture is new to a submission begun before it until every one
+    /// begun by then has finished; one begun later never needs it held.
+    #[test]
+    fn a_texture_is_new_until_those_begun_before_it_finished() {
+        assert!(unseen_by(5, 4));
+        assert!(!unseen_by(5, 5));
+        assert!(!unseen_by(5, 9));
+        // Nothing in the air when it was made: nothing to wait for.
+        assert!(!unseen_by(0, 0));
+    }
+
+    /// Noted twice (the pool, then the host copy), the later number holds,
+    /// and an entry every submission has left behind goes.
+    #[test]
+    fn a_texture_noted_twice_keeps_the_later_number() {
+        let raw = 0x5eed_0001;
+        let (started, finished) = crate::host::submissions();
+        unseen_now(raw);
+        unseen_now(raw);
+        let got = UNSEEN.lock().unwrap().get(&raw).copied();
+        // (Kept only while one begun before it may still run.)
+        if started > finished {
+            assert!(got.is_some_and(|b| b >= started));
+        }
+        UNSEEN.lock().unwrap().remove(&raw);
+    }
+
+    #[test]
+    fn a_failed_block_is_not_retried_for_each_small_upload() {
+        let mut pool: Pool<u32> = Pool::new(2);
+        let calls = std::cell::Cell::new(0);
+        let refuse = || {
+            calls.set(calls.get() + 1);
+            None
+        };
+        for size in [704008, 179720, 179720, 24080, 48648, 524288, 89616, 351760] {
+            assert!(pool.take(size, 512, 12, refuse).is_none());
+        }
+        assert_eq!(calls.get(), 1);
+        assert!(pool.take(24080, 512, 1012, || Some(1)).is_some());
+    }
+
+    #[test]
+    fn budget_tick_reclaims_idle_blocks_without_reusing_live_or_resting_pieces() {
+        let mut pool = Pool::new(STAGING_KEPT);
+        let (held, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
+        let (resting, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(2)).unwrap();
+        pool.give(resting, 0);
+        for i in 0..12 {
+            pool.add(i, 0);
+        }
+        pool.reclaim(0, SPARE_KEPT, true);
+        assert_eq!(pool.blocks(), STAGING_KEPT + 1);
+        pool.reclaim(REST - 1, SPARE, true);
+        assert_eq!(pool.blocks(), SPARE + 1);
+        assert_eq!(pool.resting.len(), 1);
+        pool.reclaim(REST, 0, true);
+        assert_eq!(pool.blocks(), 1);
+        assert!(pool.resting.is_empty());
+        pool.give(held, REST);
+        pool.reclaim(2 * REST, 0, true);
+        assert_eq!(pool.blocks(), 0);
+    }
 
     #[test]
     fn pool_caps_come_in_whole_blocks() {
@@ -955,6 +1213,46 @@ mod tests {
         assert_eq!(pool.take(BLOCK / 2, 65536, 0, make).unwrap().1, 6);
         assert_eq!(made.get(), n);
         assert!(pool.take(BLOCK, 65536, 0, make).is_none());
+    }
+
+    /// A texture placed in a heap holds no reference to it that its count
+    /// shows (this host, 2026-11-25: 1 before placing, 1 with the texture):
+    /// the pool must not count on one, and does not (a block goes only with
+    /// every piece back and rested, [`Pool::rested`]). Said here, and the
+    /// count is the same again once the texture went.
+    #[test]
+    fn a_placed_texture_holds_its_heap() {
+        let Some(host) = crate::host::host() else { return };
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: 1 << 20,
+            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        // SAFETY: plain creation.
+        unsafe { host.device.CreateHeap(&desc, &mut heap) }.unwrap();
+        let heap = heap.unwrap();
+        let before = crate::host::references(&heap);
+        let texture_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 256,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: a live heap, a valid description.
+        unsafe { host.device.CreatePlacedResource(&heap, 0, &texture_desc, D3D12_RESOURCE_STATE_COMMON, None, &mut made) }.unwrap();
+        let made = made.unwrap();
+        let held = crate::host::references(&heap);
+        println!("heap references: {before} before placing, {held} with a texture in it");
+        assert!(held >= before);
+        drop(made);
+        assert_eq!(crate::host::references(&heap), before);
     }
 
     /// A pooled texture's piece comes back when its last reference goes, not

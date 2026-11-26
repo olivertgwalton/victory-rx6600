@@ -22,6 +22,9 @@ clap.workspace = true
 tracing.workspace = true
 walkdir.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [build-dependencies]
 sha2 = "0.10.9"
 ureq = "2.12.1"
@@ -36,6 +39,10 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+# Only what a scripted run needs that every build does not have
+# (`VICTORY_STEP_OVER`; `VICTORY_KEYS` is in every build), none of the rest of
+# `diagnostics`.
+scripted = ["victory-loader/scripted"]
 
 [lints]
 workspace = true

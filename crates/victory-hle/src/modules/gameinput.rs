@@ -1191,7 +1191,6 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
@@ -1245,7 +1244,9 @@ mod host {
     /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
     /// time), with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// `Left`, `Right` (the stand-in pad's table maps them to buttons:
+    /// `Enter` is A). In every build, not only diagnostics ones: a launcher
+    /// uses it to press A on the start screen.
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();

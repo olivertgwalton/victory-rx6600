@@ -237,7 +237,8 @@ impl Pool {
         }));
         for i in 1..threads {
             // (A helper that is not there is only missed.)
-            let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
+            let _ = std::thread::Builder::new().name(format!("{name}-{i}")).stack_size(16 << 20).spawn(move || {
+                let _asker = crate::watch::asker(crate::watch::Asker::Refresh);
                 if name == "victory-land" {
                     crate::cores::keep_helper_on_fast_cores(name);
                 } else {
@@ -587,7 +588,7 @@ unsafe fn piece_at(
     // view's address stays where the title sees `title`. Not waited for: if
     // a change is under way, what the record of the views says now does
     // ([`anytime`]), or the title's own address.
-    let reading = beside.then(crate::watch::title_memory_reading_now).flatten();
+    let reading = beside.then(|| crate::watch::title_memory_reading_now_in(title, end)).flatten();
     let beside = if reading.is_some() || beside && anytime() { crate::inplace::beside(title, end) } else { None };
     count(stat::PIECES, 1);
     count(if beside.is_some() { stat::BESIDE } else { stat::DIRECT }, 1);
@@ -618,6 +619,8 @@ unsafe fn piece_at(
     let since = crate::watch::changes();
     let (mut pages, mut new_pages, mut blocks, mut dwords, mut missing) = (0, 0u64, 0, 0, 0);
     let mut span: Option<(usize, usize)> = None;
+    // Through the title's own address: the parts that changed, told once they are in.
+    let mut apart: Vec<(usize, usize)> = Vec::new();
     for_pages(title, parts, |from, n| {
         pages += 1;
         if !differing[(title + from) / PAGE - base] {
@@ -658,6 +661,8 @@ unsafe fn piece_at(
                 }
                 let s = span.get_or_insert((title + from, title + from + n));
                 s.1 = title + from + n;
+            } else {
+                apart.push((title + from, n));
             }
         }
     });
@@ -668,6 +673,7 @@ unsafe fn piece_at(
         let through = if missing == 0 { copy } else { std::ptr::null() };
         notes.landed.push((title / BLOCK, through));
     }
+    crate::watch::told(&apart);
     count(stat::NEW_PIECES, u64::from(new_pages > 0));
     count(stat::PAGES, pages);
     count(stat::NEW_PAGES, new_pages);

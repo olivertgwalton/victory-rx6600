@@ -452,6 +452,7 @@ fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
+            let _opening = crate::timeline::span("pipeline: open the host pipeline library");
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
@@ -498,7 +499,35 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
-    let library = make(&[]).ok()?;
+    // An empty library is asked for with no blob at all, which `make` cannot
+    // say: an empty slice still has an address, and vkd3d-proton refuses an
+    // address with no bytes behind it. That left it with no library at all.
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: no blob is read; a success that wrote a pointer wrote an owned
+    // ID3D12PipelineLibrary.
+    let made = unsafe {
+        (Interface::vtable(device).CreatePipelineLibrary)(
+            Interface::as_raw(device),
+            std::ptr::null(),
+            0,
+            &ID3D12PipelineLibrary::IID,
+            &mut raw,
+        )
+        .ok()
+        .and_then(|()| {
+            if raw.is_null() {
+                return Err(windows::Win32::Foundation::E_POINTER.into());
+            }
+            ID3D12PipelineLibrary::from_raw(raw).cast::<ID3D12PipelineLibrary1>()
+        })
+    };
+    let library = match made {
+        Ok(library) => library,
+        Err(e) => {
+            tracing::info!(error = %e, "the host refused an empty pipeline library");
+            return None;
+        }
+    };
     Some(Library {
         library,
         _blob: Blob::None,
@@ -525,6 +554,10 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    let create = || {
+        let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
+        create()
+    };
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
@@ -541,9 +574,11 @@ pub(crate) fn pipeline(
     };
     trace("load");
     let loaded = {
+        let mut loading = crate::timeline::span("pipeline: acquire library load guards");
         let _all = one_call();
         let _one = same_name(name);
         let _call = call("load", name);
+        loading.next("pipeline: load a PSO from the driver library");
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
     // The load read the library's file (see `trim`).
@@ -575,9 +610,11 @@ pub(crate) fn pipeline(
         )
     });
     trace("store");
+    let mut storing = crate::timeline::span("pipeline: acquire library store guards");
     let _all = one_call();
     let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
     let _call = call("store", name);
+    storing.next("pipeline: store a PSO in the driver library");
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
     if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
@@ -600,6 +637,7 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    let _saving = crate::timeline::span("pipeline: save the library and early list");
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
@@ -623,6 +661,7 @@ pub(crate) fn save(now: bool) {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
             let _call = call("serialise", "the whole library");
+            let _writing = crate::timeline::span("pipeline: serialize the library to disk");
             if let Err(e) = serialise(&library.library, &tmp, size) {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 let _ = std::fs::remove_file(&tmp);

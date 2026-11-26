@@ -21,6 +21,11 @@ mod ambient;
 mod budget;
 #[cfg(windows)]
 mod wine_dxc;
+mod lightprobe;
+#[cfg(windows)]
+mod texlate;
+#[cfg(windows)]
+mod texstore;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
@@ -34,6 +39,8 @@ mod copystat;
 mod faultbook;
 #[cfg(windows)]
 mod cores;
+#[cfg(windows)]
+mod debug_hud;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -41,6 +48,7 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+pub mod frametime;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]
@@ -53,6 +61,14 @@ mod pixels;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod port;
+#[cfg(windows)]
+mod port_cbv;
+#[cfg(windows)]
+pub mod port_descriptors;
+#[cfg(windows)]
+mod port_journal;
 #[cfg(windows)]
 mod land;
 pub mod list;
@@ -103,6 +119,8 @@ mod upload;
 mod watch;
 #[cfg(windows)]
 mod texback;
+#[cfg(windows)]
+mod wine;
 
 #[cfg(windows)]
 pub use host::on_failure;
@@ -119,11 +137,17 @@ pub fn switched(switch: &str) -> Option<bool> {
 pub fn frame_phase() -> u32 {
     copystat::phase()
 }
+
+/// Frames the title has begun (its frame waits that ended), for logs.
+pub fn frames_begun() -> u64 {
+    frame::current()
+}
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
     kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
-    title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
+    title_memory_remapping, title_memory_remapping_in, title_memory_splitting,
+    title_memory_unmapping, title_memory_written,
     writing as kernel_will_write,
 };

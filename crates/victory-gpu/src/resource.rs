@@ -100,6 +100,11 @@ pub(crate) struct ResourceDesc {
 
 #[cfg(windows)]
 impl ResourceDesc {
+    /// Width, height, format and levels (`crate::texstore`).
+    pub(crate) fn shape(&self) -> [u32; 4] {
+        [self.width as u32, self.height, self.format, u32::from(self.mip_levels)]
+    }
+
     /// The texture of this one's levels from `base` on.
     fn levels_from(&self, base: u32) -> ResourceDesc {
         let mut d = *self;
@@ -1179,6 +1184,14 @@ pub(crate) struct HostTexture {
     pub(crate) holds: std::sync::Arc<Holds>,
     /// Who makes its first upload (`crate::texture::ahead`).
     pub(crate) ahead: std::sync::atomic::AtomicU8,
+    /// Made whole from the store (`crate::texstore`): its levels below the
+    /// first one title memory holds, until a list copies them; then how
+    /// many levels the copy put in (its views show them).
+    pub(crate) prefill: std::sync::Mutex<Option<(u32, std::sync::Arc<Vec<u8>>)>>,
+    pub(crate) prefilled: std::sync::atomic::AtomicU32,
+    /// Uploads recorded into this host copy so far: the second and later ones
+    /// may leave parts out ([`crate::texture::delta`]).
+    pub(crate) uploads: std::sync::atomic::AtomicU32,
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
@@ -1377,6 +1390,31 @@ pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
 #[cfg(windows)]
 static REPLACED: std::sync::Mutex<Vec<(u64, Made)>> = std::sync::Mutex::new(Vec::new());
 
+/// The larger levels of placed texture `r`, first viewed from level
+/// `first`, if the store has them (`crate::texstore`): the level the title's
+/// memory is read from, and the levels below it as the host lays them out.
+#[cfg(windows)]
+fn stored_levels(r: &Resource, first: u32) -> Option<(u32, std::sync::Arc<Vec<u8>>)> {
+    if !crate::texstore::on() || r.desc.depth_or_array_size != 1 || r.desc.sample_count > 1 {
+        return None;
+    }
+    let t = texture_layout(&r.desc).filter(|t| t.planes.len() == 1)?;
+    let layout = &t.planes[0].layout;
+    if layout.desc.swizzle.xor() {
+        return None;
+    }
+    let level = read_from(layout, first);
+    let len = crate::texstore::key_levels(layout, u32::from(r.desc.mip_levels))
+        .into_iter()
+        .find(|&(k, _)| k == level)?
+        .1 as usize;
+    let mut smaller = vec![0u8; len];
+    if crate::host::read_there(r.data().cast_const(), &mut smaller) != len {
+        return None;
+    }
+    crate::texstore::find(r.desc.shape(), level, &smaller).map(|bytes| (level, bytes))
+}
+
 /// Since the start: host copies made with a first level other than the
 /// title's, and their bytes; host copies replaced by one with more levels;
 /// bytes of title memory such copies' textures take whole.
@@ -1396,6 +1434,9 @@ pub(crate) fn want_level(this: This, first: u32) {
     let r = resource(this);
     if r.desc.dimension == BUFFER || !r.host.placed.load(Relaxed) {
         return;
+    }
+    if r.desc.mip_levels > 1 {
+        crate::texlate::viewed(this as usize, first);
     }
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     let Some((host, _)) = made.as_ref() else {
@@ -1630,12 +1671,21 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // The levels views show ([`held_only`]), those of the slots shaders
         // pick by index among them.
         let mut base = 0;
+        let mut prefill = None;
         if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed).max(crate::texture::drop_mips());
             if first != u32::MAX {
                 base = base_level(&r.desc, first);
+            }
+            // The store has its larger levels: made whole at once.
+            if base > 0
+                && tiled.is_none()
+                && let Some(found) = stored_levels(r, first)
+            {
+                base = 0;
+                prefill = Some(found);
             }
         }
         let texture = match texture {
@@ -1664,6 +1714,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => HostTexture::new(texture, state),
         };
         host.base = base;
+        *host.prefill.get_mut().unwrap_or_else(|e| e.into_inner()) = prefill;
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
         if base > 0 {
             HELD[0].fetch_add(1, Relaxed);
@@ -2360,6 +2411,8 @@ impl HostTexture {
         let target_status = crate::pool::take_target_status(&texture);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
+        // Lists sent before must not find it in a slot they read by index.
+        crate::pool::unseen_any(&texture);
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
@@ -2371,6 +2424,9 @@ impl HostTexture {
             grown: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
+            prefill: Default::default(),
+            prefilled: Default::default(),
+            uploads: Default::default(),
             flags,
             audit: None,
             alias_pending: std::sync::atomic::AtomicBool::new(target_status.is_some()),
@@ -2389,6 +2445,7 @@ impl HostTexture {
         HOST_TEXTURES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: a live texture.
         let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
+        crate::pool::unseen_any(&texture);
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
@@ -2400,6 +2457,9 @@ impl HostTexture {
             grown: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
+            prefill: Default::default(),
+            prefilled: Default::default(),
+            uploads: Default::default(),
             flags,
             audit: None,
             alias_pending: Default::default(),
@@ -2833,6 +2893,7 @@ impl Drop for Resource {
         if self.desc.dimension != BUFFER {
             let address = std::ptr::from_ref::<Resource>(self) as usize;
             crate::texback::released(address);
+            crate::texlate::gone(address);
             textures().remove(&address);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());

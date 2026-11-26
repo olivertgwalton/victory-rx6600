@@ -453,8 +453,11 @@ impl HostPipeline {
         if std::env::var_os("VICTORY_PIPELINE_TRACE").is_some() {
             tracing::info!(step = "translating", shaders = ?shaders, "pipeline step");
         }
-        for (s, _) in &stages {
-            s.translated()?;
+        {
+            let _shaders = crate::timeline::span("pipeline: get translated shaders");
+            for (s, _) in &stages {
+                s.translated()?;
+            }
         }
         #[cfg(feature = "diagnostics")]
         if std::env::var_os("VICTORY_PIPELINE_TRACE").is_some() {

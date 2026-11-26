@@ -241,3 +241,11 @@ mod tests {
         assert_eq!(prefetch_limit(192 << 20, false, false, false, 0), 192 << 20);
     }
 }
+
+/// Whether the budgets of this module apply: always here (the NVIDIA fork
+/// took codec-d/cool_fox's residency as it is; the Linux perf branch made it
+/// `VICTORY_RESIDENCY=1`, and its callers ask this).
+#[allow(dead_code)]
+pub(crate) fn on() -> bool {
+    true
+}

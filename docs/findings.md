@@ -65,6 +65,45 @@ in that order of size:
   normalized buffer codes were one step off.
 - **Every ray missed**: the dispatch flag that says counts are threads, not groups.
 
+### Faces stood still (2026-11-25): found and fixed
+
+On an RX 7900 XTX and an RTX 4080 SUPER, with and without `-Safe`, no face moved
+(lips, brows, blinks) while bodies, hair and cloth did; never seen working in this
+fork. It was no program that does not translate, no pipeline the host refuses and no
+draw left out: every program of the chain ran every frame.
+
+The chain: a network of about twenty kinds of matrix programs (`CS_*Operation`, 671
+dispatches in the frame captured, three faces), then
+`CS_BlendshapeTranslationsHSSGraphOutputExtract`, then
+`CSComputeSkinningPedBlendShapes*` and `CS_ReconstructBlendshapeNormals`.
+
+In a frame captured at a cutscene (`victory replay <capture> --flow`, `--bytes`):
+
+- The buffer the extract reads the network's result from (views of `R16_UINT`) held
+  nothing but zeros after a whole frame, while the network's weights and the
+  extract's other inputs were there. Zero translations are a face at rest.
+- The network keeps its 16-bit halves in views of integer formats and reads and
+  writes them with `_d16` accesses. The translator took d16 data as f16 through a
+  float view unless it knew the view was an integer one, and it knew that only of
+  views a program picks from the heap, not of those in its tables (after VIctory
+  4243a96a). The network's programs have theirs in tables: `CS_GatherOperation`,
+  which writes the result, had `legacyF32ToF16` on every load and no look at the
+  view's kind. An integer's bits taken as a float are a denormal, and its f16 is zero.
+
+Fixed: the d16 accesses ask for the kind of a view in a table too, and the host
+writes the word of the table of strides for the dynamic slots of a table it makes
+afresh (the network's tables hold constant buffers, so they always are). Faces move
+on the RTX 4080 SUPER; not yet seen on the RX 7900 XTX. Tests: a d16 typed load
+through a table binds the table of strides, a 32-bit one does not
+(`a_d16_typed_buffer_load_through_a_table_reads_its_views_format_kind`, shader
+crate); the dynamic slots of a table get their words
+(`the_dynamic_slots_of_a_table_get_their_words_in_the_table_of_strides`, host;
+needs a card). The translations changed, so `TRANSLATOR_VERSION` is 2.
+
+Faces then moved but some were torn (mouths agape, teeth under the nose) on an
+RX 9070 under Proton (RADV, vkd3d-proton; Beqren's report): see "Faces still,
+eyes glowing, or faces torn" in `docs/proton.md` (`VICTORY_RAW_TYPED_LOADS`).
+
 ## Measured and not worth it
 
 - Unordered early pipelines for everything (AMD's compiler crashed).
@@ -85,7 +124,8 @@ in that order of size:
    for the next submission while this one is sent; view the card's own buffers where fills
    copy them now.
 2. The card: small buffers' copies in its own memory (`VICTORY_CARD_BUFFERS_MIN_KB=64`,
-   after fxceless c36971b2; not measured here yet), and the passes that run for nothing
+   after fxceless c36971b2, wins over `VICTORY_CARD_BUFFERS_MIN_MB`; not measured here
+   yet), and the passes that run for nothing
    without rays.
 3. Stalls: 270-660 s of a session were full of frames over 200 ms, almost all while new
    pipelines were made. `victory warm`, and a quarter of the workers for the slow ones.
