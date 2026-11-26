@@ -106,7 +106,7 @@ pub(crate) fn spans(
     Some(out)
 }
 
-thread_local! {
+victory_core::fast_local! {
     static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 

@@ -1134,6 +1134,92 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
 });
 pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
+/// Entries freed so far ([`forget`], under [`VIEWS`]' write lock, after their
+/// generations change): what a thread remembers of entries ([`Near`]) holds
+/// only while this is what it was when remembered.
+static RELEASED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What a thread remembers of [`VIEWS`], so that the views of a draw's slots
+/// are found without its lock. Every read of the lock writes its shared
+/// count, and eight recording threads reading it for every slot took turns
+/// on that one cache line (views_read and its unlock, 5 % of their own
+/// code's time, profile base). Shapes never change once numbered (they are
+/// only added), so they are remembered for good; a table entry is
+/// remembered by its record words until an entry is freed anywhere
+/// ([`RELEASED`]).
+#[derive(Default)]
+struct Near {
+    shapes: Vec<Shape>,
+    numbers: std::collections::HashMap<Shape, u32>,
+    entries: std::collections::HashMap<(u32, u32), View>,
+    released: u64,
+}
+
+victory_core::fast_local! {
+    static NEAR: std::cell::RefCell<Near> = std::cell::RefCell::new(Near::default());
+}
+
+/// The number of `shape`, from what this thread remembers or else the
+/// table (numbering it if it is new); `None` when the shapes are full.
+fn shape_number(shape: Shape) -> Option<u32> {
+    if let Some(n) = NEAR.with_borrow(|near| near.numbers.get(&shape).copied()) {
+        return Some(n);
+    }
+    let known = views_read().shape_index.get(&shape).copied();
+    let n = known.or_else(|| views_write().shape(shape))?;
+    NEAR.with_borrow_mut(|near| near.numbers.insert(shape, n));
+    Some(n)
+}
+
+/// The view of placed memory record words `i` and `generation` name, the
+/// shape from what this thread remembers.
+fn placed_near(i: u32, generation: u32) -> Option<View> {
+    let number = (payload(i, generation) >> PLACED_ADDRESS_BITS) as usize;
+    let have = NEAR.with_borrow(|near| near.shapes.len());
+    if number >= have {
+        let views = views_read();
+        let more = views.shapes.get(have..).unwrap_or_default().to_vec();
+        drop(views);
+        NEAR.with_borrow_mut(|near| {
+            if near.shapes.len() == have {
+                near.shapes.extend(more);
+            }
+        });
+    }
+    NEAR.with_borrow(|near| placed_view(&near.shapes, i, generation))
+}
+
+/// The view of table entry `i` at `generation`, if it is still its own.
+fn entry_near(i: u32, generation: u32) -> Option<View> {
+    use std::sync::atomic::Ordering::Acquire;
+    let released = RELEASED.load(Acquire);
+    let known = NEAR.with_borrow_mut(|near| {
+        if near.released != released {
+            near.entries.clear();
+            near.released = released;
+        }
+        near.entries.get(&(i, generation)).cloned()
+    });
+    if known.is_some() {
+        return known;
+    }
+    let view = {
+        let views = views_read();
+        let (view, current) = views.list.get(i as usize)?;
+        (*current == generation).then(|| view.clone())?
+    };
+    NEAR.with_borrow_mut(|near| {
+        // Bounded: the entries a frame names are some thousands.
+        if near.entries.len() >= 1 << 14 {
+            near.entries.clear();
+        }
+        if near.released == released {
+            near.entries.insert((i, generation), view.clone());
+        }
+    });
+    Some(view)
+}
+
 /// A record is the tag and two words, `i` and `generation` (the host keeps
 /// them as one 64-bit key per slot). The top two bits of `generation` say
 /// what the other 62 bits are: 0, entry `i` of the table at that
@@ -1223,6 +1309,19 @@ fn placed_words(shape: u32, address: u64) -> [u32; 2] {
     kind_words(PLACED, u64::from(shape) << PLACED_ADDRESS_BITS | address)
 }
 
+/// The view of placed memory record words `i` and `generation` name, out of
+/// `shapes` (the table's, or a thread's copy of its first ones).
+fn placed_view(shapes: &[Shape], i: u32, generation: u32) -> Option<View> {
+    let payload = payload(i, generation);
+    let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
+    let &(unordered, resource, rest) = shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
+    let mut desc = [0u32; 16];
+    desc[..10].copy_from_slice(&rest[..10]);
+    (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+    desc[12..].copy_from_slice(&rest[10..]);
+    Some(View::Placed(unordered, resource, desc))
+}
+
 impl Views {
     /// The number of `shape`, a new one if it is not there yet; `None` when
     /// the shapes are full (the view is then a table entry).
@@ -1240,15 +1339,9 @@ impl Views {
     }
 
     /// The view of placed memory [`placed_words`] named.
+    #[allow(dead_code)]
     fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
-        let payload = payload(i, generation);
-        let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
-        let &(unordered, resource, rest) = self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
-        let mut desc = [0u32; 16];
-        desc[..10].copy_from_slice(&rest[..10]);
-        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
-        desc[12..].copy_from_slice(&rest[10..]);
-        Some(View::Placed(unordered, resource, desc))
+        placed_view(&self.shapes, i, generation)
     }
 
     /// The record words of `view` as a table entry, if it has one.
@@ -1300,9 +1393,7 @@ fn words_for(view: View) -> [u32; 2] {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
                     // Nearly every placed view has a shape seen before.
-                    let known = views_read().shape_index.get(&shape).copied();
-                    let shape = known.or_else(|| views_write().shape(shape));
-                    if let Some(shape) = shape {
+                    if let Some(shape) = shape_number(shape) {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
                         return placed_words(shape, address);
                     }
@@ -1513,19 +1604,17 @@ pub(crate) fn forget(resource: usize) {
         // `forget` of that resource skips.
         views.free.push(i);
     }
+    // What threads remember of entries is let go at their next look.
+    RELEASED.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 /// The view the record words `i` and `generation` name: the one they hold
 /// whole, or the view of entry `i` if `generation` is still its own.
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
-        0 => {
-            let views = views_read();
-            let (view, current) = views.list.get(i as usize)?;
-            (*current == generation).then(|| view.clone())
-        }
+        0 => entry_near(i, generation),
         CONSTANT => Some(constant_of(i, generation)),
-        PLACED => views_read().placed_of(i, generation),
+        PLACED => placed_near(i, generation),
         _ => None,
     }
 }

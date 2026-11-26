@@ -28,6 +28,59 @@ fn mirror_ns(part: usize, since: std::time::Instant) {
 /// 5 ms of a frame, timeline thin-6).
 struct Slots(Vec<std::sync::atomic::AtomicU64>);
 
+/// The host resource a slot views, held while it does: its COM pointer in an
+/// atomic, owning one reference. Keeping the resource the slot holds already
+/// (most descriptor writes) is one load: no lock, and no reference taken and
+/// given back. A reader ([`Held::get`]) takes its own reference; the one a
+/// slot gives up goes to `crate::host::retire_resource`, which holds it until
+/// the submissions that may read it have run, so a pointer read just before
+/// it was swapped out is still alive when its reference is taken.
+#[derive(Default)]
+struct Held(std::sync::atomic::AtomicPtr<std::ffi::c_void>);
+
+impl Held {
+    /// Holds `resource` (or nothing); the resource held before, if it was
+    /// another, for the caller to retire.
+    fn hold(&self, resource: Option<ID3D12Resource>) -> Option<ID3D12Resource> {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        use windows::core::Interface;
+        let raw = resource.as_ref().map_or(std::ptr::null_mut(), Interface::as_raw);
+        if self.0.load(Acquire) == raw {
+            // The same again (`resource`'s reference goes with it).
+            return None;
+        }
+        let raw = resource.map_or(std::ptr::null_mut(), Interface::into_raw);
+        let old = self.0.swap(raw, AcqRel);
+        if old.is_null() {
+            return None;
+        }
+        // SAFETY: the reference the slot held, now ours.
+        let old = unsafe { ID3D12Resource::from_raw(old) };
+        // (Another thread put the same in meanwhile: one reference goes.)
+        (old.as_raw() != raw).then_some(old)
+    }
+
+    /// The resource held, with a reference of the caller's own.
+    fn get(&self) -> Option<ID3D12Resource> {
+        use windows::core::Interface;
+        let raw = self.0.load(std::sync::atomic::Ordering::Acquire);
+        // SAFETY: the slot's reference, alive while this one is taken (see
+        // the type); `ManuallyDrop` leaves it to the slot.
+        (!raw.is_null()).then(|| (*std::mem::ManuallyDrop::new(unsafe { ID3D12Resource::from_raw(raw) })).clone())
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let raw = std::mem::replace(self.0.get_mut(), std::ptr::null_mut());
+        if !raw.is_null() {
+            use windows::core::Interface;
+            // SAFETY: the slot's own reference.
+            drop(unsafe { ID3D12Resource::from_raw(raw) });
+        }
+    }
+}
+
 impl Slots {
     fn new(count: usize) -> Self {
         let mut bits = Vec::new();
@@ -183,10 +236,12 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     ///
-    /// A lock for each slot: one for the heap was what the recording threads
-    /// waited for most (5.6 % of their time, profile waits-1: each descriptor
-    /// made for a draw takes it, and lets go of what the slot held under it).
-    kept: Box<[Mutex<Option<ID3D12Resource>>]>,
+    /// One atomic pointer per slot ([`Held`]): one lock for the heap was
+    /// what the recording threads waited for most (5.6 % of their time,
+    /// profile waits-1), and a lock per slot still cost them 7 % of their own
+    /// code's time (profile base), with a COM reference taken and given back
+    /// for every descriptor written, most of them the resource already held.
+    kept: Box<[Held]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -266,7 +321,7 @@ impl Drop for HostHeap {
         crate::memory::heap_gone(std::ptr::from_ref(self) as usize);
         let mut n = 0u64;
         for slot in std::mem::take(&mut self.kept) {
-            if let Some(resource) = slot.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            if let Some(resource) = slot.hold(None) {
                 n += 1;
                 crate::host::retire_resource(resource);
             }
@@ -1874,7 +1929,7 @@ impl HostHeap {
             copied: Mutex::new(Vec::new()),
             waiting: Mutex::default(),
             away: Mutex::default(),
-            kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
+            kept: (0..count + extra).map(|_| Held::default()).collect(),
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -3244,25 +3299,16 @@ impl HostHeap {
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
-        let old = {
-            use windows::core::Interface;
-            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-            // The same again: nothing to retire.
-            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
-                return;
-            }
-            std::mem::replace(&mut *slot, resource)
-        };
         // A running submission may still read the old resource through
         // this slot.
-        if let Some(old) = old {
+        if let Some(old) = slot.hold(resource) {
             crate::host::retire_resource(old);
         }
     }
 
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
-        self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.kept.get(index as usize)?.get()
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
@@ -3897,7 +3943,7 @@ fn staged(sampler: bool, which: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
             }
         }
     }
-    thread_local! {
+    victory_core::fast_local! {
         static PLACE: Place = {
             let mut places = PLACES.lock().unwrap_or_else(|e| e.into_inner());
             Place(places.0.pop().or_else(|| {
@@ -6742,7 +6788,7 @@ impl ListViews {
     }
 }
 
-thread_local! {
+victory_core::fast_local! {
     static LIST_VIEWS: std::cell::RefCell<Option<ListViews>> = const { std::cell::RefCell::new(None) };
 }
 

@@ -258,7 +258,7 @@ static REPLACED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// serialise), the pipeline, and since when (`crate::host::now_us`).
 static CALLS: Mutex<Vec<(u32, &'static str, String, u64)>> = Mutex::new(Vec::new());
 
-thread_local! {
+victory_core::fast_local! {
     /// The pipeline this thread is making (its shaders), for [`CALLS`].
     static LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }

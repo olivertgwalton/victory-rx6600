@@ -1367,7 +1367,7 @@ pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
         return placed_bytes(desc);
     }
     type Known = std::collections::HashMap<([u32; 14], u32), Option<u64>>;
-    thread_local! {
+    victory_core::fast_local! {
         static KNOWN: std::cell::RefCell<Known> = std::cell::RefCell::default();
     }
     KNOWN.with(|known| {

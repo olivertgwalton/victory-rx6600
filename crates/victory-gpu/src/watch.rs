@@ -482,12 +482,12 @@ pub(crate) fn port_journal() -> bool {
 }
 
 #[cfg(test)]
-thread_local! {
+victory_core::fast_local! {
     /// [`port_journal`], for what this thread does.
     pub(crate) static PORT_JOURNAL_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-thread_local! {
+victory_core::fast_local! {
     /// Whether this thread is the submitting lane ("victory-submit").
     static ON_LANE: bool = std::thread::current().name() == Some("victory-submit");
 }
@@ -626,7 +626,7 @@ impl Drop for Asking {
     }
 }
 
-thread_local! {
+victory_core::fast_local! {
     /// Room for the kernel's answer.
     static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -956,7 +956,7 @@ impl Asker {
 }
 
 #[cfg(feature = "diagnostics")]
-thread_local! {
+victory_core::fast_local! {
     static ASKER: std::cell::Cell<Asker> = const { std::cell::Cell::new(Asker::Other) };
 }
 
@@ -1836,7 +1836,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     Some(answer)
 }
 
-thread_local! {
+victory_core::fast_local! {
     /// The askings this thread made of the kernel or the guards in [`writes`]: a texture's check
     /// ([`writes_for_texture`]) tells by them whether it asked.
     static ASKED_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -2047,7 +2047,7 @@ pub(crate) fn port_guard_plan() -> bool {
 }
 
 #[cfg(test)]
-thread_local! {
+victory_core::fast_local! {
     /// [`hot_rest`] in milliseconds, for what this thread does (0: as set).
     pub(crate) static HOT_IN_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// [`port_guard`], for what this thread does.
@@ -2709,7 +2709,7 @@ fn known_reserved() -> bool {
 }
 
 #[cfg(test)]
-thread_local! {
+victory_core::fast_local! {
     /// [`known_reserved`], for what this thread asks, when a test sets it.
     static KNOWN_RESERVED_IN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
@@ -3037,7 +3037,7 @@ fn rest() -> std::time::Duration {
 }
 
 #[cfg(test)]
-thread_local! {
+victory_core::fast_local! {
     /// [`rest`], for what this thread asks.
     static REST_IN_TEST: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
 }
@@ -3811,7 +3811,7 @@ fn guard_runs() -> bool {
 }
 
 #[cfg(test)]
-thread_local! {
+victory_core::fast_local! {
     /// [`guard_runs`], for what this thread does, and the calls of [`change`]
     /// it made: opening, setting.
     static RUNS_IN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
@@ -4501,7 +4501,7 @@ impl Drop for Remapping {
 /// shows: odd while one is under way.
 static CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-thread_local! {
+victory_core::fast_local! {
     /// This thread holds [`Remapping`]; and put blocks in
     /// [`Guards::changing`].
     static CHANGING: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, false)) };

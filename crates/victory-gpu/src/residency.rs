@@ -44,7 +44,7 @@ pub(crate) fn allocation_error(error: &windows::core::Error) {
     }
 }
 
-thread_local! {
+victory_core::fast_local! {
     static STAGING_DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 

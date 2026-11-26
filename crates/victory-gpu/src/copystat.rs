@@ -155,7 +155,7 @@ static COUNT: [Bank<COUNTERS>; BANKS] = [const { Bank([const { AtomicU64::new(0)
 #[inline]
 fn bank() -> usize {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    thread_local!(static MINE: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) });
+    victory_core::fast_local!(static MINE: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) });
     // (Asked by the allocator too: nothing here allocates.)
     MINE.try_with(|mine| {
         if mine.get() == usize::MAX {
@@ -1098,7 +1098,7 @@ struct Submitter {
 static SUBMITTERS: Mutex<Vec<(u32, Submitter)>> = Mutex::new(Vec::new());
 static RECORDERS: Mutex<Vec<(u32, u64, u64)>> = Mutex::new(Vec::new());
 
-thread_local! {
+victory_core::fast_local! {
     /// This thread's last submission: when it returned ([`now_us`]) and the
     /// thread's processor time then (user, kernel).
     static LEFT: std::cell::Cell<Option<(u64, u64, u64)>> = const { std::cell::Cell::new(None) };

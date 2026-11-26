@@ -360,7 +360,7 @@ impl Files {
 /// A number for this thread: 0 for the first that asks, and so on.
 fn this_thread() -> usize {
     static NEXT: AtomicU32 = AtomicU32::new(0);
-    thread_local! {
+    victory_core::fast_local! {
         static NUMBER: usize = NEXT.fetch_add(1, Ordering::Relaxed) as usize;
     }
     NUMBER.with(|n| *n)
@@ -397,7 +397,7 @@ fn read_overlapped(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io
             unsafe { CloseHandle(self.0) };
         }
     }
-    thread_local! {
+    victory_core::fast_local! {
         static DONE: Event =
             // SAFETY: a plain manual-reset event.
             Event(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) });
@@ -445,7 +445,7 @@ fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Re
     {
         return read_overlapped(file, out, offset);
     }
-    thread_local! {
+    victory_core::fast_local! {
         static BUFFER: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0; MOST + SECTOR]);
     }
     BUFFER.with_borrow_mut(|buffer| {
@@ -1439,7 +1439,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 /// that ends short of `out` passes: the title's chunks fill it exactly, and
 /// nothing says that is required.
 fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
-    thread_local! {
+    victory_core::fast_local! {
         static INFLATE: std::cell::RefCell<zlib_rs::Inflate> =
             std::cell::RefCell::new(zlib_rs::Inflate::new(true, 15));
     }

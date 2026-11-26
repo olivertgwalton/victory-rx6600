@@ -32,7 +32,7 @@ fn remembers() -> bool {
 /// protected meanwhile is forgotten then.
 const ANSWERS: u32 = 4096;
 
-thread_local! {
+victory_core::fast_local! {
     /// The regions Windows last said are committed and writable (start, end), newest first,
     /// and the answers they gave since they were emptied.
     static WRITABLE: Cell<([(usize, usize); 4], u32)> = const { Cell::new(([(0, 0); 4], 0)) };
