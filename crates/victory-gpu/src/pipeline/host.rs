@@ -449,8 +449,16 @@ impl HostPipeline {
         if mesh.is_some() && !host()?.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
+        #[cfg(feature = "diagnostics")]
+        if std::env::var_os("VICTORY_PIPELINE_TRACE").is_some() {
+            tracing::info!(step = "translating", shaders = ?shaders, "pipeline step");
+        }
         for (s, _) in &stages {
             s.translated()?;
+        }
+        #[cfg(feature = "diagnostics")]
+        if std::env::var_os("VICTORY_PIPELINE_TRACE").is_some() {
+            tracing::info!(step = "translated", shaders = ?shaders, "pipeline step");
         }
         let host = host()?;
 
@@ -467,6 +475,10 @@ impl HostPipeline {
         .is_ok()
             && options.AnisoFilterWithPointMipSupported.as_bool();
 
+        #[cfg(feature = "diagnostics")]
+        if std::env::var_os("VICTORY_PIPELINE_TRACE").is_some() {
+            tracing::info!(step = "root signature", shaders = ?shaders, "pipeline step");
+        }
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         // The ranges table parameters point at, alive until the root
@@ -615,6 +627,10 @@ impl HostPipeline {
                 CS: code(0),
                 ..Default::default()
             };
+            #[cfg(feature = "diagnostics")]
+        if std::env::var_os("VICTORY_PIPELINE_TRACE").is_some() {
+            tracing::info!(step = "compute pipeline", shaders = ?shaders, "pipeline step");
+        }
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
             let made = super::library::pipeline(
                 &name,

@@ -9,7 +9,7 @@
 //! CPU to a buffer the card writes, words the card has written since the
 //! start of the frame (which are not what was last put there) stay.
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+use crate::wine_dxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 
 use super::*;

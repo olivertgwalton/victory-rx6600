@@ -173,6 +173,8 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    log_to_file();
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -287,4 +289,33 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+/// `VICTORY_LOG_FILE=<path>`: stdout and stderr (the log, crash reports,
+/// stack dumps) appended to that file instead. For launchers that give the
+/// process a console of its own (Proton's), whose output nobody reads and
+/// which blocks with no display.
+#[cfg(windows)]
+fn log_to_file() {
+    use std::os::windows::io::IntoRawHandle;
+    unsafe extern "system" {
+        fn SetStdHandle(which: u32, handle: *mut core::ffi::c_void) -> i32;
+    }
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    let Some(path) = std::env::var_os("VICTORY_LOG_FILE") else {
+        return;
+    };
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path);
+    let Ok(file) = file else {
+        return;
+    };
+    // The handle stays open for the process; the standard library looks the
+    // handles up on each write.
+    let handle = file.into_raw_handle();
+    // SAFETY: a valid handle we own and keep open.
+    unsafe {
+        SetStdHandle(STD_OUTPUT_HANDLE, handle);
+        SetStdHandle(STD_ERROR_HANDLE, handle);
+    }
 }

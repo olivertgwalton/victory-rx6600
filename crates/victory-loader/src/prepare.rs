@@ -31,6 +31,50 @@ impl PreparedImage {
     }
 }
 
+/// `VICTORY_PATCH=<image>+0x<rva>:<expected hex>=<new hex>;...` (the format
+/// Palmwave's `XCL_PATCH` uses): byte patches for testing, written into the
+/// prepared copy of the image named (case ignored), each only where the
+/// bytes at the RVA are the expected ones, so another build is left alone.
+/// Returns what was done, a line per patch for the log.
+pub fn apply_patches(prepared: &mut PreparedImage, name: &str) -> Vec<String> {
+    let Ok(spec) = std::env::var("VICTORY_PATCH") else {
+        return Vec::new();
+    };
+    let hex = |s: &str| -> Option<Vec<u8>> {
+        (s.len() % 2 == 0)
+            .then(|| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect())
+            .flatten()
+    };
+    let mut done = Vec::new();
+    for entry in spec.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+        let parsed = (|| {
+            let (image, rest) = entry.split_once('+')?;
+            let (rva, bytes) = rest.split_once(':')?;
+            let (old, new) = bytes.split_once('=')?;
+            let rva = u32::from_str_radix(rva.trim_start_matches("0x"), 16).ok()?;
+            Some((image, rva, hex(old)?, hex(new)?))
+        })();
+        let Some((image, rva, old, new)) = parsed else {
+            done.push(format!("{entry}: not understood"));
+            continue;
+        };
+        if !image.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let at = prepared.info.rva_to_file_offset(rva).map(|o| o as usize);
+        match at {
+            Some(at) if old.len() == new.len() && prepared.bytes.get(at..at + old.len()) == Some(&old[..]) => {
+                prepared.bytes[at..at + new.len()].copy_from_slice(&new);
+                done.push(format!("{entry}: applied"));
+            }
+            Some(_) if old.len() != new.len() => done.push(format!("{entry}: expected and new differ in length")),
+            Some(_) => done.push(format!("{entry}: skipped, the bytes there differ")),
+            None => done.push(format!("{entry}: skipped, no such RVA in the file")),
+        }
+    }
+    done
+}
+
 /// Produces the patched copy. The changes are:
 ///
 /// * `IMAGE_FILE_DLL` set, entry point cleared: the OS maps it like a DLL

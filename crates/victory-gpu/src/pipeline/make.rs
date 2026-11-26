@@ -37,6 +37,12 @@ pub(crate) struct Pending {
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    /// When a thread began making it ([`Pending::make`]).
+    making_since: OnceLock<Instant>,
+    /// When a draw first waited for it ([`wait`]).
+    waited_since: OnceLock<Instant>,
+    /// Noted in the list of pipelines that never came back ([`note_hung`]).
+    noted_hung: AtomicBool,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -118,7 +124,10 @@ impl Pending {
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
-        let left_out = left_out(&shaders);
+        let key = key.finalize().to_hex()[..32].to_owned();
+        let left_out = left_out(&shaders).or_else(|| {
+            hung().contains(&key).then_some("the host's compiler never returned from it in an earlier run, left out")
+        });
         Pending {
             screen,
             scene_input,
@@ -128,7 +137,10 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
+            making_since: OnceLock::new(),
+            waited_since: OnceLock::new(),
+            noted_hung: AtomicBool::new(false),
+            key,
             used: AtomicBool::new(false),
         }
     }
@@ -140,7 +152,20 @@ impl Pending {
     fn make(&self) {
         self.made.get_or_init(|| {
             let began = Instant::now();
+            let _ = self.making_since.set(began);
+            #[cfg(feature = "diagnostics")]
+            if std::env::var_os("VICTORY_PIPELINE_TRACE").is_some() {
+                tracing::info!(shaders = hashes(self), "pipeline making");
+            }
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            #[cfg(feature = "diagnostics")]
+            if std::env::var_os("VICTORY_PIPELINE_TRACE").is_some() {
+                tracing::info!(shaders = hashes(self), ok = made.is_some(), "pipeline finished");
+            }
+            #[cfg(feature = "diagnostics")]
+            if began.elapsed().as_millis() >= 2000 {
+                tracing::warn!(ms = began.elapsed().as_millis() as u64, ok = made.is_some(), shaders = hashes(self), "pipeline made slowly");
+            }
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
@@ -154,9 +179,12 @@ impl Pending {
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(why) = p.left_out {
+        return Some(why.to_owned());
+    }
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some("being made".into()),
+        None => Some(format!("being made (queue state {}) [{}]", p.queue_state.load(Ordering::Relaxed), hashes(p))),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
@@ -272,8 +300,72 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// A pipeline the host has been making for this long is not waited for: its
+/// draws are dropped until it is made. Under Proton, vkd3d-proton never
+/// returned from six of the title's compute pipelines (on RADV), and every
+/// frame waited out the whole budget for them: 330 ms frames against 125.
+/// `VICTORY_PIPELINE_STUCK_MS` (2,000; 0: always wait, as before).
+fn stuck_after() -> Option<Duration> {
+    static AFTER: OnceLock<Option<Duration>> = OnceLock::new();
+    *AFTER.get_or_init(|| {
+        let ms = std::env::var("VICTORY_PIPELINE_STUCK_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(2000);
+        (ms > 0).then(|| Duration::from_millis(ms))
+    })
+}
+
+/// Pipelines still being made this long are written to the cache folder's
+/// list ([`HUNG_FILE`]) and left out by later runs, which would otherwise
+/// lose a worker to each for the whole run.
+const HUNG_AFTER: Duration = Duration::from_secs(30);
+const HUNG_FILE: &str = "pipelines-hung.txt";
+
+/// The keys of pipelines an earlier run's host never finished making.
+fn hung() -> &'static std::collections::HashSet<String> {
+    static HUNG: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    HUNG.get_or_init(|| {
+        if std::env::var_os("VICTORY_PIPELINE_HUNG").is_some_and(|v| v == "0") {
+            return Default::default();
+        }
+        let Some(dir) = super::library::dir() else { return Default::default() };
+        let list: std::collections::HashSet<String> = std::fs::read_to_string(dir.join(HUNG_FILE))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .map(str::to_owned)
+            .collect();
+        if !list.is_empty() {
+            tracing::info!(n = list.len(), "pipelines an earlier run never finished making are left out (VICTORY_PIPELINE_HUNG=0 tries them)");
+        }
+        list
+    })
+}
+
+/// Notes `p` in the list of pipelines that never came back.
+fn note_hung(p: &Pending) {
+    if p.noted_hung.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    tracing::warn!(shaders = hashes(p), key = p.key, "the host has been making a pipeline for 30 s: left out from the next run on");
+    let Some(dir) = super::library::dir() else { return };
+    let _ = std::fs::create_dir_all(dir);
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(HUNG_FILE)) {
+        let _ = writeln!(f, "{} {}", p.key, hashes(p));
+    }
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
+    if let Some(after) = stuck_after() {
+        if p.making_since.get().is_some_and(|since| since.elapsed() >= HUNG_AFTER) {
+            note_hung(p);
+        }
+        // Waited for this long already (being made, or queued behind workers
+        // that are): its draws go without it from now on.
+        if p.waited_since.get_or_init(Instant::now).elapsed() >= after {
+            return;
+        }
+    }
     let screen = p.screen && screens_first();
     let budget = if screen { screen_budget() } else { wait_budget() };
     if budget.is_zero() {

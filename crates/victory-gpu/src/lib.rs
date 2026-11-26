@@ -19,6 +19,8 @@
 mod ambient;
 #[cfg(windows)]
 mod budget;
+#[cfg(windows)]
+mod wine_dxc;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]

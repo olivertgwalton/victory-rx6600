@@ -40,7 +40,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+use crate::wine_dxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;

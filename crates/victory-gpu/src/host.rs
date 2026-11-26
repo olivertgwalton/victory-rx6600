@@ -1501,7 +1501,7 @@ pub(crate) fn compile(
     entry: windows::core::PCSTR,
     target: windows::core::PCSTR,
 ) -> windows::core::Result<Vec<u8>> {
-    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use crate::wine_dxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
@@ -4334,7 +4334,7 @@ impl Host {
     }
 
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use crate::wine_dxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call; the out

@@ -29,6 +29,7 @@ pub fn init(default_level: &str) {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(true)
+                .with_ansi(std::env::var_os("VICTORY_LOG_FILE").is_none())
                 .with_writer(std::io::stderr),
         )
         .try_init();

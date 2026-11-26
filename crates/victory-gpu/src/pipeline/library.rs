@@ -57,6 +57,12 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// The cache folder, once set (for `crate::pipeline::make`'s list of
+/// pipelines the host's compiler never returned from).
+pub(crate) fn dir() -> Option<&'static PathBuf> {
+    DIR.get()
+}
+
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
@@ -525,6 +531,15 @@ pub(crate) fn pipeline(
         return create();
     };
     let began = std::time::Instant::now();
+    let trace = |step: &str| {
+        #[cfg(feature = "diagnostics")]
+        if std::env::var_os("VICTORY_PIPELINE_TRACE").is_some() {
+            let label = LABEL.with(|l| l.borrow().clone());
+            tracing::info!(step, label, "pipeline step");
+        }
+        let _ = step;
+    };
+    trace("load");
     let loaded = {
         let _all = one_call();
         let _one = same_name(name);
@@ -545,6 +560,7 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
+    trace("create");
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
@@ -558,6 +574,7 @@ pub(crate) fn pipeline(
             began.elapsed().as_secs_f64() * 1e3
         )
     });
+    trace("store");
     let _all = one_call();
     let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
     let _call = call("store", name);
@@ -566,6 +583,7 @@ pub(crate) fn pipeline(
     if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
         library.added.fetch_add(1, Ordering::Relaxed);
     }
+    trace("stored");
     Ok(pso)
 }
 
