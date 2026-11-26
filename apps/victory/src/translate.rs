@@ -561,6 +561,35 @@ fn translate(
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    // `VICTORY_SP3_DUMP=<dir>;<text>|<text>...`: the native programs of the
+    // containers whose line holds one of the texts, as SP3 listings.
+    if let Ok(spec) = std::env::var("VICTORY_SP3_DUMP")
+        && let Some((dir, texts)) = spec.split_once(';')
+    {
+        let line = example();
+        if texts.split('|').any(|text| !text.is_empty() && line.contains(text)) {
+            let name: String = source
+                .label()
+                .chars()
+                .skip_while(|c| *c != ' ')
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .take(90)
+                .collect();
+            let _ = std::fs::create_dir_all(dir);
+            for (k, p) in programs.iter().enumerate() {
+                let mut out = format!("; {line}\n; {:?} wave64={} vgprs={}\n", p.stage, p.wave64, p.vgprs);
+                match victory_shader::gfx10::decode(&p.code) {
+                    Ok(insts) => {
+                        for i in insts {
+                            out.push_str(&format!("{:06x}: {}\n", i.offset, i.text(p.wave64)));
+                        }
+                    }
+                    Err(e) => out.push_str(&format!("; decode: {e}\n")),
+                }
+                let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.{k}.s")), out);
+            }
+        }
+    }
     // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
