@@ -3499,6 +3499,75 @@ impl<'a> Lower<'a> {
         (sum, hi)
     }
 
+    /// Puts the running submission's number into the dword of title page
+    /// `page` (clamped as the directory's) of [`super::shader::SLOT_MARKS`]:
+    /// the shader wrote there. In the current block: the caller is in the
+    /// branch of the lanes that store.
+    fn mark_page(&mut self, page: V) {
+        use super::shader::{MARKS_EPOCH, SLOT_MARKS};
+        let c = self.cur;
+        let (iu, res, void) = (self.s.m.undef(self.s.t.i32), self.s.t.res_ret, self.s.t.void);
+        let h = self.s.root_uav_handle(SLOT_MARKS);
+        let (one, align, k2) = (self.s.m.i8(1), self.s.m.i32(4), self.s.m.i32(2));
+        let epoch_at = self.s.m.i32(MARKS_EPOCH * 4);
+        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, res, 139, &[h, epoch_at, iu, one, align]);
+        let epoch = self.s.m.extract(c, r, 0);
+        let epoch = self.as_int(epoch);
+        let at = self.s.m.bin(c, Bin::Shl, page, k2);
+        self.s.op(c, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[h, at, iu, epoch, iu, iu, iu, one, align]);
+    }
+
+    /// [`Self::mark_page`] of the page holding title address `lo`, `hi`, or of
+    /// the dword of stores of no known address (`None`).
+    fn mark_address(&mut self, address: Option<(V, V)>) {
+        use super::shader::MARKS_UNKNOWN;
+        let c = self.cur;
+        let page = match address {
+            Some((lo, hi)) => {
+                let i32t = self.s.t.i32;
+                let (k16, k8) = (self.s.m.i32(16), self.s.m.i32(0xFF));
+                let low = self.s.m.bin(c, Bin::LShr, lo, k16);
+                let high = self.s.m.bin(c, Bin::And, hi, k8);
+                let high = self.s.m.bin(c, Bin::Shl, high, k16);
+                let page = self.s.m.bin(c, Bin::Or, low, high);
+                // Past the directory: no known page, as there.
+                let last = self.s.m.i32(MARKS_UNKNOWN);
+                let page = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[page, last]);
+                self.s.m.tag(page, Tag::Clamp);
+                page
+            }
+            None => self.s.m.i32(MARKS_UNKNOWN),
+        };
+        self.mark_page(page);
+    }
+
+    /// Marks what a store or atomic through the buffer view of `site`
+    /// (`src`) writes at byte `byte` of the view (`None`: not known, a typed
+    /// store): its title address is the view's plus the byte. A view by
+    /// address (`root_address`) was marked by [`Self::memory`]. In the
+    /// branch of the lanes that store.
+    fn mark_view(&mut self, site: Site, src: &Source, byte: Option<V>) {
+        if self.root_address(src).is_some() {
+            return;
+        }
+        let base = match self.view_address(site) {
+            Some(base) => Some(base),
+            None => self.heap_view_address(site).ok().flatten(),
+        };
+        let address = match (base, byte) {
+            (Some((lo, hi)), Some(byte)) => {
+                let c = self.cur;
+                let i32t = self.s.t.i32;
+                let sum = self.s.m.bin(c, Bin::Add, lo, byte);
+                let wrapped = self.s.m.cmp(c, pred::IULT, sum, lo);
+                let carry = self.s.m.cast(c, Cast::ZExt, wrapped, i32t);
+                Some((sum, self.s.m.bin(c, Bin::Add, hi, carry)))
+            }
+            _ => None,
+        };
+        self.mark_address(address);
+    }
+
     /// Title memory at the 40-bit address `lo`, `hi` (`shader.rs`
     /// `SLOT_MEMORY`): the handle of the raw view of the host copy holding
     /// it and the byte in that view. A page without a copy reads zeros
@@ -3568,6 +3637,12 @@ impl<'a> Lower<'a> {
             &[faults, place, iu, page, iu, iu, iu, mask, align],
         );
         self.end_guarded(noting, &[]);
+        if store {
+            // (In a branch of its own: the caller's store is in its own.)
+            let marking = self.begin_guarded(guard);
+            self.mark_page(page);
+            self.end_guarded(marking, &[]);
+        }
         let c = self.cur;
         self.page_there = Some(self.s.m.cmp(c, pred::NE, copy, zero));
         let copy = if store {
@@ -12455,6 +12530,7 @@ impl<'a> Lower<'a> {
             let (and, or) = (self.s.m.i32(1), self.s.m.i32(2));
             let i32t = self.s.t.i32;
             let at = self.begin_guarded(guard);
+            self.mark_view(site, &src, Some(byte));
             for (op, x) in [(and, keep), (or, set)] {
                 let args = [h, op, aligned, iu, iu, x];
                 self.s
@@ -12499,7 +12575,18 @@ impl<'a> Lower<'a> {
                 Some(v) if returns => self.i32_of(v)?,
                 _ => self.s.m.i32(0),
             };
+            // The byte of the view the atomic writes.
+            let written = match index {
+                None => Some(off),
+                Some(index) if used.is_some_and(|u| u.stride == 1) => Some(self.s.m.bin(c, Bin::Add, index, off)),
+                Some(index) => {
+                    let stride = self.s.m.i32(used.map_or(0, |u| u.stride));
+                    let at = self.s.m.bin(c, Bin::Mul, index, stride);
+                    Some(self.s.m.bin(c, Bin::Add, at, off))
+                }
+            };
             let at = self.begin_guarded(guard);
+            self.mark_view(site, &src, written);
             let i32t = self.s.t.i32;
             let r = if op == u32::MAX {
                 // cmpswap: data is (new, compare).
@@ -12608,7 +12695,20 @@ impl<'a> Lower<'a> {
             if !typed {
                 args.push(self.s.m.i32(4));
             }
+            // The byte of the view the store writes; a typed store's element
+            // size is the view's format's, which the shader does not know.
+            let written = match (typed, index) {
+                (true, _) => None,
+                (false, None) => Some(off),
+                (false, Some(index)) if used.is_some_and(|u| u.stride == 1) => Some(self.s.m.bin(c, Bin::Add, index, off)),
+                (false, Some(index)) => {
+                    let stride = self.s.m.i32(used.map_or(0, |u| u.stride));
+                    let at = self.s.m.bin(c, Bin::Mul, index, stride);
+                    Some(self.s.m.bin(c, Bin::Add, at, off))
+                }
+            };
             let at = self.begin_guarded(guard);
+            self.mark_view(site, &src, written);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
             self.end_guarded(at, &[]);

@@ -106,7 +106,7 @@ static RETIRED: [Mutex<std::collections::VecDeque<(u64, Retired)>>; 16] =
 /// The calling thread's part of [`RETIRED`].
 fn retired() -> std::sync::MutexGuard<'static, std::collections::VecDeque<(u64, Retired)>> {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    thread_local! {
+    victory_core::fast_local! {
         static PART: usize = NEXT.fetch_add(1, Ordering::Relaxed) % RETIRED.len();
     }
     // (A thread that ends may come here after its locals are gone.)
@@ -2653,6 +2653,9 @@ struct Deferred {
     /// memory (host copy, address, bytes): declaring them again would
     /// change nothing.
     gpu_written: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    /// Title memory (address, bytes) the list's copy commands of ours write
+    /// in copies (not its shaders): marked at submission (`crate::marks`).
+    copy_writes: Vec<(usize, usize)>,
     /// Scratch memory [`HostList::fill_scratch`] fills since the list last
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
@@ -3905,9 +3908,12 @@ fn relay_worker() {
 struct RelayBack {
     work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     found: Option<Vec<Vec<(usize, usize)>>>,
+    /// The first submission whose writes these are (`crate::marks`); `None`:
+    /// not known, everything is looked through.
+    since: Option<u64>,
 }
 
-fn relay_hand_back(back: &[Declared]) -> RelayBack {
+fn relay_hand_back(back: &[Declared], since: Option<u64>) -> RelayBack {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
         if shadow.carded() {
@@ -3920,7 +3926,7 @@ fn relay_hand_back(back: &[Declared]) -> RelayBack {
         }
         work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
     }
-    RelayBack { work, found: None }
+    RelayBack { work, found: None, since }
 }
 
 impl RelayBack {
@@ -3934,7 +3940,7 @@ impl RelayBack {
         // later flight writing, the title's bytes going in) is found now or
         // by that flight's landing, and the merge looks again under the
         // lock.
-        self.found = Some(crate::shadow::find_all(&self.work));
+        self.found = Some(crate::shadow::find_all(&self.work, self.since));
         crate::land::spent(stat, scanning);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
@@ -4338,7 +4344,7 @@ fn read_backs(list: &HostList) {
 
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
-fn hand_back(back: &[Declared]) {
+fn hand_back(back: &[Declared], since: Option<u64>) {
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
@@ -4360,7 +4366,7 @@ fn hand_back(back: &[Declared]) {
         }
         #[cfg(feature = "diagnostics")]
         let scanning = std::time::Instant::now();
-        let found = crate::shadow::find_all(&work);
+        let found = crate::shadow::find_all(&work, since);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
         for ((shadow, from, to), found) in work.iter().zip(found) {
@@ -5464,7 +5470,8 @@ impl Host {
                         }
                     }
                 }
-                let mut hand_back = relay_hand_back(&back);
+                let since = flights.iter().map(|f| f.number).min();
+                let mut hand_back = relay_hand_back(&back, since);
                 stage.next("landing: copies in the card's memory");
                 self.relay_card_back(&plans, fetch, &mut || {
                     if crate::land::on() {
@@ -5969,7 +5976,14 @@ impl Host {
                         }
                     }
                 }
-                hand_back(&back);
+                let since = items
+                    .iter()
+                    .filter_map(|i| match i {
+                        Late::Run(f) => Some(f.number),
+                        _ => None,
+                    })
+                    .min();
+                hand_back(&back, since);
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // In the order given: what tells the title the card is done.
@@ -6305,6 +6319,24 @@ impl Host {
         split.part(15);
         let prepared = std::time::Instant::now();
         stage.next("submit: sending");
+        // The submission's number, where its shaders read it to mark what
+        // they write, before any of them runs; and the pages its copy
+        // commands write (`crate::marks`).
+        crate::marks::copies_written(
+            runs.iter().copied().chain(own.iter().map(|o| o.list())).flat_map(|l| l.deferred().copy_writes.clone()),
+            this_submission,
+        );
+        // SAFETY: a plain query.
+        let done = unsafe { self.fence.GetCompletedValue() };
+        if let Some(epoch) = crate::marks::epoch_list(&self.device, this_submission, *submitted + 1, done) {
+            lists.insert(0, Some(epoch));
+            #[cfg(feature = "diagnostics")]
+            {
+                marks.iter_mut().for_each(|m| m.0 += 1);
+                marks.insert(0, (0, crate::copystat::Timed::Other));
+            }
+            firsts.iter_mut().for_each(|first| *first += 1);
+        }
         // When it runs on the card, for the timeline.
         #[cfg(feature = "diagnostics")]
         let stamp = stamps::take();
@@ -6490,7 +6522,7 @@ impl Host {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
         let back = crate::picked::with(declared, &picked.written);
-        hand_back(&back);
+        hand_back(&back, Some(this_submission));
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -7612,6 +7644,13 @@ impl HostList {
     /// Declared once until the list next writes title memory (but with
     /// `VICTORY_DECLARE_ONCE=0`): the dispatches of a frame declared the
     /// same ranges thousands of times, each a step of its own.
+    /// A copy command of ours (not a shader) writes `[address, address +
+    /// len)` of a copy: marked at submission as a shader's stores mark what
+    /// they write (`crate::marks`).
+    pub(crate) fn defer_copy_write(&self, address: usize, len: usize) {
+        self.deferred().copy_writes.push((address, len));
+    }
+
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,

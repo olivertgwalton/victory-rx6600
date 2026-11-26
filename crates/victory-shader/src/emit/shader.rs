@@ -70,6 +70,25 @@ pub const SLOT_STRIDES_BYTES: u32 = VIEW_ADDRESSES + SLOT_STRIDES_COUNT * 8;
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
+/// What shaders wrote, for the host's copy-back: the root UAV `u<SLOT_MARKS>`
+/// in [`ROOT_CBV_SPACE`] holds a dword per 64 KiB page of title memory
+/// ([`MEMORY_PAGES`] of them, by address as [`SLOT_MEMORY`]'s directory) and,
+/// at [`MARKS_EPOCH`], the number of the submission running, which the host
+/// writes at its start. Every store and atomic of a translated shader to
+/// title memory (through a buffer view or by address) puts that number into
+/// its page's dword; one whose address the shader cannot tell (a typed
+/// buffer store, a view of no known address) puts it into
+/// [`MARKS_UNKNOWN`]. A page whose dword is below a submission's number was
+/// not written by the shaders of that submission or any after it: the host
+/// need not look for their writes there.
+pub const SLOT_MARKS: u8 = 251;
+/// See [`SLOT_MARKS`]: the dword of stores of no known address (also that of
+/// pages past the directory's end, as there).
+pub const MARKS_UNKNOWN: u32 = MEMORY_PAGES - 1;
+/// See [`SLOT_MARKS`]: the dword of the running submission's number.
+pub const MARKS_EPOCH: u32 = MEMORY_PAGES;
+/// Dwords of the [`SLOT_MARKS`] buffer.
+pub const MARKS_DWORDS: u32 = MEMORY_PAGES + 64;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// In a directory entry's first dword: shaders do not store there by address

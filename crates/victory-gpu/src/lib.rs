@@ -24,6 +24,8 @@ mod wine_dxc;
 #[cfg(windows)]
 mod uffd;
 #[cfg(windows)]
+pub(crate) mod marks;
+#[cfg(windows)]
 mod unixlib;
 #[cfg(windows)]
 pub(crate) mod dmabuf;

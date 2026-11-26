@@ -148,7 +148,7 @@ const DEPTH_WRITE: u32 = 0x10;
 const DEPTH_READ: u32 = 0x20;
 const SHADER_RESOURCE: u32 = 0x40 | 0x80;
 
-thread_local! {
+victory_core::fast_local! {
     /// While a draw is prepared (`State::bind`, then its targets' states):
     /// the depth target the draw only tests (0: none, or one it writes),
     /// and whether a view its shaders read is of that same texture.
@@ -1987,6 +1987,25 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_MARKS {
+                    // Ours: where shaders mark the title pages they write
+                    // (`crate::marks`).
+                    let Some(marks) = crate::marks::gpu() else {
+                        crate::host::fail(format_args!("a shader marks what it writes and the marks could not be made"));
+                    };
+                    if self.sets.root(compute, param, Bound::Uav(marks)) {
+                        // SAFETY: an open list; the marks live as long as the
+                        // process.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootUnorderedAccessView(param, marks);
+                            } else {
+                                l.SetGraphicsRootUnorderedAccessView(param, marks);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory

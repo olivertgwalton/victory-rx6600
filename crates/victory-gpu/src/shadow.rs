@@ -1710,8 +1710,10 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
 /// With [`wide_back`]: for each of `work` (a copy not in the card's memory
 /// and a range `[address, end)` its shaders may have written, declared and
 /// not yet done), the 64 KiB pieces that differ from the snapshot, as
-/// [`Shadow::copy_back_with`] takes them; found on several threads.
-pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+/// [`Shadow::copy_back_with`] takes them; found on several threads. Pieces
+/// that nothing of submission `since` or after it wrote (`crate::marks`) are
+/// not looked at.
+pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)], since: Option<u64>) -> Vec<Vec<(usize, usize)>> {
     let scans = work
         .iter()
         .map(|(shadow, address, end)| {
@@ -1724,7 +1726,7 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
             }
         })
         .collect();
-    find_pieces(scans)
+    find_pieces(scans, since)
 }
 
 /// For each of `scans` (where a copy's bytes are, where its snapshot's
@@ -1733,7 +1735,7 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
 /// [`Shadow::differing`] cuts them) of `[from, to)` whose bytes differ, as
 /// (offset, bytes) in order. On several threads ([`wide`]), in pieces of
 /// work of about [`WIDE_JOB`] bytes that hold whole pieces.
-fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usize, usize)>> {
+fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>, since: Option<u64>) -> Vec<Vec<(usize, usize)>> {
     // What a job finds: (which scan, its place among that scan's jobs, the
     // pieces).
     type Found = Vec<(usize, usize, Vec<(usize, usize)>)>;
@@ -1756,6 +1758,12 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                 let mut at = from;
                 while at < to {
                     let n = (PIECE - (start + at) % PIECE).min(to - at);
+                    // Not written by the card since the flights began: the
+                    // copy holds what the snapshot does.
+                    if since.is_some_and(|since| crate::marks::untouched_since(start + at, n, since)) {
+                        at += n;
+                        continue;
+                    }
                     // SAFETY: inside the copy's mapping and its snapshot
                     // (which holds the copy's bytes at the copy's offsets);
                     // nothing writes either while a submission's results
@@ -1920,7 +1928,7 @@ mod wide_tests {
         // A scan of nothing (a range whose snapshot is gone).
         scans.push((0, 0, 0, 0, 0));
         wanted.push(Vec::new());
-        assert_eq!(find_pieces(scans), wanted);
+        assert_eq!(find_pieces(scans, None), wanted);
     }
 }
 
@@ -4005,7 +4013,7 @@ impl Shadow {
         held: *mut u8,
         left: &std::sync::atomic::AtomicI64,
     ) -> Result<Option<Vec<(usize, usize)>>, ()> {
-        thread_local! {
+        victory_core::fast_local! {
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         TITLE.with_borrow_mut(|title| {
@@ -4373,7 +4381,7 @@ impl Shadow {
     /// 4 KiB that title memory and the CPU's side have alike are left as they
     /// are, and nothing of them is sent ([`land_echo`]).
     fn take_landed(&self, from: usize, to: usize) -> usize {
-        thread_local! {
+        victory_core::fast_local! {
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         let start = self.start as usize;
@@ -4436,7 +4444,7 @@ impl Shadow {
     /// Copies title memory `[from, to)` (inside the buffer) into the copy;
     /// `known`: the copy held it before ([`send_changed`]).
     fn take(&self, from: usize, to: usize, known: bool) -> usize {
-        thread_local! {
+        victory_core::fast_local! {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
@@ -4520,7 +4528,7 @@ impl Shadow {
         if !compare || self.mapped || crate::host::upcheck::on() {
             return self.copy(from, to);
         }
-        thread_local! {
+        victory_core::fast_local! {
             /// A chunk of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
@@ -5282,7 +5290,7 @@ const FOUND_MOST: usize = 1024;
 /// the count of changes it was answered at, and the answer.
 type Found = (u64, u64, u64, u64, std::sync::Weak<Shadow>);
 
-thread_local! {
+victory_core::fast_local! {
     /// The last answers of [`lookup`] out of [`BUFFERS`], by a hash of the
     /// ask: the same buffers are asked about draw after draw, from five
     /// threads, each time through the map's lock and a dozen of its nodes

@@ -809,6 +809,8 @@ impl Host {
         for op in &ops {
             if let To::Copy(to, dst) = &op.to {
                 to.gpu_writes(&own.list, *dst as u64, op.len as u64);
+                // (A copy command, not a shader: marked at submission.)
+                own.list.defer_copy_write(*dst as usize, op.len as usize);
                 copied.push((to.clone(), *dst, *dst + op.len));
             }
         }
