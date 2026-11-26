@@ -666,6 +666,38 @@ struct RetailPlane {
 #[cfg(windows)]
 const _: () = assert!(size_of::<RetailPlane>() == 72);
 
+/// The size of the first plane's source rectangle (from its top left),
+/// where the title gives one: the part of the plane's resource that holds
+/// the picture. With the resolution ladder capped (`VICTORY_RESOLUTION`)
+/// the title draws a smaller picture into the top left of a plane of the
+/// full size and says so here; shown whole, the picture filled a quarter
+/// of the window.
+#[cfg(windows)]
+fn source_size(parameters: *const Plane) -> Option<(u32, u32)> {
+    let mut plane = [0u8; size_of::<RetailPlane>()];
+    if !crate::host::read_into(parameters.cast(), &mut plane) {
+        return None;
+    }
+    // SAFETY: the bytes of one retail plane description, copied.
+    let plane = unsafe { plane.as_ptr().cast::<RetailPlane>().read_unaligned() };
+    if plane.source_rects.is_null() {
+        return None;
+    }
+    let mut rect = [0u8; 16];
+    if !crate::host::read_into(plane.source_rects.cast(), &mut rect) {
+        return None;
+    }
+    let at = |i: usize| i32::from_le_bytes(rect[4 * i..4 * i + 4].try_into().unwrap());
+    let (left, top, right, bottom) = (at(0), at(1), at(2), at(3));
+    static LAST: std::sync::Mutex<[i32; 4]> = std::sync::Mutex::new([0; 4]);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *last != [left, top, right, bottom] {
+        *last = [left, top, right, bottom];
+        tracing::info!(left, top, right, bottom, "the title's source rectangle for its first plane");
+    }
+    (left == 0 && top == 0 && right > 0 && bottom > 0).then_some((right as u32, bottom as u32))
+}
+
 #[cfg(windows)]
 fn overlay_resource(parameters: *const Plane) -> Option<This> {
     // Read only the second prefix at the 72-byte retail PresentX stride. A
@@ -993,11 +1025,12 @@ extern "system" fn present(
             .filter(|&over_res| base_res != Some(over_res))
             .and_then(take_copy);
         let resource = texture.as_ref().map_or(0, |t| t.0);
+        let source = (planes > 0 && !plane_parameters.is_null()).then(|| source_size(plane_parameters)).flatten();
         behind::present(
             this,
             texture.map(|(_, copy, state)| (copy, state)),
             overlay.map(|(_, copy, state)| (copy, state)),
-            Shown { frame, resource },
+            Shown { frame, resource, source },
         );
         called.end();
         #[cfg(feature = "diagnostics")]
@@ -1033,7 +1066,7 @@ extern "system" fn present(
             texture,
             state,
             overlay.as_ref().map(|(_, tex, st)| (*tex, *st)),
-            Shown { frame, resource: resource as usize },
+            Shown { frame, resource: resource as usize, source: None },
         );
         crate::resource::host_transition(resource, state);
         if let Some((over_res, _, over_state)) = overlay {
@@ -1067,6 +1100,8 @@ fn frame_ends() {
 struct Shown {
     frame: u64,
     resource: usize,
+    /// The first plane's source rectangle's size ([`source_size`]).
+    source: Option<(u32, u32)>,
 }
 
 /// Shows `texture` (with optional `overlay` plane blended over it) in our window.
@@ -1080,7 +1115,7 @@ fn show_planes(
     let Some(host) = crate::host::host() else {
         return;
     };
-    let shown = host.present_planes(texture, state, overlay, what.frame);
+    let shown = host.present_planes(texture, state, overlay, what.frame, what.source);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]

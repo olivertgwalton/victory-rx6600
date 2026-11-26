@@ -9268,7 +9268,7 @@ impl Host {
     /// shown; else, in diagnostics builds, whether the frame was black.
     #[allow(dead_code)]
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
-        self.present_planes(texture, state, None, frame)
+        self.present_planes(texture, state, None, frame, None)
     }
 
     /// Shows `texture`, optionally alpha-compositing a second `overlay` plane
@@ -9279,6 +9279,7 @@ impl Host {
         state: u32,
         overlay: Option<(&ID3D12Resource, u32)>,
         frame: u64,
+        source: Option<(u32, u32)>,
     ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
@@ -9301,7 +9302,12 @@ impl Host {
             };
             format
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        // One plane whose picture is only part of it (its source rectangle):
+        // the swap chain is that size and gets that part; the window scales it.
+        let crop = source.filter(|&(w, h)| {
+            planes.is_none() && w <= desc.Width as u32 && h <= desc.Height && (w < desc.Width as u32 || h < desc.Height)
+        });
+        let (width, height) = crop.unwrap_or((desc.Width as u32, desc.Height));
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -9320,7 +9326,7 @@ impl Host {
                 Err(e) => {
                     tracing::warn!(error = %e, "two-plane composer not made; showing base plane only");
                     drop(presenter);
-                    return self.present_planes(texture, state_u32, None, frame);
+                    return self.present_planes(texture, state_u32, None, frame, source);
                 }
             }
         }
@@ -9359,7 +9365,7 @@ impl Host {
                 Err(e) => {
                     tracing::warn!(error = %e, "two-plane composer not made after resize; showing base plane only");
                     drop(presenter);
-                    return self.present_planes(texture, state_u32, None, frame);
+                    return self.present_planes(texture, state_u32, None, frame, source);
                 }
             }
         }
@@ -9420,7 +9426,7 @@ impl Host {
                         drop(back);
                         drop(presenter);
                         tracing::warn!(%err, "could not record display composite; presenting the base plane");
-                        return self.present_planes(texture, state_u32, None, frame);
+                        return self.present_planes(texture, state_u32, None, frame, source);
                     }
                     static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !ONCE.swap(true, Ordering::Relaxed) {
@@ -9464,7 +9470,24 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ));
                 list.ResourceBarrier(&pre);
-                list.CopyResource(&back, texture);
+                if crop.is_some() {
+                    let to = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::ManuallyDrop::new(Some(back.clone())),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                    };
+                    let from = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::ManuallyDrop::new(Some(texture.clone())),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                    };
+                    let part = D3D12_BOX { left: 0, top: 0, front: 0, right: width, bottom: height, back: 1 };
+                    list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&part));
+                    drop(std::mem::ManuallyDrop::into_inner(to.pResource));
+                    drop(std::mem::ManuallyDrop::into_inner(from.pResource));
+                } else {
+                    list.CopyResource(&back, texture);
+                }
             }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
