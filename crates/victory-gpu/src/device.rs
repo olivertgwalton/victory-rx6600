@@ -350,12 +350,35 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
 /// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
+/// pipeline, silently. The calls fail as they always did, with `out` null,
+/// and the first ones log the description's words and what its first word
+/// points at (`VICTORY_UNKNOWN_PIPELINE_DUMP` writes all of it out).
+///
+/// What the dumps of one run on an RX 6600 XT showed (2026-11-26, run bvh1;
+/// 16,384+ calls of 0x1c8 and 2,048+ of 0x218, all in the second the title
+/// starts its renderer): both make pipelines from the console's *compiled*
+/// shader code, with no DXIL at all, so neither the host nor the
+/// translator's usual input (a container's `FSSM` records) is there.
+/// - 0x1c8, graphics: the root signature, then (address, size) pairs: a
+///   0x184-byte block of pipeline state (register values), a 0xbc-byte
+///   vertex input description naming its semantics (`POSITION`, `COLOR`,
+///   `TEXCOORD`), the vertex program's code (0x200 bytes at a title address
+///   above 0xf_0000_0000) and its 0xd0-byte table of user-data and
+///   resource entries, then the pixel program's code and 0xb0-byte table.
+///   Inputs of position, colour and texture coordinates in thousands of
+///   variants suggest the title's 2D drawing (interface, text, overlays).
+/// - 0x218, compute: the root signature, a 0x1c-byte and a 0x14-byte block,
+///   the program's code (0x180 bytes) and its 0x118-byte table, two
+///   pointers and a 64-bit hash; the description is one of an array of such
+///   records twelve words apart.
+/// The tables are tagged entries (words of 0x41 and a register) in a form
+/// the translator does not read yet.
 /// shortcut: not implemented. Answering `S_OK` here without making the
-/// pipeline would hand the title whatever its stack held as an object.
+/// pipeline would hand the title whatever its stack held as an object, and
+/// handing it a pipeline without stages made it crash at the world's load
+/// (`docs/HARDWARE-GTX1660.md`). Writing them means decoding the state
+/// block into host graphics state and the tables into a `NativeProgram`'s
+/// layout, then translating the code as the containers' code is.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
     desc: *const u8,
@@ -388,6 +411,10 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
+        #[cfg(all(windows, feature = "diagnostics"))]
+        if let Some(words) = &description {
+            dump_unknown_pipeline(SLOT, calls, words);
+        }
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
@@ -397,6 +424,41 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         );
     }
     E_NOTIMPL
+}
+
+/// `VICTORY_UNKNOWN_PIPELINE_DUMP=<folder>` (diagnostics builds): what the
+/// title hands [`unknown_pipeline`], written out for reading offline, for
+/// the calls it logs (the first four, then every power of two). Per call,
+/// `<slot>-<call>-desc.bin` holds the description's sixteen words, and
+/// `<slot>-<call>-w<i>.bin` the bytes word `i` points at, for every word
+/// that looks like an address (over 64 KiB) and is followed by a size
+/// (1 to 64 KiB): the descriptions are runs of such pairs, some of them
+/// pointing into the title's own data, some at console shader code at
+/// addresses over 0xf_0000_0000 (title memory the GPU runs code from).
+/// What does not read (not mapped) is skipped, not an error.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump_unknown_pipeline(slot: usize, call: u32, words: &[u64]) {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let Some(dir) = DIR.get_or_init(|| {
+        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_UNKNOWN_PIPELINE_DUMP")?);
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir)
+    }) else {
+        return;
+    };
+    let name = |part: &str| dir.join(format!("{slot:x}-{call}-{part}.bin"));
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let _ = std::fs::write(name("desc"), bytes);
+    for (i, pair) in words.windows(2).enumerate() {
+        let (at, len) = (pair[0] as usize, pair[1] as usize);
+        if at < 0x1_0000 || !(1..=0x1_0000).contains(&len) {
+            continue;
+        }
+        let mut blob = vec![0u8; len];
+        if crate::host::read_into(at as *const u8, &mut blob) {
+            let _ = std::fs::write(name(&format!("w{i}")), blob);
+        }
+    }
 }
 
 /// The host device's state: the console's device is removed when the host's is
