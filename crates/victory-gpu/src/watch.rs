@@ -31,6 +31,8 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::{Condvar, Mutex, RwLock};
 
 pub(crate) mod kernel_track;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod land_watch;
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -4267,6 +4269,8 @@ fn unguard(g: &Guards, blocks: &[usize]) {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    land_watch::release(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
@@ -4294,6 +4298,8 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    #[cfg(feature = "diagnostics")]
+    land_watch::release(at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
         let mut g = guards_timed();
@@ -5042,6 +5048,14 @@ pub(crate) fn install() {
         let ours = crate::safecopy::failing_exit(r.ExceptionAddress as usize);
         // SAFETY: as above.
         let context = unsafe { (*info).ContextRecord };
+        // A block a landing made no-access to see who touches it.
+        #[cfg(feature = "diagnostics")]
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && land_watch::fault(r.ExceptionInformation[1], r.ExceptionInformation[0] == WRITE, ours.is_some(), context)
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         let fail = move |exit: usize| {
             // SAFETY: the context the system passes, to go on from.
             unsafe { (*context).Rip = exit as u64 };
