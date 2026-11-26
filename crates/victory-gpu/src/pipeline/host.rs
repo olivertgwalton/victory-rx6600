@@ -1702,7 +1702,21 @@ impl GraphicsState {
         let g = &mut self;
         // The vertex input.
         let u32_at = |o: usize| layout.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
-        if let Some(t) = u32_at(0x24).map(|w| w >> 16 & 0xff).filter(|t| (1..=4).contains(t)) {
+        // The console's types: D3D12's point, line, triangle and patch (1-4),
+        // and its own rectangles and quads, which `build` completes with a
+        // geometry stage (the title draws them through these pipelines
+        // without naming a topology of its own: dropped here, its
+        // rectangles came out as half-filled triangles, one per quad).
+        let t = u32_at(0x24).map(|w| w >> 16 & 0xff);
+        if let Some(t) = t {
+            static SEEN: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if t < 64 && *seen & 1 << t == 0 {
+                *seen |= 1 << t;
+                tracing::info!(topology = t, "native graphics pipelines: a topology type seen");
+            }
+        }
+        if let Some(t) = t.filter(|&t| (1..=4).contains(&t) || t as i32 == RECTANGLES || t as i32 == QUADS) {
             g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(t as i32);
         }
         let count = u32_at(0x4c).unwrap_or(0).min(32) as usize;

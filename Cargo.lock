@@ -1126,10 +1126,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "memchr",
  "tempfile",
  "tracing",
  "victory-core",
  "victory-formats",
+ "victory-game",
  "victory-pipeline",
  "victory-shader",
  "victory-telemetry",
