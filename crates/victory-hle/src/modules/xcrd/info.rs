@@ -177,6 +177,219 @@ pub extern "system" fn XCrdSetXvdInformation(adapter: *const Adapter, path: *con
     })())
 }
 
+/// 0x180005010: class 0 (0xb8 bytes; driver class 0x18) or 1 (0x90;
+/// 0x19); negative classes are sent and read nothing back.
+pub extern "system" fn XCrdQueryXRscInformation(adapter: *const Adapter, path: *const u16, class: i32, out: *mut u8, size: u32) -> HRESULT {
+    result((|| {
+        check(!adapter.is_null(), "Invalid Adapter Handle\n")?;
+        check(!path.is_null(), "Path must be specified\n")?;
+        check(!out.is_null(), "Info must be supplied\n")?;
+        check(class < 2, "Invalid InfoClass supplied\n")?;
+        match class {
+            0 => check(size >= 0xb8, "Info Buffer too small\n")?,
+            1 => check(size >= 0x90, "Info Buffer too small\n")?,
+            _ => {}
+        }
+        let path = text(path);
+        let mut p = Payload::new(0x7800_0050, path.len() * 2 + 0x41a);
+        match class {
+            0 => p.u32(0xc, 0x18),
+            1 => p.u32(0xc, 0x19),
+            _ => {}
+        }
+        p.u32(0, 0x418);
+        p.u32(4, (path.len() * 2) as u32);
+        let status = copy_string(p.body(), 0x418, path.len() * 2 + 2, path);
+        if status < 0 {
+            return Ok(status);
+        }
+        let hr = send(handle_of(adapter), &mut p);
+        if hr >= 0 {
+            let body = &p.bytes[HEADER..];
+            match class {
+                0 => place(out, body, &[(0, 0x10, 0x58)]),
+                1 => place(out, body, &[(0, 0x10, 0x2c), (0x2c, 0x40, 8)]),
+                _ => {}
+            }
+        }
+        Ok(hr)
+    })())
+}
+
+/// 0x180006d60: for "[XUC:]\ANYXVD"; classes 0-5 (driver classes 0xb-0x10),
+/// 8 bytes each but classes 2 and 5 (4).
+pub extern "system" fn XCrdSetXRscInformation(adapter: *const Adapter, class: i32, info: *const u8, size: u32) -> HRESULT {
+    result((|| {
+        check(!adapter.is_null(), "Invalid Adapter Handle\n")?;
+        check(!info.is_null(), "Info must be supplied\n")?;
+        check(class < 6, "Invalid InfoClass supplied\n")?;
+        match class {
+            0 | 1 | 3 | 4 => check(size >= 8, "Info Buffer too small\n")?,
+            2 | 5 => check(size >= 4, "Info Buffer too small\n")?,
+            _ => {}
+        }
+        let path: Vec<u16> = "[XUC:]\\ANYXVD".encode_utf16().collect();
+        let mut p = Payload::new(0x7800_0054, path.len() * 2 + 0x112);
+        // SAFETY: the caller's structure (checked non-null, of `size`).
+        let at = |n: usize| unsafe { std::slice::from_raw_parts(info, n) }.to_vec();
+        if (0..6).contains(&class) {
+            p.u32(8, 0xb + class as u32);
+            if class == 2 || class == 5 {
+                p.put(0x10, &at(4));
+            } else {
+                p.put(0x10, &at(8));
+            }
+        }
+        p.u32(0, 0x110);
+        p.u32(4, (path.len() * 2) as u32);
+        let status = copy_string(p.body(), 0x110, path.len() * 2 + 2, &path);
+        if status < 0 {
+            return Ok(status);
+        }
+        Ok(send(handle_of(adapter), &mut p))
+    })())
+}
+
+/// Merges `mask`'s bits of `from` into `to`.
+fn merge(to: u64, from: u64, mask: u64) -> u64 {
+    (to & !mask) | (from & mask)
+}
+
+fn rd(b: &[u8], at: usize, n: usize) -> u64 {
+    let mut v = [0u8; 8];
+    v[..n].copy_from_slice(&b[at..at + n]);
+    u64::from_le_bytes(v)
+}
+
+/// 0x1800046b0: a CRD's information: classes 0 (0x10 bytes), 1 (0x670:
+/// identity, eight bytes widened, three strings the driver places), 2
+/// (0x10, flags merged), 5 (2, two flag bits merged).
+pub extern "system" fn XCrdQueryCrdInformation(adapter: *const Adapter, id: i32, class: i32, out: *mut u8, size: u32) -> HRESULT {
+    result((|| {
+        check(!adapter.is_null(), "Invalid Adapter Handle\n")?;
+        check(id < 0x25, "Invalid CRD Id\n")?;
+        check(!out.is_null(), "Output buffer must be supplied\n")?;
+        check(class <= 2 || class == 5, "Invalid InfoClass supplied\n")?;
+        let min = match class {
+            0 | 2 => 0x10,
+            1 => 0x670,
+            5 => 2,
+            _ => 0,
+        };
+        check(size >= min, "Info Buffer too small\n")?;
+        let mut p = Payload::new(0x7800_0050, 0x418);
+        p.u64(0, 0);
+        p.u32(8, id as u32);
+        match class {
+            0 => p.u32(0xc, 2),
+            1 => p.u32(0xc, 4),
+            2 => p.u32(0xc, 0x10),
+            5 => p.u32(0xc, 0x1c),
+            _ => {}
+        }
+        let hr = send(handle_of(adapter), &mut p);
+        if hr < 0 {
+            return Ok(hr);
+        }
+        let b = p.bytes[HEADER..].to_vec();
+        // SAFETY: the caller's structure of at least the class's size.
+        let o = unsafe { std::slice::from_raw_parts_mut(out, min.max(2) as usize) };
+        let put = |o: &mut [u8], at: usize, v: u64, n: usize| o[at..at + n].copy_from_slice(&v.to_le_bytes()[..n]);
+        match class {
+            0 => place(out, &b, &[(0, 0x10, 0x10)]),
+            1 => {
+                place(out, &b, &[(0, 0x10, 0x18), (0x18, 0x28, 0xc), (0x24, 0x34, 0x10)]);
+                for i in 0..8 {
+                    put(o, 0x34 + 4 * i, u64::from(b[0x44 + i]), 4);
+                }
+                put(o, 0x54, u64::from(b[0x64]), 4);
+                for (field, to) in [(0x4c, 0x58), (0x54, 0x260), (0x5c, 0x468)] {
+                    let (at, n) = (rd(&b, field, 4) as usize, rd(&b, field + 4, 4) as usize);
+                    match b.get(0x10 + at..0x10 + at + n) {
+                        Some(s) if at != 0 && n < 0x104 => o[to..to + n].copy_from_slice(s),
+                        _ => o[to..to + 2].fill(0),
+                    }
+                }
+            }
+            2 => {
+                o[0] = b[0x10];
+                let w = merge(rd(o, 6, 2), rd(&b, 0x16, 2), 0x1ff);
+                put(o, 6, w, 2);
+                place(out, &b, &[(8, 0x18, 4), (0xc, 0x1c, 2), (0xe, 0x1e, 2)]);
+            }
+            5 => {
+                o[0] = merge(u64::from(o[0]), u64::from(b[0x10]), 3) as u8;
+                o[1] = merge(u64::from(o[1]), u64::from(b[0x11]), 3) as u8;
+            }
+            _ => {}
+        }
+        Ok(hr)
+    })())
+}
+
+/// 0x180004a80: a CRD's log; the driver says where in its answer the log
+/// is (+0x24) and how long (+0x28).
+pub extern "system" fn XCrdQueryCrdLogInformation(adapter: *const Adapter, id: i32, kind: u8, value: u64, which: u8, flags: u8, buffer: *mut u8, len: u32) -> HRESULT {
+    result((|| {
+        check(!adapter.is_null(), "Invalid Adapter Handle.\n")?;
+        check(id < 0x25, "Invalid XCRDID.\n")?;
+        check(flags & 0xfe == 0, "Invalid Flags\n")?;
+        check(buffer.is_null() == (len == 0), "Invalid buffer/length combination.\n")?;
+        let mut p = Payload::new(0x7800_0050, len as usize + 0x418);
+        p.u64(0, 0);
+        p.u32(8, id as u32);
+        p.u32(0xc, 8);
+        p.put(0x10, &[kind]);
+        p.u64(0x18, value);
+        p.put(0x20, &[which, flags & 1]);
+        if buffer.is_null() {
+            p.u64(0x24, 0);
+        } else {
+            p.u32(0x24, 0x408);
+            p.u32(0x28, len);
+        }
+        let hr = send(handle_of(adapter), &mut p);
+        if hr >= 0 && !buffer.is_null() {
+            copy_out(&p, 0x24, buffer);
+        }
+        Ok(hr)
+    })())
+}
+
+/// Copies the driver's `(offset, length)` at `field` of the answer out.
+fn copy_out(p: &Payload, field: usize, buffer: *mut u8) {
+    let b = &p.bytes[HEADER..];
+    let (at, n) = (rd(b, field, 4) as usize, rd(b, field + 4, 4) as usize);
+    if let Some(data) = b.get(0x10 + at..0x10 + at + n) {
+        // SAFETY: the caller's buffer (the driver keeps to its length).
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buffer, n) };
+    }
+}
+
+/// 0x180004c20: vendor information for a CRD; the answer's place is at
+/// +0x1c and +0x20.
+pub extern "system" fn XCrdQueryCrdVendorInformation(adapter: *const Adapter, id: i32, kind: u8, value: u32, a: u16, b: u16, buffer: *mut u8, len: u32) -> HRESULT {
+    result((|| {
+        check(!adapter.is_null(), "Invalid Adapter Handle.\n")?;
+        check(id < 0x25, "Invalid XCRDID.\n")?;
+        check(!buffer.is_null() && len != 0, "Buffer must be provided.\n")?;
+        let mut p = Payload::new(0x7800_0050, len as usize + 0x418);
+        p.u32(8, id as u32);
+        p.u32(0xc, 0x11);
+        p.put(0x10, &[kind]);
+        p.u32(0x14, value);
+        p.put(0x18, &a.to_le_bytes());
+        p.put(0x1a, &b.to_le_bytes());
+        p.u32(0x1c, 0x408);
+        p.u32(0x20, len);
+        let hr = send(handle_of(adapter), &mut p);
+        if hr >= 0 {
+            copy_out(&p, 0x1c, buffer);
+        }
+        Ok(hr)
+    })())
+}
+
 /// The content the cloud feature bits belong to.
 const ANY_XVC: &str = "[XUC:]\\ANYXVC";
 
@@ -201,5 +414,10 @@ pub(crate) fn exports() -> Vec<crate::HleExport> {
         hle_export!(XCrdSetXvdInformation),
         hle_export!(XCloudQueryFeatureBits),
         hle_export!(XCloudSetFeatureBits),
+        hle_export!(XCrdQueryXRscInformation),
+        hle_export!(XCrdSetXRscInformation),
+        hle_export!(XCrdQueryCrdInformation),
+        hle_export!(XCrdQueryCrdLogInformation),
+        hle_export!(XCrdQueryCrdVendorInformation),
     ]
 }

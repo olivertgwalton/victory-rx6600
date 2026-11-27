@@ -1175,3 +1175,51 @@ fn xvd_information_entry_counts() {
     }
 }
 
+
+#[test]
+#[ignore = "prints the reference's field maps"]
+fn learn_xrsc_information() {
+    let Some(r) = reference::reference("XCrdQueryXRscInformation") else { return };
+    let f: extern "system" fn(*const Adapter, *const u16, u32, *mut u8, u32) -> HRESULT = unsafe { std::mem::transmute(r) };
+    let a = adapter();
+    let p = wz("[XUC:]\\x");
+    learn("XCrdQueryXRscInformation", &[(0, 0xb8), (1, 0x90)], &|_, c, o, n| f(&a, p.as_ptr(), c, o, n));
+}
+
+#[test]
+fn fuzz_xrsc_and_crd_information() {
+    let classes: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 0xffff_ffff];
+    let ids: &[u64] = &[3, 0, 0x24, 0x25, 0xffff_ffff];
+    fuzz("XCrdQueryXRscInformation", &[Adp, Path, Int(classes), OutOpt(0x800), Int(INFO_SIZES)], W32);
+    for c in classes {
+        let c: &'static [u64] = Box::leak(Box::new([*c]));
+        fuzz("XCrdSetXRscInformation", &[Adp, Int(c), InOpt(0x40), Int(&[8, 0, 3, 4])], W32);
+        fuzz("XCrdQueryXRscInformation", &[Adp, Path, Int(c), OutOpt(0x800), Int(INFO_SIZES)], W32);
+        // Class 1's strings are placed by (offset, length) pairs at +0x4c.
+        fuzz_keeping("XCrdQueryCrdInformation", &[Adp, Int(ids), Int(c), OutOpt(0x800), Int(&[0x670, 0, 1, 2, 0x10])], W32, &[0x4c..0x64]);
+    }
+    let flags: &[u64] = &[0, 1, 2, 0xff];
+    fuzz_keeping("XCrdQueryCrdLogInformation", &[Adp, Int(ids), Int(BYTES), Int(&[7, 0]), Int(BYTES), Int(flags), OutOpt(0x100), Int(&[0x40, 0, 1])], W32, &[0x24..0x2c]);
+    fuzz_keeping("XCrdQueryCrdVendorInformation", &[Adp, Int(ids), Int(BYTES), Int(&[7, 0]), Int(&[1, 0, 0xffff]), Int(&[2, 0]), OutOpt(0x100), Int(&[0x40, 0, 1])], W32, &[0x1c..0x24]);
+}
+
+#[test]
+fn crd_information_strings() {
+    let s = session();
+    let (r, l) = both!("XCrdQueryCrdInformation": extern "system" fn(*const Adapter, i32, i32, *mut u8, u32) -> HRESULT);
+    let a = adapter();
+    for (off, len) in [(0x80u32, 0x20u32), (0, 0x20), (0x80, 0x104), (0x80, 0x103), (0x80, 0)] {
+        same(&format!("{off:#x} {len:#x}"), run(&s, |s| s.reply(accepting(move |_, body| {
+            for (i, b) in body.iter_mut().enumerate().skip(0x10) {
+                *b = (i as u8).wrapping_mul(7);
+            }
+            for f in [0x4c, 0x54, 0x5c] {
+                body[f..f + 4].copy_from_slice(&off.to_le_bytes());
+                body[f + 4..f + 8].copy_from_slice(&len.to_le_bytes());
+            }
+        })), |side| {
+            let mut out = vec![0xccu8; 0x800];
+            ((if side { r(&a, 3, 1, out.as_mut_ptr(), 0x670) } else { l(&a, 3, 1, out.as_mut_ptr(), 0x670) }), out)
+        }));
+    }
+}
