@@ -628,6 +628,130 @@ pub extern "system" fn XGComputeTexture3DLayout(desc: *const Texture3dDesc, out:
     compute_layout(XGCreateTexture3DComputer(desc, &mut c), c, out)
 }
 
+/// Bits per texel by DXGI format, as `XGComputeOptimalSwizzleMode` sizes
+/// textures (0: unknown).
+fn bits_per_texel(format: u32) -> u32 {
+    match format {
+        1..=4 => 128,
+        5..=8 => 96,
+        9..=22 | 102 => 64,
+        23..=47 | 67 | 87..=93 | 100 | 101 | 108 | 109 | 116 | 117 | 189 | 191 => 32,
+        104 | 105 => 24,
+        48..=59 | 68 | 69 | 85 | 86 | 107 | 114 | 115 | 118..=120 => 16,
+        103 | 106 | 110 => 12,
+        60..=65 | 73..=78 | 82..=84 | 94..=99 | 113 | 190 => 8,
+        70..=72 | 79..=81 | 111 | 112 => 4,
+        66 => 1,
+        _ => 0,
+    }
+}
+
+/// D3D11 misc flag: a 64 KiB display texture.
+const MISC_DISPLAY: u32 = 0x800_0000;
+
+/// `(dimension, format, width, height, depth or array, samples, bind
+/// flags, misc flags)`: the mode the library suggests for a D3D11-style
+/// texture (`XG_RESOURCE_DIMENSION`: 1 buffer, 2 1D, 3 2D, 4 3D).
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn XGComputeOptimalSwizzleMode(
+    dimension: u32,
+    format: u32,
+    width: u32,
+    height: u32,
+    _depth: u32,
+    samples: u32,
+    bind: u32,
+    misc: u32,
+) -> u32 {
+    let target = bind & BIND_RENDER_TARGET != 0;
+    let mode = match dimension {
+        1 => Swizzle::LINEAR,
+        _ if bind & BIND_DEPTH_STENCIL != 0 => Swizzle::SW_64KB_Z_X,
+        3 | 4 if misc & MISC_DISPLAY != 0 => Swizzle::SW_64KB_D,
+        3 | 4 if target => Swizzle::SW_64KB_R_X,
+        3 if bind & BIND_UNORDERED_ACCESS != 0 => {
+            let bits = u64::from(bits_per_texel(format)) * u64::from(width) * u64::from(height);
+            if samples != 1 || bits == 0 || bits & !7 > 64 << 13 {
+                Swizzle::SW_64KB_R_X
+            } else {
+                Swizzle::SW_4KB_S_X
+            }
+        }
+        3 | 4 => Swizzle::SW_4KB_S,
+        _ => Swizzle::LINEAR,
+    };
+    mode.0
+}
+
+/// Writes `64KB_Z_X` through its ninth argument; returns that argument
+/// (the library returns it unchanged in the result register).
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn XGComputeOptimalDepthStencilSwizzleMode(
+    _dimension: u32,
+    _format: u32,
+    _width: u32,
+    _height: u32,
+    _depth: u32,
+    _mips: u32,
+    _samples: u32,
+    _bind: u32,
+    out: *mut u32,
+) -> HRESULT {
+    // SAFETY: the caller passes room for the mode or null.
+    if let Some(o) = unsafe { out.as_mut() } {
+        *o = Swizzle::SW_64KB_Z_X.0;
+    }
+    out as usize as HRESULT
+}
+
+/// `(_, _, mode)`: S_OK for modes 4 to 28 that are multiples of 4, E_FAIL
+/// for others, whatever else is passed.
+pub extern "system" fn XGValidateDepthStencilSwizzleMode(_a: u32, _b: u32, mode: u32) -> HRESULT {
+    if (4..=28).contains(&mode) && mode % 4 == 0 { S_OK } else { E_FAIL }
+}
+
+/// Whether the library is initialized and whether exclusive locking is on
+/// (and held).
+static INITIALIZED: AtomicU32 = AtomicU32::new(0);
+static LOCKING: AtomicU32 = AtomicU32::new(0);
+static LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 0 if this call initialized the library, 1 if it already was.
+pub extern "system" fn XGInitializeLibrary() -> u32 {
+    INITIALIZED.swap(1, Ordering::AcqRel)
+}
+
+/// 0 if this call ended the library, 1 if it was not initialized.
+pub extern "system" fn XGTerminateLibrary() -> u32 {
+    u32::from(INITIALIZED.swap(0, Ordering::AcqRel) != 1)
+}
+
+/// `(version)`: initializes the library for a console model (4: Series);
+/// returns whether it already was. Layouts here are Series X's.
+pub extern "system" fn XGSetHardwareVersion(_version: u32) -> u32 {
+    INITIALIZED.swap(1, Ordering::AcqRel)
+}
+
+/// `(on)`: whether the library takes a lock around its work.
+pub extern "system" fn XGEnableExclusiveLocking(on: u32) {
+    LOCKING.store(on, Ordering::Release);
+}
+
+/// Takes the lock if locking is on: 1 then, else 0.
+pub extern "system" fn XGEnterExclusiveLock() -> u32 {
+    if LOCKING.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    while LOCKED.swap(true, Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+    1
+}
+
+pub extern "system" fn XGLeaveExclusiveLock() {
+    LOCKED.store(false, Ordering::Release);
+}
+
 const R8_UNORM: u32 = 61;
 const R8_UINT: u32 = 62;
 
@@ -1848,6 +1972,15 @@ pub(crate) fn module() -> HleModule {
             hle_export!(XGComputeTexture1DLayout),
             hle_export!(XGComputeTexture2DLayout),
             hle_export!(XGComputeTexture3DLayout),
+            hle_export!(XGComputeOptimalSwizzleMode),
+            hle_export!(XGComputeOptimalDepthStencilSwizzleMode),
+            hle_export!(XGValidateDepthStencilSwizzleMode),
+            hle_export!(XGInitializeLibrary),
+            hle_export!(XGTerminateLibrary),
+            hle_export!(XGSetHardwareVersion),
+            hle_export!(XGEnableExclusiveLocking),
+            hle_export!(XGEnterExclusiveLock),
+            hle_export!(XGLeaveExclusiveLock),
         ],
     }
 }
@@ -2045,6 +2178,6 @@ mod tests {
         assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
         let bad = desc(256, 256, 1, 28, 0x103);
         assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
-        assert!(module().exports.len() == 8);
+        assert!(module().exports.len() == 17);
     }
 }

@@ -733,3 +733,42 @@ fn xg_descriptions_match_the_library() {
 fn xg_descriptions_match_the_library_in_every_dimension_mode_and_size() {
     check_xg("geometry", desc_vectors!("geometry"));
 }
+
+/// `XGComputeOptimalSwizzleMode` and `XGValidateDepthStencilSwizzleMode`
+/// over the sweep the harness ran, against the library's answers (one byte
+/// each, in order).
+#[test]
+fn small_exports_match_the_library() {
+    let want = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/xg/small-exports.bytes"));
+    let sizes = [(1, 1), (64, 64), (128, 128), (256, 256), (256, 257), (512, 256), (1024, 1024), (4096, 16), (4096, 17), (181, 181), (182, 182), (2048, 2048)];
+    let mut got = vec![];
+    for dim in 0..=5 {
+        for fmt in 0..192 {
+            for (s, &(w, h)) in sizes.iter().enumerate() {
+                for smp in 1..=2 {
+                    for bind in (0..0x100).step_by(0x20) {
+                        for misc in [0, 0x800_0000] {
+                            if dim != 3 && (s > 1 || smp > 1 || fmt > 2) {
+                                continue;
+                            }
+                            got.push(XGComputeOptimalSwizzleMode(dim, fmt, w, h, 1, smp, bind | 8, misc) as u8);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for a in 0..4 {
+        for b in 0..4 {
+            for mode in 0..32 {
+                got.push(u8::from(XGValidateDepthStencilSwizzleMode(a, b, mode) == S_OK));
+            }
+        }
+    }
+    assert_eq!(got.len(), want.len());
+    let bad = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+    assert_eq!(bad, 0, "{bad} answers differ from the library");
+    let mut mode = 0;
+    XGComputeOptimalDepthStencilSwizzleMode(3, 40, 256, 256, 1, 1, 1, 0x40, &mut mode);
+    assert_eq!(mode, 24);
+}
