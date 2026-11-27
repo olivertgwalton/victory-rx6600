@@ -743,3 +743,15 @@ fn repair_xvc_every_kind() {
     }
     same("null info", run(&s, |_| {}, |rf| if rf { r(&a, std::ptr::null()) } else { l(&a, std::ptr::null()) }));
 }
+
+const SFLAGS: &[u64] = &[1, 0, 8, 9, 0x1_0000, 0x1_0009, 2, 0x2_0000, 0x1_ffff];
+
+#[test]
+fn fuzz_streaming_queries() {
+    fuzz("XCrdSetFlatContentPath", &[Adp, Path, Path], W32);
+    fuzz("XCrdStorageQueryBlobAttributes", &[Adp, Path, OutOpt(0x34)], W32);
+    fuzz("XCrdStreamingAdjustStreamingFlags", &[Adp, Int(&[5, 0]), Int(SFLAGS), Int(SFLAGS)], W32);
+    fuzz("XCrdStreamingQueryInformationEx", &[Out(0x108), Out(0x30), Adp, Int(&[0x44, 0, u64::MAX])], W32);
+    fuzz("XCrdStreamingQueryInformation", &[Out(0x108), Adp, Int(&[0x44, 0, u64::MAX])], W32);
+    fuzz("XCrdStreamingQueryInformationByPath", &[Out(0x108), Adp, Path, Int(FLAG1)], W32);
+}

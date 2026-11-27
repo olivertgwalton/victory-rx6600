@@ -384,6 +384,142 @@ pub extern "system" fn XCrdRepairXvc(adapter: *const Adapter, repair: *const Rep
     })())
 }
 
+/// 0x180006a50: a CRD path and the flat content path it maps to.
+pub extern "system" fn XCrdSetFlatContentPath(adapter: *const Adapter, path: *const u16, content: *const u16) -> HRESULT {
+    result((|| {
+        check(!adapter.is_null(), "Invalid adapter handle.\n")?;
+        check(!path.is_null(), "Invalid CRD path.\n")?;
+        check(!content.is_null(), "Invalid content path.\n")?;
+        let (c, t) = (text(path), text(content));
+        let mut p = Payload::new(0x7800_0194, (c.len() + t.len()) * 2 + 0x14);
+        p.u32(0, 0x10);
+        p.u32(4, (c.len() * 2) as u32);
+        p.u32(8, (c.len() * 2 + 0x12) as u32);
+        p.u32(0xc, (t.len() * 2) as u32);
+        if let Err(hr) = two_paths(&mut p, 0x10, c, t) {
+            return Ok(hr);
+        }
+        Ok(send(handle_of(adapter), &mut p))
+    })())
+}
+
+/// 0x180007bb0: a blob's attributes, 0x34 bytes from +0x10.
+pub extern "system" fn XCrdStorageQueryBlobAttributes(adapter: *const Adapter, path: *const u16, attributes: *mut [u8; 0x34]) -> HRESULT {
+    result((|| {
+        check(!adapter.is_null(), "Invalid Adapter Handle.\n")?;
+        check(!path.is_null(), "Invalid Input Path.\n")?;
+        check(!attributes.is_null(), "Attributes must not be NULL\n")?;
+        let mut p = headed(0x7800_00c4, 0x48, text(path))?;
+        let hr = send(handle_of(adapter), &mut p);
+        if hr >= 0 {
+            // SAFETY: checked non-null.
+            unsafe { (*attributes).copy_from_slice(&p.bytes[super::srb::HEADER + 0x10..super::srb::HEADER + 0x44]) };
+        }
+        Ok(hr)
+    })())
+}
+
+/// The library's streaming flags as the driver's: bit 0 -> 0x10, bit 3 ->
+/// 0x100, bit 16 -> 0x80000.
+fn streaming_flags(f: u32) -> u32 {
+    (if f & 1 != 0 { 0x10 } else { 0 }) | (if f & 8 != 0 { 0x100 } else { 0 }) | (if f & 0x1_0000 != 0 { 0x8_0000 } else { 0 })
+}
+
+/// 0x180008280: flags to set and to clear on a streaming instance (bits
+/// 0, 3 and 16).
+pub extern "system" fn XCrdStreamingAdjustStreamingFlags(adapter: *const Adapter, id: u64, enable: u32, disable: u32) -> HRESULT {
+    result((|| {
+        check(!adapter.is_null(), "Invalid Adapter Handle\n")?;
+        check(enable & !0x1_ffff == 0, "Invalid Enable flags\n")?;
+        check(disable & !0x1_ffff == 0, "Invalid Disable flags\n")?;
+        check(enable & disable == 0, "Cannot enable and disable same flags\n")?;
+        check(enable & !0x1_0009 == 0, "Invalid Enable flags\n")?;
+        check(disable & !0x1_0009 == 0, "Invalid Disable flags\n")?;
+        let mut p = Payload::new(0x7800_00dc, 0x10);
+        p.u64(0, id);
+        p.u32(8, streaming_flags(enable));
+        p.u32(0xc, streaming_flags(disable));
+        Ok(send(handle_of(adapter), &mut p))
+    })())
+}
+
+/// 0x18000c870: the driver's streaming information (its body) as the
+/// caller's 0x108-byte structure; ten flag bits at +0x98 are merged into
+/// what the caller had there.
+fn streaming_info(out: *mut u8, body: &[u8]) {
+    // (from, to, bytes)
+    const MAP: &[(usize, usize, usize)] = &[
+        (0x58, 0x58, 8), (0x60, 0x60, 8), (0x50, 0x50, 8), (0x78, 0x78, 4), (0x80, 0x80, 8), (0x68, 0x68, 8),
+        (0x70, 0x70, 8), (0xac, 0x9c, 4), (0xb8, 0xa8, 4), (0xbc, 0xac, 1), (0x8, 0x8, 8), (0x38, 0x38, 8),
+        (0x18, 0x18, 8), (0x20, 0x20, 8), (0x30, 0x30, 8), (0x40, 0x40, 8), (0x10, 0x10, 8), (0x0, 0x0, 8),
+        (0xbe, 0xae, 2), (0x88, 0x88, 8), (0x9c, 0x90, 4), (0xa4, 0x7c, 4), (0xa0, 0x94, 4),
+        (0xb0, 0xa0, 4), (0xb4, 0xa4, 4), (0xd0, 0xc0, 8), (0xc8, 0xb8, 8), (0xd8, 0xc8, 8), (0xe0, 0xd0, 4),
+        (0xe8, 0xd8, 16), (0xf8, 0xe8, 8), (0x100, 0xf0, 8), (0x108, 0xf8, 8), (0x110, 0x100, 8),
+    ];
+    // SAFETY: the caller's 0x108-byte structure.
+    let out = unsafe { std::slice::from_raw_parts_mut(out, 0x108) };
+    for &(from, to, n) in MAP {
+        if from < 0xa8 || from > 0xab {
+            out[to..to + n].copy_from_slice(&body[from..from + n]);
+        }
+    }
+    const BITS: u32 = 0x1 | 0x2 | 0x8 | 0x10 | 0x20 | 0x80 | 0x40 | 0x100 | 0x200 | 0x400;
+    let flags = u32::from_le_bytes(body[0xa8..0xac].try_into().unwrap());
+    let mine = u32::from_le_bytes(out[0x98..0x9c].try_into().unwrap());
+    out[0x98..0x9c].copy_from_slice(&((mine & !BITS) | (flags & BITS)).to_le_bytes());
+}
+
+/// 0x180008670: a streaming instance's information; failures are noted
+/// in the caller's record (source line 0xae8 for a missing adapter).
+pub extern "system" fn XCrdStreamingQueryInformationEx(out: *mut u8, failure: *mut super::srb::Failure, adapter: *const Adapter, id: u64) -> HRESULT {
+    // SAFETY: the caller's record (not checked).
+    let failure = unsafe { &mut *failure };
+    if adapter.is_null() {
+        super::srb::log(1, "Invalid Adapter Handle\n");
+        failure.note(0xae8, 0);
+        return E_INVALIDARG;
+    }
+    let mut p = Payload::new(0x7800_0038, 0x118);
+    p.u64(0, id);
+    let hr = super::srb::send_noting(handle_of(adapter), &mut p, Some(0x28), failure);
+    if hr >= 0 {
+        streaming_info(out, &p.bytes[super::srb::HEADER..]);
+    }
+    hr
+}
+
+/// 0x1800084a0: as the `Ex`, with a record of its own.
+pub extern "system" fn XCrdStreamingQueryInformation(out: *mut u8, adapter: *const Adapter, id: u64) -> HRESULT {
+    XCrdStreamingQueryInformationEx(out, &mut super::srb::Failure::default(), adapter, id)
+}
+
+/// 0x1800084f0: by the content's path (non-empty); flag 1 sets bit 1 of
+/// the mode at +0x98.
+pub extern "system" fn XCrdStreamingQueryInformationByPath(out: *mut u8, adapter: *const Adapter, path: *const u16, flags: u32) -> HRESULT {
+    result((|| {
+        check(!adapter.is_null(), "Invalid Adapter Handle\n")?;
+        check(!path.is_null(), "Invalid XCRD Path\n")?;
+        let path = text(path);
+        check(!path.is_empty(), "Invalid XCRD String Length\n")?;
+        check(flags & !1 == 0, "Invalid Flags\n")?;
+        let bytes = path.len() * 2;
+        let mut p = Payload::new(0x7800_0038, bytes + 0x11a);
+        p.u64(0, u64::MAX);
+        p.u32(0x98, if flags & 1 != 0 { 3 } else { 1 });
+        let status = copy_string(p.body(), 0x118, bytes + 2, path);
+        if status < 0 {
+            return Ok(status);
+        }
+        p.u32(0x90, 0x118);
+        p.u32(0x94, (bytes + 2) as u32);
+        let hr = send(handle_of(adapter), &mut p);
+        if hr >= 0 {
+            streaming_info(out, &p.bytes[super::srb::HEADER..]);
+        }
+        Ok(hr)
+    })())
+}
+
 pub(crate) fn exports() -> Vec<crate::HleExport> {
     use crate::hle_export;
     vec![
@@ -401,5 +537,11 @@ pub(crate) fn exports() -> Vec<crate::HleExport> {
         hle_export!(XCrdSetEncryptedEa),
         hle_export!(XCrdRemapTest),
         hle_export!(XCrdRepairXvc),
+        hle_export!(XCrdSetFlatContentPath),
+        hle_export!(XCrdStorageQueryBlobAttributes),
+        hle_export!(XCrdStreamingAdjustStreamingFlags),
+        hle_export!(XCrdStreamingQueryInformationEx),
+        hle_export!(XCrdStreamingQueryInformation),
+        hle_export!(XCrdStreamingQueryInformationByPath),
     ]
 }

@@ -78,7 +78,7 @@ pub struct Failure {
 }
 
 impl Failure {
-    fn note(&mut self, line: u32, value: u64) {
+    pub fn note(&mut self, line: u32, value: u64) {
         if self.line != 0 {
             return;
         }
@@ -94,18 +94,26 @@ impl Failure {
 
 /// 0x18000e50c: sends and keeps no failure record.
 pub fn send(handle: Handle, payload: &mut Payload) -> HRESULT {
-    send_noting(handle, payload, &mut 0xa, &mut Failure::default())
+    send_noting(handle, payload, None, &mut Failure::default())
 }
 
-/// 0x18000e55c. `value` is set to 0xa first and copied into the failure
-/// record (as the console's).
-pub fn send_noting(handle: Handle, payload: &mut Payload, value: &mut u64, failure: &mut Failure) -> HRESULT {
-    *value = 0xa;
+/// 0x18000e55c. Its value slot (set to 0xa first, copied into the failure
+/// record) is a local, or the body's bytes at `value_at` when the caller
+/// points it there.
+pub fn send_noting(handle: Handle, payload: &mut Payload, value_at: Option<usize>, failure: &mut Failure) -> HRESULT {
+    let local = 0xa_u64;
+    if let Some(at) = value_at {
+        payload.u64(at, 0xa);
+    }
+    let value = |p: &Payload, local: u64| match value_at {
+        Some(at) => u64::from_le_bytes(p.bytes[HEADER + at..HEADER + at + 8].try_into().unwrap()),
+        None => local,
+    };
     let s = sys();
     // SAFETY: a plain auto-reset event.
     let event = unsafe { (s.create_event_w)(std::ptr::null(), 0, 0, std::ptr::null()) };
     if event.is_null() {
-        failure.note(0x1a0b, *value);
+        failure.note(0x1a0b, value(payload, local));
         return hresult_from_win32(super::sys::last_error());
     }
     let len = payload.bytes.len() as u32;
@@ -127,9 +135,9 @@ pub fn send_noting(handle: Handle, payload: &mut Payload, value: &mut u64, failu
             status = code;
         } else if code < 0 {
             status = code;
-            failure.note(0x1a28, *value);
+            failure.note(0x1a28, value(payload, local));
         } else {
-            failure.note(0x1a2a, *value);
+            failure.note(0x1a2a, value(payload, local));
         }
         tries += 1;
         if status != DEVICE_BUSY || tries >= 100 {
