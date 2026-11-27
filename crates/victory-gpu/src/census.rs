@@ -36,7 +36,7 @@ pub fn set_title_bytes(f: fn() -> u64) {
 }
 
 /// The keys, in the order they are printed.
-const KEYS: [&str; 26] = [
+const KEYS: [&str; 28] = [
     "title_committed",
     "duplicates",
     "private_commit",
@@ -49,6 +49,8 @@ const KEYS: [&str; 26] = [
     "texture_staging",
     "texture_pool_blocks",
     "texture_pool_free",
+    "texture_pool_resting",
+    "texture_pool_empty",
     "target_pool_free",
     "staging_pool_blocks",
     "host_textures",
@@ -125,6 +127,7 @@ fn log(frame: u64) {
     // not), host textures (each made from title memory), view copies. The
     // console holds each byte once; the goal is for this to be near 0.
     let duplicates = copies[1] + known_local + crate::shadow::view_copy_bytes();
+    let room_parts = crate::pool::texture_room_parts();
     let values: [u64; KEYS.len()] = [
         TITLE_BYTES.get().map_or(UNKNOWN, |f| f()),
         duplicates,
@@ -138,6 +141,8 @@ fn log(frame: u64) {
         crate::texture::live_staging_bytes(),
         texture_blocks,
         crate::pool::texture_room(),
+        room_parts[0],
+        room_parts[1],
         crate::pool::target_room(),
         staging_blocks,
         host_textures,
@@ -155,6 +160,7 @@ fn log(frame: u64) {
     ];
     let line = format_line(&values, &PEAK);
     let (budget, nonlocal_budget) = card.map_or((UNKNOWN, UNKNOWN), |c| (c[0], c[2]));
+    tracing::warn!(target: "victory_gpu::census", "texture pool frame {frame}: {}", crate::pool::texture_holes());
     tracing::warn!(
         target: "victory_gpu::census",
         "memory census frame {frame}: {line} dxgi_local_budget={} dxgi_nonlocal_budget={} unaccounted_local={} \

@@ -183,6 +183,15 @@ impl Ripe {
     }
 }
 
+/// Whether a piece goes in the fullest block it fits in rather than the
+/// lowest (`VICTORY_POOL_FULLEST=1`; off by default: run pool4 against
+/// pool3, the same fps and the same free bytes, 24 blocks under a quarter
+/// full still, held by textures that live long).
+fn fullest_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_FULLEST").is_some_and(|v| v == "1"))
+}
+
 /// Pieces cut from blocks that were not ripe, for want of a ripe one.
 static UNRIPE: AtomicU64 = AtomicU64::new(0);
 
@@ -221,6 +230,10 @@ impl Ranges {
             len += size;
         }
         self.0.insert(start, len);
+    }
+
+    fn fits(&self, len: u64, align: u64) -> bool {
+        self.0.iter().any(|(&start, &size)| start.next_multiple_of(align) + len <= start + size)
     }
 
     fn whole(&self, size: u64) -> bool {
@@ -301,13 +314,33 @@ impl<B: Clone> Pool<B> {
         }
         self.rested(now);
         let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
+        if fullest_first() {
+            // The fullest block it fits in: the emptiest get no more, and
+            // as their pieces come back they are let go (pool3: half the
+            // blocks bytes free, 19 blocks under a quarter full, with the
+            // lowest that fits taken).
+            let best = self
+                .blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| Some((i, b.as_ref()?)))
+                .filter(|(_, b)| ripe.is(b) && b.free.fits(len, align))
+                .min_by_key(|(_, b)| b.free.free_bytes())
+                .map(|(i, _)| i);
+            if let Some(i) = best
+                && let Some(start) = self.blocks[i].as_mut().and_then(|b| b.free.take(len, align))
             {
                 found = Some((i, start));
-                break;
+            }
+        } else {
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                if let Some(block) = block
+                    && ripe.is(block)
+                    && let Some(start) = block.free.take(len, align)
+                {
+                    found = Some((i, start));
+                    break;
+                }
             }
         }
         if found.is_none() && ripe.ahead > 0 {
@@ -447,6 +480,39 @@ static HELD: AtomicU64 = AtomicU64::new(0);
 /// by us that new textures take first.
 pub(crate) fn texture_room() -> u64 {
     (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+}
+
+/// For the census: of the texture blocks no texture holds, bytes resting
+/// (given back less than [`REST`] ago) and bytes in blocks wholly empty.
+pub(crate) fn texture_room_parts() -> [u64; 2] {
+    let pool = lock(&TEXTURES);
+    let resting = pool.resting.iter().fold(0u64, |t, (_, p)| t.saturating_add(p.len));
+    let empty = pool.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count() as u64 * BLOCK;
+    [resting, empty]
+}
+
+/// For the census: the texture blocks free ranges by size (below 256 KiB,
+/// 1 MiB, 4 MiB, 16 MiB, and the rest): their bytes, and blocks by how
+/// full (under a quarter, a half, three quarters, and the rest).
+pub(crate) fn texture_holes() -> String {
+    let pool = lock(&TEXTURES);
+    let mut bytes = [0u64; 5];
+    let mut count = [0u64; 5];
+    let mut fill = [0u64; 4];
+    for block in pool.blocks.iter().flatten() {
+        let free = block.free.free_bytes();
+        fill[(((BLOCK - free) * 4 / BLOCK) as usize).min(3)] += 1;
+        for &len in block.free.0.values() {
+            let class = [256u64 << 10, 1 << 20, 4 << 20, 16 << 20].iter().position(|&l| len < l).unwrap_or(4);
+            bytes[class] += len;
+            count[class] += 1;
+        }
+    }
+    format!(
+        "holes MB(count) <256K {}({}) <1M {}({}) <4M {}({}) <16M {}({}) more {}({}); blocks full <25% {} <50% {} <75% {} rest {}",
+        bytes[0] >> 20, count[0], bytes[1] >> 20, count[1], bytes[2] >> 20, count[2], bytes[3] >> 20, count[3], bytes[4] >> 20, count[4],
+        fill[0], fill[1], fill[2], fill[3]
+    )
 }
 
 /// For the memory line and the census: blocks of textures and of staging
