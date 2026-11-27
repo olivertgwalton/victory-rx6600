@@ -5666,7 +5666,10 @@ fn lookup_with(address: u64, len: u64, any: bool, quick: bool, buckets: bool) ->
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+        // `VICTORY_INPLACE_CLASSES`: the xmem classes whose title buffers are
+        // in place, big or not; the others are copies as before.
+        let routed = crate::inplace::class_route(key.0);
+        if routed.unwrap_or(!big) && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }

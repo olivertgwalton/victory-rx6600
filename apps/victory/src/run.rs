@@ -208,6 +208,16 @@ pub fn run(
         println!("renderer port 2: {patched} of {} descriptor record stores of the title patched", SITES.len());
         victory_hle::port_descriptors::hooked(image.base(), size, patched);
     }
+    // Renderer port #8 (VICTORY_PORT_WAITS=1): the title's wait for a value
+    // the GPU writes sleeps until the layer writes it.
+    #[cfg(windows)]
+    if execute && victory_hle::port_waits::on() {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped, nothing of it has run yet, and the
+        // function is ours.
+        let done = unsafe { victory_loader::wait_sites::apply(image.base(), size, victory_hle::port_waits::wait_address()) };
+        println!("renderer port 8: the title's wait for GPU-written values: {done:?}");
+    }
     // The frame rate (VICTORY_FRAME_INTERVAL_MS, off without it): our frame
     // clock ticks at that interval (victory-gpu), and the title is given
     // the matching rate in place of its setting's 30 (VICTORY_TITLE_FPS

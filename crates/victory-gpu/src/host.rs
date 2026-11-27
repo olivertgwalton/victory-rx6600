@@ -679,7 +679,43 @@ fn bury(finished: u64) {
             }
             retired.drain(..n).collect()
         };
-        drop(done);
+        bury_aside(done);
+    }
+}
+
+/// Whether what [`bury`] lets go is dropped by a thread of its own
+/// (`VICTORY_BURY_ASIDE=0`: by the caller, as before). The caller is the
+/// thread that lands flights: releasing the host's objects took it 7 ms a
+/// frame between two landings (run air512, "the rest" of the landing's
+/// line), and the title is told that the card is done only by the next
+/// landing.
+fn bury_aside_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BURY_ASIDE").is_none_or(|v| v != "0"))
+}
+
+/// Drops `done`: on the thread that only does that, in the order given.
+fn bury_aside(done: Vec<(u64, Retired)>) {
+    if !bury_aside_on() {
+        return drop(done);
+    }
+    static TO: OnceLock<Option<std::sync::mpsc::Sender<Vec<(u64, Retired)>>>> = OnceLock::new();
+    let to = TO.get_or_init(|| {
+        let (to, from) = std::sync::mpsc::channel::<Vec<(u64, Retired)>>();
+        std::thread::Builder::new()
+            .name("victory-bury".into())
+            .spawn(move || {
+                // Each batch is dropped as it comes; the loop ends with the process.
+                for batch in from {
+                    drop(batch);
+                }
+            })
+            .ok()
+            .map(|_| to)
+    });
+    // No thread, or it is gone: dropped here.
+    if let Some(Err(back)) = to.as_ref().map(|to| to.send(done)) {
+        drop(back.0);
     }
 }
 
@@ -10143,20 +10179,25 @@ impl Meter {
         // which may not pump for a while), so a thread of ours does it and
         // presenting never waits; it takes the newest text when free.
         static PENDING: Mutex<Option<(usize, Vec<u16>)>> = Mutex::new(None);
+        static THERE: std::sync::Condvar = std::sync::Condvar::new();
         static SETTER: std::sync::Once = std::sync::Once::new();
         *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some((hwnd.0 as usize, text));
+        THERE.notify_one();
         SETTER.call_once(|| {
             let _ = std::thread::Builder::new()
                 .name("victory-caption".into())
                 .spawn(|| {
                     loop {
-                        let next = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
-                        match next {
+                        // Asleep until a text is there (it looked every 100 ms before).
+                        let next = {
+                            let pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+                            THERE.wait_while(pending, |p| p.is_none()).unwrap_or_else(|e| e.into_inner()).take()
+                        };
+                        if let Some((hwnd, text)) = next {
                             // SAFETY: a window handle and a NUL-terminated text.
-                            Some((hwnd, text)) => unsafe {
+                            unsafe {
                                 let _ = SetWindowTextW(HWND(hwnd as *mut _), PCWSTR(text.as_ptr()));
-                            },
-                            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+                            }
                         }
                     }
                 });

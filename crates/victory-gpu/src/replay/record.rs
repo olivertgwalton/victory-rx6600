@@ -1913,7 +1913,30 @@ unsafe extern "system" fn copy_descriptors(
 unsafe extern "system" fn execute(this: Ptr, n: u32, lists: *const Ptr) {
     // SAFETY: `n` closed lists, as D3D12 asks; the state is the queue's.
     unsafe {
-        let go = || own!(this, ID3D12CommandQueue_Vtbl.ExecuteCommandLists)(this, n, lists);
+        // vkd3d-proton tells a list of its own by its method table's address
+        // (`d3d12_command_list_from_iface`) and takes any other for none: a
+        // list with a shim made the queue read through a null pointer (run
+        // schedRec: d3d12core+0x5912dd at the first submission). So each
+        // list points at its own table for the call; a closed list is used
+        // by nobody else meanwhile.
+        let go = || {
+            let shimmed: Vec<(Ptr, usize)> = if lists.is_null() {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(lists, n as usize)
+                    .iter()
+                    .filter(|p| !p.is_null() && hook::ours(**p))
+                    .map(|&p| (p, hook::table(p)))
+                    .collect()
+            };
+            for &(p, _) in &shimmed {
+                p.cast::<usize>().write(hook::orig_table(p));
+            }
+            own!(this, ID3D12CommandQueue_Vtbl.ExecuteCommandLists)(this, n, lists);
+            for &(p, table) in &shimmed {
+                p.cast::<usize>().write(table);
+            }
+        };
         let Some(r) = recorder().filter(|_| !ours()) else {
             return go();
         };

@@ -370,6 +370,27 @@ fn place_in_section(device: &ID3D12Device, start: u64, len: u64) -> Option<Place
     Some(Placed { buffer, heap: heap.clone(), gpu, bias: offset - at })
 }
 
+/// `VICTORY_INPLACE_CLASSES`: a list of xmem classes by their number in
+/// `crate::memclass::CLASSES` (`4,5`: write-combined and coherent). When
+/// set, with [`level`] 2, a title buffer is in place if and only if its
+/// class is listed, whatever its size: the placement is by what the title
+/// asked the memory to be, not by how big the buffer is. `None`: not set,
+/// and the size rule of `crate::shadow` decides as before.
+///
+/// Why by class: a buffer in place costs the CPU nothing (no refresh, no
+/// snapshot, no compare, no landing) and the card a read or write over the
+/// bus each time; a copy in the card's memory is the other way round. Runs
+/// uma2/uma3 (every buffer in place): the submitting thread 45 -> 31 ms a
+/// frame, the frame 47 -> 56 ms with the card busy throughout.
+pub(crate) fn class_route(at: u64) -> Option<bool> {
+    static MASK: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let mask = (*MASK.get_or_init(|| {
+        let v = std::env::var("VICTORY_INPLACE_CLASSES").ok()?;
+        Some(v.split(',').filter_map(|c| c.trim().parse::<u32>().ok()).filter(|c| *c < 32).fold(0, |m, c| m | 1 << c))
+    }))?;
+    Some(mask >> crate::memclass::class_of(at as usize) & 1 == 1)
+}
+
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
