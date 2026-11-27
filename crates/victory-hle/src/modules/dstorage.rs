@@ -48,6 +48,14 @@ const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 const END_OF_FILE: HRESULT = 0x8007_0026_u32 as i32;
 /// `HRESULT_FROM_WIN32(ERROR_INVALID_DATA)`: a bad compressed stream.
 const INVALID_DATA: HRESULT = 0x8007_000D_u32 as i32;
+// The console's own DirectStorage errors (facility 0x924), as `XCRDAPI.dll`
+// returns and logs them.
+/// A queue used after `Close` (every queue method checks first).
+const QUEUE_CLOSED: HRESULT = 0x8924_0010_u32 as i32;
+/// A queue priority outside low (-1) to real-time (2).
+const INVALID_QUEUE_PRIORITY: HRESULT = 0x8924_0013_u32 as i32;
+/// A status entry past the array's capacity.
+const INDEX_OUT_OF_RANGE: HRESULT = 0x8924_0015_u32 as i32;
 
 type Out = *mut *mut c_void;
 
@@ -172,7 +180,9 @@ extern "system" fn create_status_array(
         iid = iid_text(iid),
         "dstorage: status array"
     );
-    let entries = (0..capacity).map(|_| AtomicI32::new(S_OK)).collect();
+    // Every entry starts pending, as the console's do: one nothing was
+    // enqueued for is not complete.
+    let entries = (0..capacity).map(|_| AtomicI32::new(E_PENDING)).collect();
     let written = (0..capacity).map(|_| AtomicU64::new(0)).collect();
     let array = Instance::create(
         Object::new("dstorage status array", &STATUS_VTABLE),
@@ -181,17 +191,25 @@ extern "system" fn create_status_array(
     put(out, array)
 }
 
-/// The queue's description: as in 2020 (source type, capacity, priority,
-/// name), plus a field the title sets to 1.
+/// The queue's description for `CreateQueue1` (`DSTORAGE_QUEUE_DESC1`): as
+/// in 2020 (source type, capacity, priority, name), plus options. The
+/// 2020 `CreateQueue` (slot 0x18) takes the same without the options.
 #[repr(C)]
 struct QueueDesc {
     source_type: u64,
     capacity: u16,
     priority: i8,
     name: *const c_char,
-    unknown: u64,
+    /// Bit 0: the queue does not submit itself once half of its capacity
+    /// has been enqueued since the last submit ([`MANUAL_SUBMIT`]); the
+    /// other bits are reserved and must be 0. The title sets 1.
+    options: u64,
 }
 
+/// `QueueDesc::options` bit 0.
+const MANUAL_SUBMIT: u64 = 1;
+
+/// `CreateQueue1` (slot 0x50), the one the title calls.
 extern "system" fn create_queue(
     _: Factory,
     desc: *const QueueDesc,
@@ -202,23 +220,65 @@ extern "system" fn create_queue(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    if desc.options > MANUAL_SUBMIT {
+        tracing::warn!(options = desc.options, "dstorage: queue options' reserved bits are not 0");
+        return E_INVALIDARG;
+    }
+    new_queue(desc, desc.options & MANUAL_SUBMIT != 0, iid, out)
+}
+
+/// The 2020 `CreateQueue` (slot 0x18): a queue that submits itself at half
+/// capacity.
+extern "system" fn create_queue_2020(
+    _: Factory,
+    desc: *const QueueDesc2020,
+    iid: *const Guid,
+    out: Out,
+) -> HRESULT {
+    // SAFETY: the title passes its description (null tolerated).
+    let Some(desc) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    let desc = QueueDesc {
+        source_type: desc.source_type,
+        capacity: desc.capacity,
+        priority: desc.priority,
+        name: desc.name,
+        options: 0,
+    };
+    new_queue(&desc, false, iid, out)
+}
+
+/// `DSTORAGE_QUEUE_DESC`, 0x18 bytes.
+#[repr(C)]
+struct QueueDesc2020 {
+    source_type: u64,
+    capacity: u16,
+    priority: i8,
+    name: *const c_char,
+}
+
+fn new_queue(desc: &QueueDesc, manual: bool, iid: *const Guid, out: Out) -> HRESULT {
     let name = text(desc.name);
     tracing::info!(
         source = desc.source_type,
         capacity = desc.capacity,
         priority = desc.priority,
         name,
-        unknown = desc.unknown,
+        manual,
         iid = iid_text(iid),
         "dstorage: queue"
     );
+    if !(-1..=2).contains(&desc.priority) {
+        return INVALID_QUEUE_PRIORITY;
+    }
     let Some(scheduler) = scheduler() else {
         return E_OUTOFMEMORY;
     };
     let mut lanes = scheduler.lock();
     let id = lanes.next_id;
     lanes.next_id += 1;
-    let lane = Lane::new(desc.priority, desc.capacity);
+    let lane = Lane::new(desc.priority, desc.capacity, manual);
     lanes.lanes.insert(id, lane);
     drop(lanes);
     put(
@@ -259,7 +319,7 @@ static FACTORY_VTABLE: Methods<16> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    missing::<3> as *const (),            // 0x18 (2020: queue creation)
+    create_queue_2020 as *const (),       // 0x18
     open_file as *const (),               // 0x20
     create_status_array as *const (),     // 0x28
     missing::<6> as *const (),            // 0x30 (2020: CPU affinity)
@@ -483,19 +543,27 @@ struct StatusArray {
 type Array = *mut Instance<StatusArray>;
 
 /// The result of the requests before entry `index`: pending, the first
-/// failure, or success.
+/// failure, or success; past the end, the console's out-of-range error.
 extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
     // SAFETY: an array we created and the title still holds.
     let entries = &unsafe { &*this }.state.entries;
-    entries
-        .get(index as usize)
-        .map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire))
+    entries.get(index as usize).map_or_else(
+        || {
+            tracing::warn!(index, capacity = entries.len(), "dstorage: status entry out of range");
+            INDEX_OUT_OF_RANGE
+        },
+        |e| e.load(Ordering::Acquire),
+    )
 }
 
 /// The title polls this (entry 0, a `Sleep(1)` loop) and never
-/// reads the result itself.
+/// reads the result itself. An entry past the end is never complete.
 extern "system" fn is_complete(this: Array, index: u32) -> bool {
-    let done = status_result(this, index) != E_PENDING;
+    // SAFETY: an array we created and the title still holds.
+    let Some(entry) = unsafe { &*this }.state.entries.get(index as usize) else {
+        return false;
+    };
+    let done = entry.load(Ordering::Acquire) != E_PENDING;
     if done && stream_log::on() {
         // SAFETY: as above.
         let written = &unsafe { &*this }.state.written;
@@ -538,9 +606,12 @@ struct Scheduler {
     finished: Condvar,
 }
 
-/// Priority weights per class (low, normal, high and real-time), as the
-/// console's: about 10x per level, counted against request sizes.
-const COST: [u64; 3] = [100, 10, 1];
+/// Priority weights per class (low, normal, high, real-time): about 10x per
+/// level, counted against request sizes. The console keeps the four
+/// classes apart (`XCRDAPI.dll` hands its storage host 3, 2, 1 and 0 for
+/// them); how its host weighs them is not in the library.
+const COST: [u64; 4] = [1000, 100, 10, 1];
+const CLASSES: usize = COST.len();
 /// The console's default staging buffer.
 const STAGING: u64 = 32 << 20;
 
@@ -557,9 +628,9 @@ struct Lanes {
     /// Weighted round robin: each class's virtual time (bytes × cost), and
     /// the time of the last start; within a class, the lane clock of the
     /// last start.
-    clock: [u64; 3],
+    clock: [u64; CLASSES],
     now: u64,
-    lane_now: [u64; 3],
+    lane_now: [u64; CLASSES],
     /// Since the last debug summary: requests, bytes written, time spent
     /// running them.
     done: (u64, u64, std::time::Duration),
@@ -573,6 +644,9 @@ struct Lanes {
 struct Lane {
     class: usize,
     capacity: usize,
+    /// Made with `MANUAL_SUBMIT`: runs only what the title submits (see
+    /// [`queue`]); otherwise it also submits itself at half capacity.
+    manual: bool,
     /// Bytes started, for round robin among the lanes of a class.
     clock: u64,
     /// Enqueued, not yet submitted.
@@ -618,9 +692,9 @@ fn scheduler() -> Option<&'static Scheduler> {
                     staged: 0,
                     staging: STAGING,
                     starved: false,
-                    clock: [0; 3],
+                    clock: [0; CLASSES],
                     now: 0,
-                    lane_now: [0; 3],
+                    lane_now: [0; CLASSES],
                     done: Default::default(),
                     refused: 0,
                     bcpack: Default::default(),
@@ -922,10 +996,12 @@ impl Lanes {
 }
 
 impl Lane {
-    fn new(priority: i8, capacity: u16) -> Lane {
+    fn new(priority: i8, capacity: u16, manual: bool) -> Lane {
         Lane {
-            class: priority.clamp(-1, 1).wrapping_add(1) as usize,
+            // Low (-1) to real-time (2): classes 0 to 3.
+            class: (priority.clamp(-1, 2) + 1) as usize,
             capacity: usize::from(capacity),
+            manual,
             clock: 0,
             unsubmitted: Vec::new(),
             reads: VecDeque::new(),
@@ -1282,8 +1358,17 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     let Some(entries) = (unsafe { array.as_ref() }).map(|a| &a.state.entries) else {
         return;
     };
+    // As the console: a closed queue, or an entry past the end, is an error
+    // the title is not told of, and the entry stays as it was.
+    if !is_open(this, "EnqueueStatus") {
+        return;
+    }
     let Some(entry) = entries.get(index as usize) else {
-        tracing::warn!(index, "dstorage: status entry out of range");
+        tracing::warn!(
+            index,
+            hr = format_args!("{:#010x}", INDEX_OUT_OF_RANGE as u32),
+            "dstorage: status entry out of range"
+        );
         return;
     };
     entry.store(E_PENDING, Ordering::Release);
@@ -1292,21 +1377,37 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     queue(this, Command::Status(Status { array, index, enqueued }));
 }
 
-/// Whether a queue submits itself once half of it is enqueued
-/// (`VICTORY_DSTORAGE_HALF=1`), as DirectStorage for the PC does and as ours
-/// did. The title's batches (up to 4,095 requests, in queues of 4,159) hold
-/// more than half now and then, and it maps the pages they go to and fills
-/// in their page lists in its own submit, after it has enqueued them all
-/// (image +0xe88f0: the batch's mapping list first, at +0xf2c470, which
-/// writes the page lists at +0x55aa6a0; then the status entry; then our
-/// submit). So 2,079 requests, three or four times a load, ran on lists of
-/// page 0, or, worse, of the pages the addresses had shown before: their
-/// data went into whatever those pages belonged to by then, and the pages it
-/// was for stayed as they were.
-fn half_submits() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_HALF").is_some_and(|v| v == "1"))
+/// Whether the queue is still open; if not, logs the console's error for
+/// `method` (which then does nothing).
+fn is_open(this: QueueRef, method: &str) -> bool {
+    // SAFETY: a queue we created and the title still holds.
+    let id = unsafe { &*this }.state.id;
+    let open = scheduler()
+        .is_some_and(|s| s.lock().lanes.get(&id).is_some_and(|l| !l.closed));
+    if !open {
+        tracing::warn!(
+            queue = id,
+            method,
+            hr = format_args!("{:#010x}", QUEUE_CLOSED as u32),
+            "dstorage: a method of a closed queue"
+        );
+    }
+    open
 }
+
+// When a queue submits itself (`Lane::manual`). As `XCRDAPI.dll`: a queue
+// made without `MANUAL_SUBMIT` submits itself when the commands enqueued
+// since the last submit reach half its capacity; one made with it (as the
+// title makes all of its queues) only when the title submits. That matters:
+// the title's batches (up to 4,095 requests, in queues of 4,159) hold more
+// than half now and then, and it maps the pages they go to and fills in
+// their page lists in its own submit, after it has enqueued them all (image
+// +0xe88f0: the batch's mapping list first, at +0xf2c470, which writes the
+// page lists at +0x55aa6a0; then the status entry; then our submit). When
+// ours submitted at half regardless, 2,079 requests, three or four times a
+// load, ran on lists of page 0, or, worse, of the pages the addresses had
+// shown before: their data went into whatever those pages belonged to by
+// then, and the pages it was for stayed as they were.
 
 /// Adds a command to the queue; blocks while the queue is full. A queue
 /// that is full of commands nobody submitted submits itself, since nothing
@@ -1320,6 +1421,8 @@ fn queue(this: QueueRef, command: Command) {
     let mut lanes = scheduler.lock();
     loop {
         let Some(lane) = lanes.lanes.get(&id).filter(|l| !l.closed) else {
+            drop(lanes);
+            is_open(this, "EnqueueEntry"); // the console's error, logged
             return; // closed: dropped (a status releases its array)
         };
         // One slot stays free, as the console's count of empty slots says.
@@ -1345,17 +1448,22 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if half_submits() && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+    // The console counts commands since the last submit and submits when
+    // the count is exactly half the capacity.
+    if !lane.manual && lane.unsubmitted.len() == lane.capacity / 2 {
         lanes.submit(id, true);
         scheduler.work.notify_all();
     }
 }
 
-/// The title's submit, where its page lists become valid ([`half_submits`]):
+/// The title's submit, where its page lists become valid ([`Lane::manual`]):
 /// the pages are mapped just before, also those under addresses without a
 /// list (memory only the CPU sees).
 extern "system" fn submit(this: QueueRef) {
     let _called = victory_gpu::timeline::span("the title's DirectStorage Submit");
+    if !is_open(this, "Submit") {
+        return;
+    }
     // SAFETY: as above.
     let id = unsafe { &*this }.state.id;
     let Some(scheduler) = scheduler() else {
@@ -1372,6 +1480,9 @@ extern "system" fn submit(this: QueueRef) {
 /// completes, and this returns once the reads already running have
 /// finished. The title calls this, not `Release`.
 extern "system" fn close(this: QueueRef) {
+    if !is_open(this, "Close") {
+        return;
+    }
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
 }
@@ -1715,7 +1826,7 @@ fn read_list(list: *const usize, offset: usize, len: usize) -> Vec<usize> {
 /// here. It is only ever overwritten: an address the title unmapped keeps
 /// the number of the page it had, which the title maps elsewhere soon after,
 /// so a number the title owns says nothing about whether it is the right
-/// one ([`half_submits`]). Page 0 does (an address never mapped yet): a list
+/// one ([`Lane::manual`]). Page 0 does (an address never mapped yet): a list
 /// with a page the title does not own is read again for a while, up to
 /// 1.5 s; what it holds then is used as it is.
 fn page_list(list: *const usize, offset: usize, len: usize) -> Vec<usize> {
@@ -1821,7 +1932,7 @@ mod tests {
             capacity: 0x80,
             priority: 0,
             name: c"test".as_ptr(),
-            unknown: 1,
+            options: 1,
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
@@ -1900,7 +2011,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source), 0x20);
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
-        assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+        assert_eq!(std::mem::offset_of!(QueueDesc, options), 0x18);
     }
 
     fn compress_zlib(plain: &[u8]) -> Vec<u8> {
@@ -2045,7 +2156,7 @@ mod tests {
             capacity: 4,
             priority: 1,
             name: c"small".as_ptr(),
-            unknown: 1,
+            options: 1,
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
@@ -2217,9 +2328,9 @@ mod tests {
             staged: 0,
             staging,
             starved: false,
-            clock: [0; 3],
+            clock: [0; CLASSES],
             now: 0,
-            lane_now: [0; 3],
+            lane_now: [0; CLASSES],
             done: Default::default(),
             refused: 0,
             bcpack: Default::default(),
@@ -2238,9 +2349,9 @@ mod tests {
     #[test]
     fn priorities_share_by_bytes_about_tenfold() {
         let mut l = lanes(STAGING);
-        l.lanes.insert(0, Lane::new(0, 4096));
-        l.lanes.insert(1, Lane::new(1, 4096));
-        l.lanes.insert(2, Lane::new(2, 4096)); // real-time: as high
+        l.lanes.insert(0, Lane::new(0, 4096, true));
+        l.lanes.insert(1, Lane::new(1, 4096, true));
+        l.lanes.insert(2, Lane::new(2, 4096, true)); // real-time: a class of its own
         for _ in 0..400 {
             for id in 0..3 {
                 read(&mut l, id, 0, 4096);
@@ -2248,21 +2359,21 @@ mod tests {
         }
         (0..3).for_each(|id| l.submit(id, false));
         let mut started = [0u32; 3];
-        for _ in 0..330 {
+        for _ in 0..333 {
             let job = l.start().unwrap();
             started[job.lane as usize] += 1;
             l.finish(&job, Ok(()));
         }
-        // Normal gets about a tenth of what high and real-time get together.
-        assert_eq!(started[1] + started[2], 300, "{started:?}");
-        assert_eq!(started[0], 30, "{started:?}");
-        assert!(started[1].abs_diff(started[2]) <= 1, "{started:?}");
+        // Each level gets about ten times the one below.
+        assert!(started[2].abs_diff(300) <= 2, "{started:?}");
+        assert!(started[1].abs_diff(30) <= 2, "{started:?}");
+        assert!(started[0].abs_diff(3) <= 1, "{started:?}");
     }
 
     #[test]
     fn staging_bounds_compressed_bytes_in_flight() {
         let mut l = lanes(100);
-        l.lanes.insert(0, Lane::new(0, 64));
+        l.lanes.insert(0, Lane::new(0, 64, true));
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, 0, 1000); // raw: straight to its destination
@@ -2284,7 +2395,7 @@ mod tests {
     #[test]
     fn a_status_waits_for_every_earlier_read() {
         let mut l = lanes(STAGING);
-        l.lanes.insert(0, Lane::new(0, 64));
+        l.lanes.insert(0, Lane::new(0, 64, true));
         let array = status_array(2).cast::<Instance<StatusArray>>();
         let status = |index| {
             add_ref_instance(array);
@@ -2398,6 +2509,72 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(result(array, 0), E_PENDING);
         assert_eq!(out, [0; 16]);
+    }
+
+    fn queue_with(capacity: u16, priority: i8, options: u64) -> (HRESULT, *mut c_void) {
+        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let desc = QueueDesc {
+            source_type: 0,
+            capacity,
+            priority,
+            name: c"test".as_ptr(),
+            options,
+        };
+        let mut queue = std::ptr::null_mut();
+        (create(factory(), &desc, std::ptr::null(), &mut queue), queue)
+    }
+
+    #[test]
+    fn status_entries_start_pending_and_past_the_end_is_an_error() {
+        let array = status_array(2);
+        let done: extern "system" fn(*mut c_void, u32) -> bool = call(array, 0x18);
+        assert_eq!(result(array, 1), E_PENDING);
+        assert!(!done(array, 1));
+        assert_eq!(result(array, 2), INDEX_OUT_OF_RANGE);
+        assert!(!done(array, 2));
+    }
+
+    #[test]
+    fn queue_priorities_and_options_are_checked() {
+        assert_eq!(queue_with(0x80, 3, 1).0, INVALID_QUEUE_PRIORITY);
+        assert_eq!(queue_with(0x80, -2, 1).0, INVALID_QUEUE_PRIORITY);
+        assert_eq!(queue_with(0x80, 0, 2).0, E_INVALIDARG);
+        let (hr, queue) = queue_with(0x80, 2, 1);
+        assert_eq!(hr, S_OK);
+        void(queue, 0x40);
+    }
+
+    #[test]
+    fn a_queue_without_manual_submit_submits_itself_at_half() {
+        let (_dir, file) = file_with(&pattern(64));
+        let (hr, queue) = queue_with(8, 0, 0);
+        assert_eq!(hr, S_OK);
+        let array = status_array(1);
+        let mut outs = [[0u8; 16]; 3];
+        for out in &mut outs {
+            enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
+        }
+        // The fourth command (half of 8) submits the lot; nobody calls Submit.
+        enqueue_status(queue, array, 0);
+        assert_eq!(wait(array, 0), S_OK);
+        assert!(outs.iter().all(|out| out[..] == pattern(64)[8..24]));
+        void(queue, 0x40);
+    }
+
+    #[test]
+    fn a_closed_queue_leaves_status_entries_as_they_were() {
+        let (_dir, file) = file_with(&pattern(64));
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut out = [0u8; 16];
+        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 0, 16));
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        void(queue, 0x40);
+        enqueue_status(queue, array, 0);
+        assert_eq!(result(array, 0), S_OK, "not made pending again");
+        void(queue, 0x40); // a second close: an error, nothing else
     }
 
     #[test]
