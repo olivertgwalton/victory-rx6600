@@ -1091,15 +1091,564 @@ fn meta_address(c: &Computer, usage: u32, mip: u32, x: u64, y: u32, z: u32, samp
     Some(index * block * 8 + u64::from(inside))
 }
 
-/// Slots the title does not call: size, alignment, offsets, coordinates,
-/// view descriptor, tiled-resource query.
-extern "system" fn unused(this: This) -> HRESULT {
-    tracing::warn!(desc = ?computer(this).desc, "unimplemented texture computer method");
-    E_NOTIMPL
+/// The layout as slot 0x10 gives it (the library keeps a copy to answer
+/// the slots below from).
+fn layout_out(this: This) -> Box<LayoutOut> {
+    // SAFETY: plain data, filled by `layout`.
+    let mut out: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });
+    layout(this, &mut *out);
+    out
+}
+
+/// Slot 0x18: the texture's size.
+extern "system" fn size(this: This) -> u64 {
+    layout_out(this).size
+}
+
+/// Slot 0x20: its base alignment.
+extern "system" fn alignment(this: This) -> u64 {
+    layout_out(this).alignment
+}
+
+/// Slot 0x28 `(plane, mip)`: where the mip starts, `u64::MAX` for a plane
+/// or mip the texture does not have.
+extern "system" fn mip_offset(this: This, plane: u32, mip: u32) -> u64 {
+    let l = layout_out(this);
+    if plane >= l.planes || mip >= l.mips {
+        return u64::MAX;
+    }
+    let p = &l.plane[plane as usize];
+    p.offset + p.mips[mip as usize].offset
+}
+
+/// Slot 0x60: whether the texture is a tiled resource (a 2D texture of one
+/// plane in a `_T` mode).
+extern "system" fn tiled_resource(this: This) -> u8 {
+    let c = computer(this);
+    u8::from(c.desc.dimension == 3 && matches!(c.swizzle.0, 17 | 18) && c.texture.planes.len() == 1)
+}
+
+/// Slot 0x38 `(offset, plane, mip, x, y, z, sample)`: the element at a
+/// byte offset from the texture's start. The library answers for linear
+/// layouts only (E_INVALIDARG for tiled ones), for offsets inside a mip of
+/// the first slice.
+#[allow(clippy::too_many_arguments)]
+extern "system" fn element_at(
+    this: This,
+    offset: u64,
+    plane_out: *mut u32,
+    mip_out_: *mut u32,
+    x_out: *mut u64,
+    y_out: *mut u32,
+    z_out: *mut u32,
+    sample_out: *mut u32,
+) -> HRESULT {
+    let c = computer(this);
+    let l = layout_out(this);
+    for (index, p) in l.plane.iter().take(l.planes as usize).enumerate() {
+        for (m, mip) in p.mips.iter().take(l.mips as usize).enumerate() {
+            let start = p.offset + mip.offset;
+            if offset < start || offset >= start + mip.size {
+                continue;
+            }
+            if let Some(Placed { kind: PlaneKind::Meta(_), usage, .. }) = c.planes.get(index) {
+                if *usage != HTILE {
+                    return E_INVALIDARG;
+                }
+                // `HTILE`: the plane, the rest zero.
+                // SAFETY: each output is null or room for its value.
+                unsafe {
+                    if let Some(o) = plane_out.as_mut() {
+                        *o = index as u32;
+                    }
+                    for o in [mip_out_, y_out, z_out, sample_out] {
+                        if let Some(o) = o.as_mut() {
+                            *o = 0;
+                        }
+                    }
+                    if let Some(o) = x_out.as_mut() {
+                        *o = 0;
+                    }
+                }
+                return S_OK;
+            }
+            let linear = matches!(c.planes.get(index).map(|p| &p.kind), Some(PlaneKind::Data(_)))
+                && mip.swizzle == Swizzle::LINEAR.0
+                && p.element_bytes != 0;
+            if !linear {
+                return E_INVALIDARG;
+            }
+            // The library reads the offset (from the texture's start) as
+            // if each slice held its chain largest mip first, the way the
+            // GPU's address library lays out linear surfaces (every mip at
+            // mip 0's pitch), though its own layouts put the smallest
+            // first: the mip and position it reports come from that
+            // reading, none past a mip's extent.
+            let chain = &p.mips[..l.mips as usize];
+            let pitch = u64::from(chain[0].pitch_bytes);
+            let size = |m: &MipOut| pitch * u64::from(m.padded[1]);
+            // 3D slices are the layout's own (each depth slice holds the
+            // chain at each mip's pitch).
+            let slice: u64 = if c.desc.dimension == TEXTURE_3D {
+                p.slice_size
+            } else {
+                chain.iter().map(size).sum()
+            };
+            let (z, mut rest) = (offset / slice, offset % slice);
+            let mut m = 0;
+            while m < chain.len() && rest >= size(&chain[m]) {
+                rest -= size(&chain[m]);
+                m += 1;
+            }
+            let Some(mip) = chain.get(m) else {
+                return E_INVALIDARG;
+            };
+            let (y, x) = (rest / pitch, rest % pitch / u64::from(p.element_bytes));
+            if y >= u64::from(mip.elements[1]) || x >= u64::from(mip.elements[0]) || z >= u64::from(mip.depth_or_array) {
+                return E_INVALIDARG;
+            }
+            // SAFETY: each output is null or room for its value.
+            unsafe {
+                if let Some(o) = plane_out.as_mut() {
+                    *o = index as u32;
+                }
+                if let Some(o) = mip_out_.as_mut() {
+                    *o = m as u32;
+                }
+                if let Some(o) = x_out.as_mut() {
+                    *o = x;
+                }
+                if let Some(o) = y_out.as_mut() {
+                    *o = y as u32;
+                }
+                if let Some(o) = z_out.as_mut() {
+                    *o = z as u32;
+                }
+                if let Some(o) = sample_out.as_mut() {
+                    *o = 0;
+                }
+            }
+            return S_OK;
+        }
+    }
+    E_INVALIDARG
+}
+
+/// The library's address-equation number for a plane: 5 per mode (by
+/// element size) in mode order for 2D, from 80 over the 3D modes; none
+/// (`u32::MAX`) for linear, 1D, samples and 3D `64KB_D_X` of 8 and 16
+/// bytes, which take no numbers (3D `64KB_R_X` follows on at 113).
+fn equation_index(c: &Computer, l: &Layout) -> u32 {
+    const MODES_2D: [u32; 14] = [1, 2, 5, 6, 9, 10, 17, 18, 21, 22, 24, 25, 26, 27];
+    const MODES_3D: [u32; 7] = [5, 9, 17, 21, 24, 25, 26];
+    let e = l.desc.element_bytes.trailing_zeros();
+    let sw = l.desc.swizzle.0;
+    if l.desc.samples > 1 || !l.addressable() {
+        return u32::MAX;
+    }
+    match c.desc.dimension {
+        3 => MODES_2D.iter().position(|&m| m == sw).map_or(u32::MAX, |k| 5 * k as u32 + e),
+        TEXTURE_3D if sw == Swizzle::SW_64KB_R_X.0 => 113 + e,
+        TEXTURE_3D => MODES_3D.iter().position(|&m| m == sw).map_or(u32::MAX, |k| 80 + 5 * k as u32 + e),
+        _ => u32::MAX,
+    }
+}
+
+/// Slot 0x68 `(plane, out [u32; 4])`: the plane's address-equation number
+/// and block shape in elements. E_INVALIDARG for a plane without a view
+/// descriptor, E_FAIL for metadata.
+extern "system" fn plane_info(this: This, plane: u32, out: *mut [u32; 4]) -> HRESULT {
+    let c = computer(this);
+    // SAFETY: the caller passes room for four values.
+    let out = unsafe { &mut *out };
+    *out = [u32::MAX, 0, 0, 0];
+    if descriptor(c, plane).is_none() {
+        return E_INVALIDARG;
+    }
+    match c.planes.get(plane as usize).map(|p| &p.kind) {
+        Some(PlaneKind::Data(i)) => {
+            let l = &c.texture.planes[*i].layout;
+            *out = [equation_index(c, l), l.block[0], l.block[1], l.block[2]];
+            S_OK
+        }
+        _ => E_FAIL,
+    }
+}
+
+/// Slot 0x58 `(plane, out [u32; 8])`: the GPU image descriptor the library
+/// makes for a plane (the first three), base address 0. E_INVALIDARG for
+/// planes without one: `HTILE`, `DCC`, planes of nothing.
+extern "system" fn view_descriptor(this: This, plane: u32, out: *mut [u32; 8]) -> HRESULT {
+    if out.is_null() || plane >= 3 {
+        return E_INVALIDARG;
+    }
+    match descriptor(computer(this), plane) {
+        Some(d) => {
+            // SAFETY: checked non-null; room for the descriptor.
+            unsafe { out.write(d) };
+            S_OK
+        }
+        None => E_INVALIDARG,
+    }
+}
+
+/// Image formats, channel selects and BC swizzles by DXGI format, plane
+/// usage and context (0 plain, 1 render target, 2 depth buffer with
+/// `HTILE`), as the library writes them (measured).
+#[rustfmt::skip]
+const DESCRIPTOR_FORMATS: &[(u32, u32, u32, u32, u32, u32)] = &[
+    (1, 1, 0, 75, 0xfac, 0),
+    (1, 1, 1, 77, 0xfac, 0),
+    (2, 1, 0, 77, 0xfac, 0),
+    (2, 1, 1, 77, 0xfac, 0),
+    (3, 1, 0, 75, 0xfac, 0),
+    (3, 1, 1, 75, 0xfac, 0),
+    (4, 1, 0, 76, 0xfac, 0),
+    (4, 1, 1, 76, 0xfac, 0),
+    (9, 1, 0, 69, 0xfac, 0),
+    (9, 1, 1, 71, 0xfac, 0),
+    (10, 1, 0, 71, 0xfac, 0),
+    (10, 1, 1, 71, 0xfac, 0),
+    (11, 1, 0, 65, 0xfac, 0),
+    (11, 1, 1, 65, 0xfac, 0),
+    (12, 1, 0, 69, 0xfac, 0),
+    (12, 1, 1, 69, 0xfac, 0),
+    (13, 1, 0, 66, 0xfac, 0),
+    (13, 1, 1, 66, 0xfac, 0),
+    (14, 1, 0, 70, 0xfac, 0),
+    (14, 1, 1, 70, 0xfac, 0),
+    (15, 1, 0, 62, 0x22c, 0),
+    (15, 1, 1, 64, 0x22c, 0),
+    (16, 1, 0, 64, 0x22c, 0),
+    (16, 1, 1, 64, 0x22c, 0),
+    (17, 1, 0, 62, 0x22c, 0),
+    (17, 1, 1, 62, 0x22c, 0),
+    (18, 1, 0, 63, 0x22c, 0),
+    (18, 1, 1, 63, 0x22c, 0),
+    (19, 5, 0, 20, 0x204, 0),
+    (19, 5, 1, 20, 0x204, 0),
+    (19, 6, 0, 5, 0x204, 0),
+    (19, 6, 1, 5, 0x204, 0),
+    (19, 7, 0, 20, 0x204, 0),
+    (19, 7, 2, 22, 0x204, 0),
+    (19, 8, 0, 5, 0x204, 0),
+    (19, 8, 2, 5, 0x004, 0),
+    (20, 5, 0, 22, 0x204, 0),
+    (20, 5, 1, 22, 0x204, 0),
+    (20, 6, 0, 5, 0x220, 0),
+    (20, 6, 1, 5, 0x220, 0),
+    (20, 7, 0, 22, 0x204, 0),
+    (20, 7, 2, 22, 0x204, 0),
+    (20, 8, 0, 5, 0x220, 0),
+    (20, 8, 2, 5, 0x004, 0),
+    (21, 1, 0, 146, 0x204, 0),
+    (21, 1, 1, 146, 0x22c, 0),
+    (21, 7, 2, 22, 0x204, 0),
+    (22, 6, 0, 5, 0x220, 0),
+    (22, 6, 1, 5, 0x220, 0),
+    (22, 7, 2, 22, 0x204, 0),
+    (22, 8, 2, 5, 0x004, 0),
+    (23, 1, 0, 54, 0xfac, 0),
+    (23, 1, 1, 50, 0xfac, 0),
+    (24, 1, 0, 50, 0xfac, 0),
+    (24, 1, 1, 50, 0xfac, 0),
+    (25, 1, 0, 54, 0xfac, 0),
+    (25, 1, 1, 54, 0xfac, 0),
+    (26, 1, 0, 36, 0x3ac, 0),
+    (26, 1, 1, 36, 0x3ac, 0),
+    (27, 1, 0, 60, 0xfac, 0),
+    (27, 1, 1, 56, 0xfac, 0),
+    (28, 1, 0, 56, 0xfac, 0),
+    (28, 1, 1, 56, 0xfac, 0),
+    (29, 1, 0, 130, 0xfac, 0),
+    (29, 1, 1, 130, 0xfac, 0),
+    (30, 1, 0, 60, 0xfac, 0),
+    (30, 1, 1, 60, 0xfac, 0),
+    (31, 1, 0, 57, 0xfac, 0),
+    (31, 1, 1, 57, 0xfac, 0),
+    (32, 1, 0, 61, 0xfac, 0),
+    (32, 1, 1, 61, 0xfac, 0),
+    (33, 1, 0, 27, 0x22c, 0),
+    (33, 1, 1, 29, 0x22c, 0),
+    (34, 1, 0, 29, 0x22c, 0),
+    (34, 1, 1, 29, 0x22c, 0),
+    (35, 1, 0, 23, 0x22c, 0),
+    (35, 1, 1, 23, 0x22c, 0),
+    (36, 1, 0, 27, 0x22c, 0),
+    (36, 1, 1, 27, 0x22c, 0),
+    (37, 1, 0, 24, 0x22c, 0),
+    (37, 1, 1, 24, 0x22c, 0),
+    (38, 1, 0, 28, 0x22c, 0),
+    (38, 1, 1, 28, 0x22c, 0),
+    (39, 1, 0, 20, 0x204, 0),
+    (39, 1, 1, 22, 0x204, 0),
+    (39, 7, 2, 22, 0x204, 0),
+    (40, 1, 0, 22, 0x204, 0),
+    (40, 1, 1, 22, 0x204, 0),
+    (40, 7, 2, 22, 0x204, 0),
+    (41, 1, 0, 22, 0x204, 0),
+    (41, 1, 1, 22, 0x204, 0),
+    (42, 1, 0, 20, 0x204, 0),
+    (42, 1, 1, 20, 0x204, 0),
+    (43, 1, 0, 21, 0x204, 0),
+    (43, 1, 1, 21, 0x204, 0),
+    (44, 5, 0, 142, 0x22c, 0),
+    (44, 5, 1, 142, 0x22c, 0),
+    (44, 6, 0, 5, 0x204, 0),
+    (44, 6, 1, 5, 0x204, 0),
+    (44, 7, 0, 142, 0x22c, 0),
+    (44, 7, 2, 141, 0x204, 0),
+    (44, 8, 0, 5, 0x204, 0),
+    (44, 8, 2, 5, 0x004, 0),
+    (45, 5, 0, 141, 0x204, 0),
+    (45, 5, 1, 141, 0x204, 0),
+    (45, 6, 0, 5, 0x204, 0),
+    (45, 6, 1, 5, 0x204, 0),
+    (45, 7, 0, 141, 0x204, 0),
+    (45, 7, 2, 141, 0x204, 0),
+    (45, 8, 0, 5, 0x204, 0),
+    (45, 8, 2, 5, 0x004, 0),
+    (46, 1, 0, 141, 0x204, 0),
+    (46, 1, 1, 141, 0x22c, 0),
+    (46, 7, 2, 141, 0x204, 0),
+    (47, 6, 0, 5, 0x220, 0),
+    (47, 6, 1, 5, 0x220, 0),
+    (47, 7, 2, 141, 0x204, 0),
+    (47, 8, 2, 5, 0x004, 0),
+    (48, 1, 0, 18, 0x22c, 0),
+    (48, 1, 1, 14, 0x22c, 0),
+    (49, 1, 0, 14, 0x22c, 0),
+    (49, 1, 1, 14, 0x22c, 0),
+    (50, 1, 0, 18, 0x22c, 0),
+    (50, 1, 1, 18, 0x22c, 0),
+    (51, 1, 0, 15, 0x22c, 0),
+    (51, 1, 1, 15, 0x22c, 0),
+    (52, 1, 0, 19, 0x22c, 0),
+    (52, 1, 1, 19, 0x22c, 0),
+    (53, 1, 0, 11, 0x204, 0),
+    (53, 1, 1, 13, 0x204, 0),
+    (53, 7, 2, 7, 0x204, 0),
+    (54, 1, 0, 13, 0x204, 0),
+    (54, 1, 1, 13, 0x204, 0),
+    (55, 1, 0, 7, 0x204, 0),
+    (55, 1, 1, 7, 0x204, 0),
+    (55, 7, 2, 7, 0x204, 0),
+    (56, 1, 0, 7, 0x204, 0),
+    (56, 1, 1, 7, 0x204, 0),
+    (57, 1, 0, 11, 0x204, 0),
+    (57, 1, 1, 11, 0x204, 0),
+    (58, 1, 0, 8, 0x204, 0),
+    (58, 1, 1, 8, 0x204, 0),
+    (59, 1, 0, 12, 0x204, 0),
+    (59, 1, 1, 12, 0x204, 0),
+    (60, 1, 0, 5, 0x204, 0),
+    (60, 1, 1, 1, 0x204, 0),
+    (61, 1, 0, 1, 0x204, 0),
+    (61, 1, 1, 1, 0x204, 0),
+    (62, 1, 0, 5, 0x204, 0),
+    (62, 1, 1, 5, 0x204, 0),
+    (62, 8, 2, 5, 0x004, 0),
+    (63, 1, 0, 2, 0x204, 0),
+    (63, 1, 1, 2, 0x204, 0),
+    (64, 1, 0, 6, 0x204, 0),
+    (64, 1, 1, 6, 0x204, 0),
+    (65, 1, 0, 1, 0x800, 0),
+    (65, 1, 1, 1, 0x800, 0),
+    (66, 1, 0, 1, 0x204, 0),
+    (66, 1, 1, 1, 0x204, 0),
+    (67, 1, 0, 132, 0x3ac, 0),
+    (67, 1, 1, 132, 0x3ac, 0),
+    (68, 1, 0, 147, 0x3ac, 0),
+    (69, 1, 0, 151, 0x3ac, 0),
+    (70, 1, 0, 169, 0xfac, 0),
+    (71, 1, 0, 169, 0xfac, 0),
+    (71, 1, 1, 169, 0xfac, 0),
+    (72, 1, 0, 170, 0xfac, 0),
+    (73, 1, 0, 171, 0xfac, 0),
+    (73, 1, 1, 171, 0xfac, 0),
+    (74, 1, 0, 171, 0xfac, 0),
+    (74, 1, 1, 171, 0xfac, 0),
+    (75, 1, 0, 172, 0xfac, 0),
+    (75, 1, 1, 172, 0xfac, 0),
+    (76, 1, 0, 173, 0xfac, 0),
+    (76, 1, 1, 173, 0xfac, 0),
+    (77, 1, 0, 173, 0xfac, 0),
+    (77, 1, 1, 173, 0xfac, 0),
+    (78, 1, 0, 174, 0xfac, 0),
+    (78, 1, 1, 174, 0xfac, 0),
+    (79, 1, 0, 175, 0x204, 0),
+    (80, 1, 0, 175, 0x204, 0),
+    (80, 1, 1, 175, 0x204, 0),
+    (81, 1, 0, 176, 0x204, 0),
+    (82, 1, 0, 177, 0x22c, 0),
+    (82, 1, 1, 177, 0x22c, 0),
+    (83, 1, 0, 177, 0x22c, 0),
+    (83, 1, 1, 177, 0x22c, 0),
+    (84, 1, 0, 178, 0x22c, 0),
+    (84, 1, 1, 178, 0x22c, 0),
+    (85, 1, 0, 133, 0x32e, 0),
+    (85, 1, 1, 133, 0x32e, 0),
+    (86, 1, 0, 134, 0xf2e, 0),
+    (86, 1, 1, 134, 0xf2e, 0),
+    (87, 1, 0, 56, 0xf2e, 0),
+    (87, 1, 1, 56, 0xf2e, 0),
+    (88, 1, 0, 56, 0x32e, 0),
+    (88, 1, 1, 56, 0xf2e, 0),
+    (89, 1, 0, 50, 0xfac, 0),
+    (89, 1, 1, 50, 0xfac, 0),
+    (90, 1, 0, 60, 0xf2e, 0),
+    (90, 1, 1, 56, 0xf2e, 0),
+    (91, 1, 0, 130, 0xf2e, 0),
+    (91, 1, 1, 130, 0xf2e, 0),
+    (92, 1, 0, 60, 0x32e, 0),
+    (92, 1, 1, 56, 0xf2e, 0),
+    (93, 1, 0, 130, 0x32e, 0),
+    (93, 1, 1, 130, 0xf2e, 0),
+    (94, 1, 0, 179, 0x3ac, 0),
+    (94, 1, 1, 179, 0x3ac, 0),
+    (95, 1, 0, 179, 0x3ac, 0),
+    (95, 1, 1, 179, 0x3ac, 0),
+    (96, 1, 0, 180, 0x3ac, 0),
+    (96, 1, 1, 180, 0x3ac, 0),
+    (97, 1, 0, 181, 0xfac, 0),
+    (97, 1, 1, 181, 0xfac, 0),
+    (98, 1, 0, 181, 0xfac, 0),
+    (98, 1, 1, 181, 0xfac, 0),
+    (99, 1, 0, 182, 0xfac, 0),
+    (99, 1, 1, 182, 0xfac, 0),
+    (100, 1, 0, 56, 0xfac, 0),
+    (100, 1, 1, 56, 0xfac, 0),
+    (101, 1, 0, 50, 0x3ac, 0),
+    (101, 1, 1, 50, 0xfac, 0),
+    (102, 1, 0, 65, 0x3ac, 0),
+    (102, 1, 1, 65, 0xfac, 0),
+    (103, 5, 0, 1, 0x204, 0),
+    (103, 5, 1, 1, 0x204, 0),
+    (103, 6, 0, 14, 0x22c, 0),
+    (103, 6, 1, 14, 0x22c, 0),
+    (104, 5, 0, 7, 0x204, 0),
+    (104, 5, 1, 7, 0x204, 0),
+    (104, 6, 0, 23, 0x22c, 0),
+    (104, 6, 1, 23, 0x22c, 0),
+    (105, 5, 0, 7, 0x204, 0),
+    (105, 5, 1, 7, 0x204, 0),
+    (105, 6, 0, 23, 0x22c, 0),
+    (105, 6, 1, 23, 0x22c, 0),
+    (106, 5, 0, 1, 0x204, 0),
+    (106, 5, 1, 1, 0x204, 0),
+    (106, 6, 0, 14, 0x22c, 0),
+    (106, 6, 1, 14, 0x22c, 0),
+    (107, 1, 0, 151, 0x3ac, 0),
+    (110, 5, 0, 1, 0x204, 0),
+    (110, 5, 1, 1, 0x204, 0),
+    (110, 6, 0, 14, 0x22c, 0),
+    (110, 6, 1, 14, 0x22c, 0),
+    (111, 1, 0, 1, 0x204, 0),
+    (111, 1, 1, 1, 0x204, 0),
+    (112, 1, 0, 1, 0x204, 0),
+    (112, 1, 1, 1, 0x204, 0),
+    (113, 1, 0, 1, 0x204, 0),
+    (113, 1, 1, 1, 0x204, 0),
+    (114, 1, 0, 14, 0xa04, 0),
+    (114, 1, 1, 14, 0x22c, 0),
+    (115, 1, 0, 136, 0xf2e, 0),
+    (115, 1, 1, 136, 0xf2e, 0),
+    (116, 1, 0, 285, 0xfac, 0),
+    (116, 1, 1, 285, 0xfac, 0),
+    (117, 1, 0, 131, 0xfac, 0),
+    (117, 1, 1, 131, 0xfac, 0),
+    (118, 5, 0, 7, 0x204, 0),
+    (118, 5, 1, 7, 0x204, 0),
+    (118, 6, 0, 5, 0x204, 0),
+    (118, 6, 1, 5, 0x204, 0),
+    (118, 7, 2, 7, 0x204, 0),
+    (118, 8, 2, 5, 0x004, 0),
+    (119, 1, 0, 7, 0x204, 0),
+    (119, 1, 1, 7, 0x204, 0),
+    (119, 7, 2, 7, 0x204, 0),
+    (119, 8, 2, 5, 0x004, 0),
+    (120, 6, 0, 5, 0x220, 0),
+    (120, 6, 1, 5, 0x220, 0),
+    (120, 7, 2, 7, 0x204, 0),
+    (120, 8, 2, 5, 0x004, 0),
+    (189, 1, 0, 51, 0xfac, 0),
+    (189, 1, 1, 51, 0xfac, 0),
+    (190, 1, 0, 137, 0x22c, 0),
+    (191, 1, 0, 141, 0x22c, 0),
+    (191, 1, 1, 141, 0x22c, 0),
+];
+
+/// GFX10 image types.
+const IMAGE_1D_ARRAY: u32 = 12;
+const IMAGE_2D_ARRAY: u32 = 13;
+const IMAGE_2D_MSAA: u32 = 15;
+const IMAGE_3D: u32 = 10;
+
+/// The view descriptor of a plane: GFX10's 8 dwords, with the format,
+/// size, mip levels (sample count for multisampled data), mode, type and
+/// depth or array size.
+fn descriptor(c: &Computer, plane: u32) -> Option<[u32; 8]> {
+    if c.degenerate || plane >= 3 {
+        return None;
+    }
+    let placed = c.planes.get(plane as usize)?;
+    let (w, h) = (c.desc.width as u32, c.desc.height);
+    let depth = u32::from(c.desc.depth_or_array.max(1)) - 1;
+    let (format, select, bc, w, h, levels, sw, ty) = match &placed.kind {
+        PlaneKind::Data(i) => {
+            let l = &c.texture.planes[*i].layout;
+            if l.size == 0 {
+                return None;
+            }
+            let ctx = if c.planes.iter().any(|p| p.usage == HTILE) {
+                2
+            } else {
+                u32::from(c.desc.flags & ALLOW_RENDER_TARGET != 0)
+            };
+            let find = |ctx| {
+                DESCRIPTOR_FORMATS
+                    .iter()
+                    .find(|e| e.0 == c.desc.format && e.1 == placed.usage && e.2 == ctx)
+            };
+            let &(_, _, _, format, select, bc) = find(ctx).or_else(|| find(0))?;
+            let samples = l.desc.samples;
+            let (levels, ty) = match c.desc.dimension {
+                _ if samples > 1 => (samples.trailing_zeros(), IMAGE_2D_MSAA),
+                TEXTURE_1D => (c.mips - 1, IMAGE_1D_ARRAY),
+                TEXTURE_3D => (c.mips - 1, IMAGE_3D),
+                _ => (c.mips - 1, IMAGE_2D_ARRAY),
+            };
+            (format, select, bc, l.desc.width, l.desc.height, levels, l.desc.swizzle.0, ty)
+        }
+        PlaneKind::Meta(_) => {
+            // `CMASK` and `FMASK` as 32-bit and per-sample-count surfaces
+            // of the texture's size in the depth XOR mode.
+            let format = match (placed.usage, c.desc.samples) {
+                (CMASK, _) => 5,
+                (FMASK, 2) => 159,
+                (FMASK, 4) => 161,
+                (FMASK, _) => 166,
+                _ => return None,
+            };
+            (format, 0x004, 0, w, h, 0, Swizzle::SW_64KB_Z_X.0, IMAGE_2D_ARRAY)
+        }
+        PlaneKind::Empty => return None,
+    };
+    let (w1, h1) = (w - 1, h - 1);
+    Some([
+        0,
+        format << 20 | (w1 & 3) << 30,
+        w1 >> 2 | h1 << 14 | 1 << 31,
+        select | levels << 16 | sw << 20 | bc << 25 | ty << 28,
+        depth,
+        0x8040_0000 | levels << 4,
+        0,
+        0,
+    ])
 }
 
 #[repr(C)]
-struct Vtable([*const (); 13]);
+struct Vtable([*const (); 14]);
 // SAFETY: function addresses only.
 unsafe impl Sync for Vtable {}
 
@@ -1107,16 +1656,17 @@ static VTABLE: Vtable = Vtable([
     add_ref as *const (),   // 0x00
     release as *const (),   // 0x08
     layout as *const (),    // 0x10
-    unused as *const (),    // 0x18 size
-    unused as *const (),    // 0x20 alignment
-    unused as *const (),    // 0x28 mip offset
+    size as *const (),      // 0x18
+    alignment as *const (), // 0x20
+    mip_offset as *const (), // 0x28
     element_offset as *const (), // 0x30
-    unused as *const (),    // 0x38 element coordinate
+    element_at as *const (), // 0x38
     copy_into as *const (), // 0x40
     copy_from as *const (), // 0x48
     tiling as *const (),    // 0x50
-    unused as *const (),    // 0x58 view descriptor
-    unused as *const (),    // 0x60 tiled resource?
+    view_descriptor as *const (), // 0x58
+    tiled_resource as *const (), // 0x60
+    plane_info as *const (), // 0x68
 ]);
 
 pub(crate) fn module() -> HleModule {

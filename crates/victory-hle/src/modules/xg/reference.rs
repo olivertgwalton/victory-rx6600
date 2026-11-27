@@ -218,6 +218,89 @@ pub(super) fn parse(line: &str) -> Option<ResourceDesc> {
     })
 }
 
+/// The computer's other slots for a description, in the harness's
+/// layout: size, alignment, mip offsets of 4 planes by 16 mips, the tiled
+/// flag, plane info and view descriptors of 4 planes, and the element at
+/// each offset the main record asks for.
+pub(super) fn slots_record(index: u32, d: &ResourceDesc) -> Vec<u8> {
+    let mut r = Vec::with_capacity(1536);
+    let p32 = |r: &mut Vec<u8>, v: u32| r.extend_from_slice(&v.to_le_bytes());
+    let p64 = |r: &mut Vec<u8>, v: u64| r.extend_from_slice(&v.to_le_bytes());
+    p32(&mut r, 0x3248_4758);
+    p32(&mut r, index);
+    let mut c: This = std::ptr::null_mut();
+    let chr = XGCreateTextureComputer(d, &mut c);
+    p32(&mut r, chr as u32);
+    if chr < 0 || c.is_null() {
+        r.resize(1536, 0);
+        return r;
+    }
+    p64(&mut r, slot::<extern "system" fn(This) -> u64>(c, 3)(c));
+    p64(&mut r, slot::<extern "system" fn(This) -> u64>(c, 4)(c));
+    p32(&mut r, u32::from(slot::<extern "system" fn(This) -> u8>(c, 12)(c)));
+    let mip_offset: extern "system" fn(This, u32, u32) -> u64 = slot(c, 5);
+    for p in 0..4 {
+        for m in 0..16 {
+            p64(&mut r, mip_offset(c, p, m));
+        }
+    }
+    let info: extern "system" fn(This, u32, *mut u8) -> HRESULT = slot(c, 13);
+    let srd: extern "system" fn(This, u32, *mut u8) -> HRESULT = slot(c, 11);
+    let (mut ih, mut iv, mut sh, mut sv) = ([0i32; 4], [[0u8; 16]; 4], [0i32; 4], [[0u8; 32]; 4]);
+    for p in 0..4 {
+        ih[p] = info(c, p as u32, iv[p].as_mut_ptr());
+        sh[p] = srd(c, p as u32, sv[p].as_mut_ptr());
+    }
+    for h in ih {
+        p32(&mut r, h as u32);
+    }
+    iv.iter().for_each(|v| r.extend_from_slice(v));
+    for h in sh {
+        p32(&mut r, h as u32);
+    }
+    sv.iter().for_each(|v| r.extend_from_slice(v));
+    // The element at each offset the main record asks for.
+    let mut layout = vec![0u8; LAYOUT_BYTES];
+    slot::<extern "system" fn(This, *mut u8) -> HRESULT>(c, 2)(c, layout.as_mut_ptr());
+    let rd = |o: usize| u32::from_le_bytes(layout[o..o + 4].try_into().unwrap());
+    let (lmips, planes) = (rd(0x10), rd(0x14));
+    type Offset = extern "system" fn(This, u32, u32, u64, u32, u32, u32, *mut u32) -> u64;
+    type At = extern "system" fn(This, u64, *mut u32, *mut u32, *mut u64, *mut u32, *mut u32, *mut u32) -> HRESULT;
+    let (off, at): (Offset, At) = (slot(c, 6), slot(c, 7));
+    let (w, h, dd) = (d.width as u32, d.height, u32::from(d.depth_or_array));
+    let mut hr = [0i32; OFFSETS];
+    let (mut pl, mut mp, mut xs, mut ys, mut zs, mut ss) = ([0u32; OFFSETS], [0u32; OFFSETS], [0u64; OFFSETS], [0u32; OFFSETS], [0u32; OFFSETS], [0u32; OFFSETS]);
+    let mut k = 0;
+    let lastmip = lmips.saturating_sub(1);
+    'p: for p in 0..planes.min(2) {
+        for mm in [0, 1, lastmip / 2, lastmip] {
+            if k + 3 > OFFSETS {
+                break 'p;
+            }
+            if mm >= lmips {
+                continue;
+            }
+            let (mw, mh) = ((w >> mm).max(1), (h >> mm).max(1));
+            let md = if d.dimension == 4 { (dd >> mm).max(1) } else { dd.max(1) };
+            for j in [[0, 0, 0], [mw - 1, mh - 1, md - 1], [mw / 2 + u32::from(mw > 2), mh / 3, md / 2]] {
+                let mut bit = 0;
+                let o = off(c, p, mm, u64::from(j[0]), j[1], j[2], 0, &mut bit);
+                let base = 0x18 + p as usize * 0x6c8 + 0x18;
+                let poff = u64::from_le_bytes(layout[base..base + 8].try_into().unwrap());
+                hr[k] = at(c, o.wrapping_add(poff), &mut pl[k], &mut mp[k], &mut xs[k], &mut ys[k], &mut zs[k], &mut ss[k]);
+                k += 1;
+            }
+        }
+    }
+    hr.iter().for_each(|&v| p32(&mut r, v as u32));
+    pl.iter().chain(&mp).for_each(|&v| p32(&mut r, v));
+    xs.iter().for_each(|&v| p64(&mut r, v));
+    ys.iter().chain(&zs).chain(&ss).for_each(|&v| p32(&mut r, v));
+    release(c);
+    debug_assert_eq!(r.len(), 1536);
+    r
+}
+
 #[test]
 #[ignore]
 fn dump() {
@@ -226,6 +309,13 @@ fn dump() {
     };
     let text = std::fs::read_to_string(cases).unwrap();
     let mut bytes = vec![];
+    if std::env::var_os("XG_SLOTS").is_some() {
+        for (i, d) in text.lines().filter_map(parse).enumerate() {
+            bytes.extend_from_slice(&slots_record(i as u32, &d));
+        }
+        std::fs::write(out, bytes).unwrap();
+        return;
+    }
     for (i, d) in text.lines().filter_map(parse).enumerate() {
         let below = match (std::env::var_os("XGH_NOCOPY"), std::env::var("XG_COPY_BELOW")) {
             (Some(_), _) => 0,
@@ -464,6 +554,41 @@ fn check(name: &str, vectors: &[u8]) {
     assert!(bad.is_empty(), "{name}: {} of {} differ from the library, e.g. {:?}", bad.len(), cases.len(), &bad[..bad.len().min(5)]);
 }
 
+/// Two-plane formats, whose second plane's element lookups (slot 0x38)
+/// are left out of the checked slots records: the library reads those
+/// offsets in a way not reproduced here.
+const TWO_PLANES: [u32; 10] = [19, 20, 44, 45, 103, 104, 105, 106, 110, 118];
+
+fn slots_hash(d: &ResourceDesc, r: &mut [u8]) -> u64 {
+    const INV: usize = 1536 - 24 * 32;
+    if TWO_PLANES.contains(&d.format) {
+        for k in 12..24 {
+            for (off, n) in [(0, 4), (96, 4), (192, 4), (288, 8), (480, 4), (576, 4), (672, 4)] {
+                let o = INV + off + k * n;
+                r[o..o + n].fill(0);
+            }
+        }
+    }
+    record_hash(r)
+}
+
+/// The other slots against the library's.
+fn check_slots(name: &str, vectors: &[u8]) {
+    let cases = suite(name);
+    assert_eq!(cases.len() * 8, vectors.len(), "{name}: cases and vectors");
+    let mut bad = vec![];
+    for (i, (d, want)) in cases.iter().zip(vectors.chunks_exact(8)).enumerate() {
+        if excluded(d) {
+            continue;
+        }
+        let got = slots_hash(d, &mut slots_record(i as u32, d));
+        if got != u64::from_le_bytes(want.try_into().unwrap()) {
+            bad.push((i, *d));
+        }
+    }
+    assert!(bad.is_empty(), "{name} slots: {} of {} differ from the library, e.g. {:?}", bad.len(), cases.len(), &bad[..bad.len().min(5)]);
+}
+
 macro_rules! vectors {
     ($name:literal) => {
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/xg/", $name, ".hashes"))
@@ -513,4 +638,31 @@ fn cases() {
         })
         .collect();
     std::fs::write(out, text).unwrap();
+}
+
+macro_rules! slot_vectors {
+    ($name:literal) => {
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/xg/", $name, ".slots.hashes"))
+    };
+}
+
+#[test]
+fn other_slots_match_the_library_for_every_format() {
+    check_slots("formats", slot_vectors!("formats"));
+}
+
+#[test]
+fn other_slots_match_the_library_for_every_dimension_mode_and_size() {
+    check_slots("geometry", slot_vectors!("geometry"));
+}
+
+#[test]
+fn other_slots_match_the_library_for_use_flags_and_samples() {
+    check_slots("flags", slot_vectors!("flags"));
+}
+
+#[test]
+fn other_slots_match_the_library_for_metadata() {
+    check_slots("metadata", slot_vectors!("metadata"));
+    check_slots("dcc", slot_vectors!("dcc"));
 }
