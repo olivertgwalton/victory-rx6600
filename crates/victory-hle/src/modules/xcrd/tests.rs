@@ -699,3 +699,14 @@ fn is_corrupt_not_found_is_not_corrupt() {
         ((if rf { r(&a, p.as_ptr(), &mut c) } else { l(&a, p.as_ptr(), &mut c) }), c)
     }));
 }
+
+const EA: &[u64] = &[1, 0, 2, 4, 8, 9, 0x10, 0x8000_0000, 0x8000_0009, 0xffff_ffff];
+
+#[test]
+fn fuzz_path_bodies_2() {
+    fuzz("XCrdDefragXvc", &[Adp, Path, Int(FLAG1), OutOpt(4), OutOpt(4), OutOpt(4)], W32);
+    fuzz("XCrdCopyExtendedAttributes", &[Adp, Path, Path, Int(EA)], W32);
+    fuzz("XCrdMoveSidecarFiles", &[Adp, Path, Path, Int(FLAG1)], W32);
+    fuzz("XCrdSetExtendedAttributes", &[Adp, Path, Int(EA), Int(&[0x55, 0, u64::MAX])], W32);
+    fuzz("XCrdSetEncryptedEa", &[Adp, Path, Int(&[0x55, 0]), InOpt(32), InOpt(16)], W32);
+}
