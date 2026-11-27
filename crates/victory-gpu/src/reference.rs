@@ -470,8 +470,8 @@ const NOT_WRITTEN: &[(&str, usize)] = &[
     ("queue", 0x40), ("queue", 0x48), ("queue", 0xc8), ("queue", 0xe8), ("queue", 0xf0), ("queue", 0x128),
     // list: 36
     ("list", 0x58), ("list", 0x90), ("list", 0xd8), ("list", 0x188), ("list", 0x210), ("list", 0x218), ("list", 0x260), ("list", 0x268), ("list", 0x270), ("list", 0x278), ("list", 0x298), ("list", 0x2a0), ("list", 0x2e8), ("list", 0x2f0), ("list", 0x2f8), ("list", 0x300), ("list", 0x330), ("list", 0x338), ("list", 0x340), ("list", 0x370), ("list", 0x378), ("list", 0x3b8), ("list", 0x3c0), ("list", 0x3c8), ("list", 0x3d0), ("list", 0x3d8), ("list", 0x3e0), ("list", 0x3e8), ("list", 0x3f8), ("list", 0x400), ("list", 0x410), ("list", 0x428), ("list", 0x430), ("list", 0x460), ("list", 0x478), ("list", 0x4a8),
-    // pipeline: 2
-    ("pipeline", 0x58), ("pipeline", 0x68),
+    // pipeline: 1
+    ("pipeline", 0x68),
     // descriptor heap: 1
     ("descriptor heap", 0x58),
     // resource: 1

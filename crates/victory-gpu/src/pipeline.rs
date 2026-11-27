@@ -955,6 +955,80 @@ pub(crate) extern "system" fn create_stream(
     )
 }
 
+/// The pipeline id the console's driver keeps for a pipeline made by device
+/// method 0x1c8 (GameOS `xgs12_10.dll`, set at pipeline+0x70 while it reads
+/// the description's vertex layout block, version 0x1000 at +4): after the
+/// block's first table (count at 0x40; entries of a word, a length, that
+/// many bytes, a word and three bytes, from 0x44), a 32-bit word.
+pub(crate) fn native_pipeline_id(layout: &[u8]) -> Option<u32> {
+    let u = |o: usize| layout.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    if u(4)? != 0x1000 {
+        return None;
+    }
+    let mut at = 0x44;
+    for _ in 0..u(0x40)?.min(4096) {
+        let len = u(at + 4)? as usize;
+        at += 8 + len + 7;
+    }
+    u(at)
+}
+
+/// A blob of bytes (`ID3DBlob`): QueryInterface, AddRef, Release,
+/// GetBufferPointer, GetBufferSize.
+#[repr(C)]
+struct Blob {
+    object: Object,
+    bytes: Vec<u8>,
+}
+const BLOB_IIDS: [Iid; 1] = [guid(0x8ba5fb08, 0x5195, 0x40e2, [0xac, 0x58, 0x0d, 0x98, 0x9c, 0x3a, 0x01, 0x02])];
+extern "system" fn blob_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+    let found = object::is(iid, &BLOB_IIDS).then_some(this);
+    object::answer(PIPELINE, iid, found, out)
+}
+extern "system" fn blob_release(this: This) -> u32 {
+    object::release_boxed::<Blob>(this)
+}
+extern "system" fn blob_pointer(this: This) -> *mut u8 {
+    // SAFETY: one of our blobs.
+    unsafe { (*this.cast_mut().cast::<Blob>()).bytes.as_mut_ptr() }
+}
+extern "system" fn blob_size(this: This) -> usize {
+    // SAFETY: one of our blobs.
+    unsafe { (*this.cast::<Blob>()).bytes.len() }
+}
+static BLOB_FUNCTIONS: Table<5> = Table([
+    blob_query as *const (),
+    object::add_ref as *const (),
+    blob_release as *const (),
+    blob_pointer as *const (),
+    blob_size as *const (),
+]);
+
+/// Pipeline method 0x58 `(kind, _, out)` (+0x66020 -> +0x62d30, the driver's
+/// path for pipelines it did not make as its 0x4005cf00 type, which ours
+/// are not): E_INVALIDARG for a kind other than 0; else a new 4-byte blob
+/// (+0x3e9d0) holding the root pipeline's id (a variant's is its base's,
+/// whose layout it keeps). Pipelines not made by 0x1c8 have no id here.
+extern "system" fn pipeline_id_blob(this: This, kind: u32, _unused: u64, out: *mut This) -> HRESULT {
+    if kind != 0 {
+        return E_INVALIDARG;
+    }
+    #[cfg(windows)]
+    let id = pipeline(this).native.as_ref().and_then(|n| native_pipeline_id(&n.layout));
+    #[cfg(not(windows))]
+    let id: Option<u32> = { let _ = this; None };
+    let Some(id) = id else {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!("pipeline method 0x58 of a pipeline without the console's id (not made by device method 0x1c8)"));
+        return object::E_NOTIMPL;
+    };
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    let blob = Box::new(Blob { object: Object::new(&BLOB_FUNCTIONS), bytes: id.to_le_bytes().to_vec() });
+    object::hand_out(PIPELINE, blob, &BLOB_IIDS[0], &BLOB_IIDS, out)
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &PIPELINE_IIDS).then_some(this);
     object::answer(PIPELINE, iid, found, out)
@@ -971,6 +1045,7 @@ pub(crate) static FUNCTIONS: Table<24> = {
     f[7] = object::parent_device as *const (); // 0x38
     // 0x60 (+0x66040): E_NOTIMPL for pipelines without the driver's
     // 0x4005cf00 type, which none of ours have.
+    f[11] = pipeline_id_blob as *const (); // 0x58
     f[12] = object::not_implemented as *const (); // 0x60
     Table(f)
 };
@@ -1130,5 +1205,55 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pipeline_id {
+    use super::*;
+    use crate::object::slot;
+
+    /// A layout block as the driver reads it: version 0x1000, `entries` in
+    /// the first table, then the id.
+    fn block(entries: &[&[u8]], id: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 0x44];
+        b[4..8].copy_from_slice(&0x1000u32.to_le_bytes());
+        b[0x40..0x44].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        for e in entries {
+            b.extend_from_slice(&7u32.to_le_bytes());
+            b.extend_from_slice(&(e.len() as u32).to_le_bytes());
+            b.extend_from_slice(e);
+            b.extend_from_slice(&[9; 7]);
+        }
+        b.extend_from_slice(&id.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn the_id_follows_the_first_table() {
+        assert_eq!(native_pipeline_id(&block(&[], 0x1234)), Some(0x1234));
+        assert_eq!(native_pipeline_id(&block(&[b"POSITION", b"UV"], 0xabcd)), Some(0xabcd));
+        let mut other = block(&[], 1);
+        other[5] = 0;
+        assert_eq!(native_pipeline_id(&other), None, "the driver refuses other versions");
+    }
+
+    /// Pipeline 0x58 (+0x62d30): kind 0 a 4-byte blob of the id; other kinds
+    /// E_INVALIDARG.
+    #[cfg(windows)]
+    #[test]
+    fn method_0x58_hands_out_the_id_in_a_blob() {
+        let mut p: This = std::ptr::null();
+        assert_eq!(hand_out_native_graphics(Vec::new(), vec![0; 0x100], block(&[b"N"], 77), &PIPELINE_IIDS[0], &mut p), object::S_OK);
+        let f = slot::<extern "system" fn(This, u32, u64, *mut This) -> HRESULT>(p, 0x58);
+        let mut blob: This = std::ptr::null();
+        assert_eq!(f(p, 1, 0, &mut blob), E_INVALIDARG);
+        assert_eq!(f(p, 0, 0, &mut blob), object::S_OK);
+        let size = slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob);
+        let data = slot::<extern "system" fn(This) -> *mut u8>(blob, 0x18)(blob);
+        // SAFETY: the blob's 4 bytes.
+        assert_eq!((size, unsafe { data.cast::<u32>().read_unaligned() }), (4, 77));
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob), 0);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 }
