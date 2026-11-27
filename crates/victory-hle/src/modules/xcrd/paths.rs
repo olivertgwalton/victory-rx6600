@@ -520,6 +520,145 @@ pub extern "system" fn XCrdStreamingQueryInformationByPath(out: *mut u8, adapter
     })())
 }
 
+/// 0x18000ab80: copies an XBlob; offset and length must be 0; flag 2 adds
+/// bit 1 to flag 1; a value comes back from +0x28.
+pub extern "system" fn XCrdXBlobCopy(adapter: *const Adapter, source: *const u16, dest: *const u16, offset: u64, length: u64, flags: u32, out: *mut u64) -> HRESULT {
+    result((|| {
+        check(!adapter.is_null(), "Invalid Adapter Handle.\n")?;
+        check(!source.is_null(), "Invalid Src Input Path.\n")?;
+        check(!dest.is_null(), "Invalid Dst Input Path.\n")?;
+        check(offset == 0 && length == 0, "Offset, Length must be zero.\n")?;
+        let (s, t) = (text(source), text(dest));
+        let total = (s.len() + t.len()) * 2 + 0x54;
+        let mut p = Payload::new(0x7800_00ec, total);
+        p.u32(0, total as u32);
+        p.u32(0x14, if flags & 2 != 0 { (flags & 1) | 2 } else { flags & 1 });
+        p.u32(4, 0x50);
+        p.u32(8, (s.len() * 2) as u32);
+        p.u32(0xc, (0x50 + s.len() * 2 + 2) as u32);
+        p.u32(0x10, (t.len() * 2) as u32);
+        if let Err(hr) = two_paths(&mut p, 0x50, s, t) {
+            return Ok(hr);
+        }
+        let hr = send(handle_of(adapter), &mut p);
+        if hr >= 0 && !out.is_null() {
+            // SAFETY: checked non-null.
+            unsafe { *out = u64::from_le_bytes(p.bytes[super::srb::HEADER + 0x28..super::srb::HEADER + 0x30].try_into().unwrap()) };
+        }
+        Ok(hr)
+    })())
+}
+
+/// 0x180009d30: trims an XVD (flag 1 also reports the size trimmed, from
+/// +0x20); whether it is done (+0x1c) comes back whatever the driver said.
+pub extern "system" fn XCrdTrimXvd(adapter: *const Adapter, path: *const u16, flags: u32, trimmed: *mut u64, done: *mut u8) -> HRESULT {
+    if !done.is_null() {
+        // SAFETY: checked non-null.
+        unsafe { *done = 0 };
+    }
+    result((|| {
+        check(!adapter.is_null(), "Invalid Adapter Handle\n")?;
+        check(!path.is_null(), "XCrdPath must be specified\n")?;
+        check(flags & !1 == 0, "Invalid Flags\n")?;
+        check(flags & 1 == 0 || !trimmed.is_null(), "TrimmedSize cannot be null\n")?;
+        let path = text(path);
+        check(path.len() * 2 + 0x4a <= super::srb::MAX_BODY, "Payload too large for XVIO\n")?;
+        let mut p = Payload::new(0x7800_00ac, path.len() * 2 + 0x4a);
+        p.u32(0x14, if flags & 1 != 0 { 3 } else { 2 });
+        p.u32(0, 0x48);
+        p.u32(4, (path.len() * 2) as u32);
+        let status = copy_string(p.body(), 0x48, path.len() * 2 + 2, path);
+        if status < 0 {
+            return Ok(status);
+        }
+        let hr = send(handle_of(adapter), &mut p);
+        let b = &p.bytes[super::srb::HEADER..];
+        if hr >= 0 && !trimmed.is_null() {
+            // SAFETY: checked non-null.
+            unsafe { *trimmed = u64::from_le_bytes(b[0x20..0x28].try_into().unwrap()) };
+        }
+        if !done.is_null() {
+            // SAFETY: as above.
+            unsafe { *done = b[0x1c] };
+        }
+        Ok(hr)
+    })())
+}
+
+/// 0x180009a10: trims an XVC, keeping what the specifiers (pairs of
+/// strings) name: a table of `{offset, bytes}` pairs at +8's offset and the
+/// strings after it.
+pub extern "system" fn XCrdTrimXvc(adapter: *const Adapter, path: *const u16, count: u32, specs: *const [*const u16; 2], flags: u32, trimmed: *mut u64, done: *mut u8) -> HRESULT {
+    if !done.is_null() {
+        // SAFETY: checked non-null.
+        unsafe { *done = 0 };
+    }
+    result((|| {
+        check(!adapter.is_null(), "Invalid Adapter Handle\n")?;
+        check(!path.is_null(), "XCrdPath must be specified\n")?;
+        check(flags & !1 == 0, "Invalid Flags\n")?;
+        check(flags & 1 == 0 || !trimmed.is_null(), "TrimmedSize cannot be null\n")?;
+        if count == 0 {
+            check(specs.is_null(), "Specifiers must be NULL if zero specifiers are passed\n")?;
+        } else {
+            check(!specs.is_null(), "Specifiers must not be NULL\n")?;
+        }
+        let path = text(path);
+        // SAFETY: `count` pairs of strings (non-null when count is not 0).
+        let pairs: Vec<(&[u16], &[u16])> = (0..count as usize).map(|i| unsafe { let s = *specs.add(i); (text(s[0]), text(s[1])) }).collect();
+        let mut size = (path.len() as u32).wrapping_add(count.wrapping_mul(8)).wrapping_mul(2).wrapping_add(0x4a);
+        for (a, b) in &pairs {
+            size = size.wrapping_add(((a.len() + b.len()) * 2 + 4) as u32);
+        }
+        check(size as usize <= super::srb::MAX_BODY, "Payload too large for XVIO\n")?;
+        let mut p = Payload::new(0x7800_00ac, size as usize);
+        p.u32(0x14, flags & 1);
+        p.u32(0, 0x48);
+        p.u32(4, (path.len() * 2) as u32);
+        let status = copy_string(p.body(), 0x48, path.len() * 2 + 2, path);
+        let table = path.len() * 2 + 0x4a;
+        p.u32(0x10, count);
+        p.u32(8, table as u32);
+        p.u32(0xc, count.wrapping_mul(16));
+        if status < 0 {
+            return Ok(status);
+        }
+        let mut cursor = table + count as usize * 16;
+        for (i, (a, b)) in pairs.iter().enumerate() {
+            let entry = table + i * 16;
+            let status = copy_string(p.body(), cursor, a.len() * 2 + 2, a);
+            let grown = p.read_u32(0xc) + (a.len() * 2 + 2) as u32;
+            p.u32(0xc, grown);
+            p.u32(entry, cursor as u32);
+            p.u32(entry + 4, (a.len() * 2) as u32);
+            let second = cursor + 2 + a.len() * 2;
+            if status < 0 {
+                return Ok(status);
+            }
+            let status = copy_string(p.body(), second, b.len() * 2 + 2, b);
+            let grown = p.read_u32(0xc) + (b.len() * 2 + 2) as u32;
+            p.u32(0xc, grown);
+            p.u32(entry + 8, second as u32);
+            p.u32(entry + 12, (b.len() * 2) as u32);
+            cursor = second + b.len() * 2 + 2;
+            if status < 0 {
+                return Ok(status);
+            }
+        }
+        let hr = send(handle_of(adapter), &mut p);
+        let body = &p.bytes[super::srb::HEADER..];
+        if hr >= 0 && !trimmed.is_null() {
+            // SAFETY: checked non-null.
+            unsafe { *trimmed = u64::from_le_bytes(body[0x20..0x28].try_into().unwrap()) };
+        }
+        if !done.is_null() {
+            // SAFETY: as above.
+            unsafe { *done = body[0x1c] };
+        }
+        Ok(hr)
+    })())
+}
+
 pub(crate) fn exports() -> Vec<crate::HleExport> {
     use crate::hle_export;
     vec![
@@ -537,6 +676,9 @@ pub(crate) fn exports() -> Vec<crate::HleExport> {
         hle_export!(XCrdSetEncryptedEa),
         hle_export!(XCrdRemapTest),
         hle_export!(XCrdRepairXvc),
+        hle_export!(XCrdXBlobCopy),
+        hle_export!(XCrdTrimXvd),
+        hle_export!(XCrdTrimXvc),
         hle_export!(XCrdSetFlatContentPath),
         hle_export!(XCrdStorageQueryBlobAttributes),
         hle_export!(XCrdStreamingAdjustStreamingFlags),

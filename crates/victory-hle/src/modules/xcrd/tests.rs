@@ -1223,3 +1223,35 @@ fn crd_information_strings() {
         }));
     }
 }
+
+#[test]
+fn fuzz_blob_copy_and_trim() {
+    fuzz("XCrdXBlobCopy", &[Adp, Path, Path, Int(&[0, 1]), Int(&[0, 1]), Int(&[0, 1, 2, 3, 4, 0xffff_ffff]), OutOpt(8)], W32);
+    fuzz("XCrdTrimXvd", &[Adp, Path, Int(FLAG1), OutOpt(8), OutOpt(1)], W32);
+}
+
+#[test]
+fn trim_xvc_with_specifiers() {
+    let s = session();
+    trace_all(&s);
+    let (r, l) = both!("XCrdTrimXvc": extern "system" fn(*const Adapter, *const u16, u32, *const [*const u16; 2], u32, *mut u64, *mut u8) -> HRESULT);
+    let a = adapter();
+    let path = wz("[XUC:]\\pkg.xvc");
+    let words: Vec<Vec<u16>> = ["", "a", "region", "lang-en-US", &"q".repeat(0x300)].iter().map(|w| wz(w)).collect();
+    let specs: Vec<[*const u16; 2]> = (0..6).map(|i| [words[i % 5].as_ptr(), words[(i * 3 + 1) % 5].as_ptr()]).collect();
+    for count in [0u32, 1, 2, 6] {
+        for with_specs in [true, false] {
+            for flags in [0u32, 1, 2] {
+                for (what, driver) in drivers(&[]) {
+                    same(&format!("{count} {with_specs} {flags} {what}"), run(&s, |s| driver(s), |side| {
+                        let sp = if with_specs { specs.as_ptr() } else { std::ptr::null() };
+                        let (mut t, mut d) = (0xccccu64, 0xccu8);
+                        let hr = if side { r(&a, path.as_ptr(), count, sp, flags, &mut t, &mut d) } else { l(&a, path.as_ptr(), count, sp, flags, &mut t, &mut d) };
+                        let hr2 = if side { r(&a, path.as_ptr(), count, sp, flags, std::ptr::null_mut(), std::ptr::null_mut()) } else { l(&a, path.as_ptr(), count, sp, flags, std::ptr::null_mut(), std::ptr::null_mut()) };
+                        (hr, t, d, hr2)
+                    }));
+                }
+            }
+        }
+    }
+}
