@@ -102,6 +102,7 @@ pub extern "system" fn XMemVirtualAlloc(
         },
     };
     let asked = protect;
+    let asked_kind = kind;
     let mut protect = match protect & HOST_PROTECTION {
         0 => PAGE_NOACCESS,
         p => p,
@@ -186,7 +187,7 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & ADDRESS_32BIT != 0 {
         LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
     }
-    note_protection(asked, kind, flags, at as usize, size);
+    note_protection(asked, asked_kind, flags, at as usize, size);
     at
 }
 
@@ -206,7 +207,7 @@ fn note_protection(protect: u32, kind: u32, flags: u64, at: usize, size: usize) 
     };
     if n.is_power_of_two() {
         tracing::info!(
-            "title memory asked for as protection {protect:#x}, kind {kind:#x}, flags {flags:#x}: {n} times, {} MB, last {at:#x}+{size:#x}",
+            "title memory asked for as protection {protect:#x}, kind {kind:#x} (as passed), flags {flags:#x}: {n} times, {} MB, last {at:#x}+{size:#x}",
             bytes >> 20
         );
     }
@@ -322,8 +323,90 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
     }
 }
 
+/// What reaches [`XMemAllocDefault`], by memory type and [`Route`]: said
+/// for the 1st, 2nd, 4th.. call of each, with how much so far.
+fn note_default(size: usize, attributes: u64) {
+    static SEEN: [[AtomicU64; 4]; 16] = [const { [const { AtomicU64::new(0) }; 4] }; 16];
+    static BYTES: [[AtomicU64; 4]; 16] = [const { [const { AtomicU64::new(0) }; 4] }; 16];
+    let kind = memory_type(attributes);
+    let Some(route) = Route::of(size, attributes) else {
+        return;
+    };
+    let r = route as usize;
+    let n = SEEN[kind][r].fetch_add(1, Ordering::Relaxed) + 1;
+    let bytes = BYTES[kind][r].fetch_add(size as u64, Ordering::Relaxed) + size as u64;
+    if n.is_power_of_two() {
+        tracing::info!(
+            "XMemAllocDefault: memory type {kind}, {route:?}: {n} calls, {} KB, last {size} bytes, attributes {attributes:#x}",
+            bytes >> 10
+        );
+    }
+}
+
+/// `XMemAlloc` memory types (attribute bits 29-32): what `xmem.dll` adds to
+/// the allocation type: `MEM_GRAPHICS` (its bit 28) for memory both
+/// processors reach, 64 KiB pages for the large CPU kinds, nothing for type
+/// 0. 0 for types it refuses.
+const KIND_ALLOCATION: [u32; 16] = [
+    0, GRAPHICS_KIND, GRAPHICS_KIND, GRAPHICS_KIND, GRAPHICS_KIND, GRAPHICS_KIND, GRAPHICS_KIND,
+    LARGE_CPU_KIND, LARGE_CPU_KIND, LARGE_CPU_KIND, GRAPHICS_KIND, GRAPHICS_KIND, GRAPHICS_KIND, 0, 0, 0,
+];
+const GRAPHICS_KIND: u32 = 0x1000_0000;
+const LARGE_CPU_KIND: u32 = 0x40_0000;
+/// The protection of each memory type: CPU read-write, then write-combined
+/// (0x400) or uncached (0x200), then the GPU's (0x800 and up; 0x20000
+/// coherent, 0x40000 GPU-uncached). 0: a type `xmem.dll` refuses.
+const KIND_PROTECTION: [u32; 16] = [
+    0x4, 0x2404, 0x1404, 0x22004, 0x1004, 0x50404, 0x70004, 0x4, 0x404, 0x204, 0x62004, 0x8004,
+    0x10404, 0, 0, 0,
+];
+
+fn memory_type(attributes: u64) -> usize {
+    (attributes >> 29 & 0xf) as usize
+}
+
+/// Where `xmem.dll`'s `XMemAllocDefault` takes a block from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// The title partition's process heap (`HeapAlloc`).
+    ProcessHeap = 0,
+    /// The memory type's heap of 256-byte units.
+    SmallBlocks = 1,
+    /// The memory type's heap of 4 KiB units.
+    MediumBlocks = 2,
+    /// An allocation of its own (`XMemVirtualAlloc`).
+    Virtual = 3,
+}
+
+impl Route {
+    /// None where the console returns null: no bytes, or a memory type it
+    /// does not know.
+    fn of(size: usize, attributes: u64) -> Option<Route> {
+        let kind = memory_type(attributes);
+        if size == 0 || KIND_PROTECTION[kind] == 0 {
+            return None;
+        }
+        let align = attributes >> ALIGNMENT_SHIFT & 0x1f;
+        let pages = attributes >> 14 & 3;
+        let allocation = KIND_ALLOCATION[kind];
+        if allocation == 0 && align <= 4 && pages == 0 {
+            return Some(Route::ProcessHeap);
+        }
+        if allocation == LARGE_CPU_KIND {
+            return Some(Route::Virtual);
+        }
+        // Graphics memory comes in 64 KiB pages at least.
+        let pages = if allocation == GRAPHICS_KIND && pages == 0 { 1 } else { pages };
+        if align > 16 || size > 0x2_0000 || attributes & ALLOC_32BIT != 0 || pages == 2 {
+            return Some(Route::Virtual);
+        }
+        Some(if align > 12 || size > 0xf00 { Route::MediumBlocks } else { Route::SmallBlocks })
+    }
+}
+
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
+    note_default(size, attributes);
     if attributes & ALLOC_32BIT != 0 {
         return XMemVirtualAlloc(
             std::ptr::null_mut(),
