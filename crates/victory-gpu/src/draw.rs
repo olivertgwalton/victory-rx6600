@@ -790,6 +790,20 @@ pub(crate) static HEAP_TEXTURES_REUPLOADED_FULL: AtomicU64 = AtomicU64::new(0);
 /// only wants bringing up to date, and the ones whose memory went (letting
 /// their host copies go is what makes room). What is uploaded while the
 /// card has room is the same either way.
+/// Since the start, why the texture pass stopped or held a slot: the
+/// frame's upload budget or time, the commit reserve, an upload refused (at
+/// three places), staging deferred; slots held for want of room; passes.
+pub(crate) static PASS_STOPS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+pub(crate) fn pass_stops_line() -> String {
+    let v = |i: usize| PASS_STOPS[i].load(Ordering::Relaxed);
+    let q = HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
+    format!(
+        "queue {} slots, {} due (oldest written {} frames ago), {} looked at, {} in part; passes {}: stopped by the frame's budget or time {}, the commit reserve {}, uploads refused {} / {} / {}, staging deferred {}; slots held for room {}",
+        q[0], q[1], q[4], q[2], q[3], v(7), v(0), v(1), v(2), v(3), v(4), v(5), v(6)
+    )
+}
+
 /// Free bytes in the texture pool below which [`resource::pool_gaps`] does
 /// not look (a pass would find no range anyway).
 const GAPS_LEAST: u64 = 64 << 20;
@@ -2956,8 +2970,10 @@ impl State {
             BAKE_SERVED.store(0, Ordering::Relaxed);
         }
         let mut served = true;
+        PASS_STOPS[7].fetch_add(1, Ordering::Relaxed);
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+                PASS_STOPS[0].fetch_add(1, Ordering::Relaxed);
                 served = false;
                 break;
             }
@@ -3087,6 +3103,7 @@ impl State {
                         // (`most`), or until the card has room; the pass
                         // goes on, within a count that bounds one pass.
                         host.texture_slot_held(index, write, frame + most);
+                        PASS_STOPS[6].fetch_add(1, Ordering::Relaxed);
                         if refused > 1024 {
                             break;
                         }
@@ -3108,6 +3125,7 @@ impl State {
             // `mapped == 0` reclamation (`texture_slot_gone`) has run, and
             // before mirroring a slot to an unuploaded texture.
             if !crate::residency::admit_texture_pass(required) {
+                PASS_STOPS[1].fetch_add(1, Ordering::Relaxed);
                 served = false;
                 break;
             }
@@ -3144,6 +3162,7 @@ impl State {
             };
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             if crate::residency::upload_refused() {
+                PASS_STOPS[2].fetch_add(1, Ordering::Relaxed);
                 served = false;
                 break;
             }
@@ -3173,6 +3192,7 @@ impl State {
                 continue;
             }
             if crate::residency::upload_refused() {
+                PASS_STOPS[3].fetch_add(1, Ordering::Relaxed);
                 served = false;
                 break;
             }
@@ -3242,6 +3262,7 @@ impl State {
                 }
             }
             if ahead.is_none() && crate::residency::upload_refused() {
+                PASS_STOPS[4].fetch_add(1, Ordering::Relaxed);
                 served = false;
                 break;
             }
@@ -3263,6 +3284,7 @@ impl State {
             if ahead.is_none()
                 && (crate::residency::take_staging_deferred() || crate::residency::upload_refused())
             {
+                PASS_STOPS[5].fetch_add(1, Ordering::Relaxed);
                 served = false;
                 break;
             }
