@@ -3,9 +3,8 @@
 //! chose ([`victory_gpu::console`]).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put_string,
-};
+use super::xasync::{E_NOT_SUFFICIENT_BUFFER, E_NOTIMPL};
+use super::xgameruntime::{Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing};
 
 pub const PROVIDER: Guid = Guid::new(
     0xe349_bd1a,
@@ -58,15 +57,50 @@ pub const INTERFACES: &[Interface] = &[
 
 type This = *const Object;
 
+/// Copies `text` into the title's buffer as the console's runtime does: the
+/// buffer must hold the whole `field` bytes (the API's maximum, not the
+/// text's length), which are written, zero-padded; the bytes used are
+/// `used`, or the text and its NUL when `None`.
+fn put_field(
+    text: &str,
+    field: usize,
+    used: Option<usize>,
+    size: usize,
+    buffer: *mut u8,
+    out: *mut usize,
+) -> HRESULT {
+    if buffer.is_null() || size < field {
+        return E_NOT_SUFFICIENT_BUFFER;
+    }
+    let bytes = text.as_bytes();
+    // SAFETY: the buffer holds at least `field` bytes, checked above.
+    unsafe {
+        buffer.write_bytes(0, field);
+        buffer.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len().min(field - 1));
+    }
+    if !out.is_null() {
+        // SAFETY: checked non-null.
+        unsafe { out.write(used.unwrap_or(bytes.len().min(field - 1) + 1)) };
+    }
+    S_OK
+}
+
+/// Console xgameruntime.dll RVA 0xf68b0: 39 bytes; always reports 39 used.
 extern "system" fn console_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
-    put_string(CONSOLE_ID, size, buffer, used)
+    put_field(CONSOLE_ID, 0x27, Some(0x27), size, buffer, used)
 }
+/// RVA 0xf6920: 16 bytes; reports the text and its NUL.
 extern "system" fn sandbox_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
-    put_string(SANDBOX, size, buffer, used)
+    put_field(SANDBOX, 0x10, None, size, buffer, used)
 }
-/// The device id this title sees (titles see different ones).
+/// The device id this title sees (titles see different ones). RVA 0xf6830:
+/// 45 bytes; reports the text and its NUL.
 extern "system" fn device_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
-    put_string(DEVICE_ID, size, buffer, used)
+    put_field(DEVICE_ID, 0x2d, None, size, buffer, used)
+}
+/// RVA 0xcfd00: not implemented on the console either.
+extern "system" fn not_implemented(_: This) -> HRESULT {
+    E_NOTIMPL
 }
 
 #[repr(C)]
@@ -114,13 +148,18 @@ extern "system" fn analytics_info(_: This, out: *mut AnalyticsInfo) -> *mut Anal
     out
 }
 
-static VTABLE: Methods<6> = Methods([
+/// One table serves every interface id (console table 0x18015c1f0).
+static VTABLE: Methods<10> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    console_id as *const (), // 0x18, by the older table; titles seen do not call it
-    sandbox_id as *const (), // 0x20
-    device_id as *const (),  // 0x28
+    console_id as *const (),      // 0x18
+    sandbox_id as *const (),      // 0x20
+    device_id as *const (),       // 0x28
+    missing::<6> as *const (),    // 0x30 (0xf6980)
+    missing::<7> as *const (),    // 0x38 (0xf69d0)
+    missing::<8> as *const (),    // 0x40 (0xf6780)
+    not_implemented as *const (), // 0x48 (0xcfd00)
 ]);
 
 static ANALYTICS_VTABLE: Methods<4> = Methods([
@@ -396,5 +435,41 @@ mod tests {
         assert_eq!(size_of::<AnalyticsInfo>(), 0x90);
         assert_eq!(info.os.build, 22000);
         assert_eq!(&info.form[..14], b"Xbox Series X\0");
+    }
+
+    /// The id getters against the console's (RVAs 0xf68b0, 0xf6920,
+    /// 0xf6830): fixed buffer sizes, zero-padded fields, bytes used.
+    #[test]
+    fn ids_take_the_console_field_sizes() {
+        type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
+        for (slot, field, used, text) in [
+            (0x18, 0x27, 0x27, CONSOLE_ID),
+            (0x20, 0x10, SANDBOX.len() + 1, SANDBOX),
+            (0x28, 0x2d, DEVICE_ID.len() + 1, DEVICE_ID),
+        ] {
+            let get = super::super::xgameruntime::method::<Get>(&OBJECT, slot);
+            let mut buffer = [0xffu8; 0x40];
+            let mut n = 0;
+            assert_eq!(
+                get(&OBJECT, field - 1, buffer.as_mut_ptr(), &mut n),
+                E_NOT_SUFFICIENT_BUFFER,
+                "{slot:#x}"
+            );
+            assert_eq!(get(&OBJECT, field, buffer.as_mut_ptr(), &mut n), S_OK);
+            assert_eq!(n, used, "{slot:#x}");
+            assert_eq!(&buffer[..text.len()], text.as_bytes());
+            assert!(
+                buffer[text.len()..field].iter().all(|&b| b == 0),
+                "{slot:#x} zero-padded"
+            );
+            assert!(
+                buffer[field..].iter().all(|&b| b == 0xff),
+                "{slot:#x} nothing past the field"
+            );
+        }
+        let unimplemented = super::super::xgameruntime::method::<extern "system" fn(This) -> HRESULT>(
+            &OBJECT, 0x48,
+        );
+        assert_eq!(unimplemented(&OBJECT), E_NOTIMPL);
     }
 }

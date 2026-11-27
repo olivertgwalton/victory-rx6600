@@ -61,9 +61,19 @@ type This = *const Object;
 // shortcut: HDR output is not done (see the presentation items in
 // `TODO.md`); report enabled, with the host display's luminance, once the
 // swap chain can present HDR.
-extern "system" fn try_enable_hdr(_: This, preference: u32, _info: *mut c_void) -> u32 {
+/// As the console (RVA 0xc25d0), the title's display info (three floats)
+/// is cleared first; a disabled result leaves it so.
+extern "system" fn try_enable_hdr(_: This, preference: u32, info: *mut [f32; 3]) -> u32 {
+    if !info.is_null() {
+        // SAFETY: checked non-null; the title passes room for the info.
+        unsafe { info.write([0.0; 3]) };
+    }
     tracing::info!(preference, "HDR mode: disabled (SDR presentation)");
     2
+}
+/// The older entry (RVA 0xc25c0): the same with preference 0.
+extern "system" fn try_enable_hdr_default(this: This, info: *mut [f32; 3]) -> u32 {
+    try_enable_hdr(this, 0, info)
 }
 
 /// Nothing launches URIs for the title: no store, browser or console app
@@ -140,8 +150,8 @@ static HDR_VTABLE: Methods<5> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    missing::<3> as *const (),
-    try_enable_hdr as *const (), // 0x20
+    try_enable_hdr_default as *const (), // 0x18
+    try_enable_hdr as *const (),         // 0x20
 ]);
 
 #[cfg(windows)]
@@ -194,5 +204,22 @@ mod tests {
             NOT_SUPPORTED => assert!(handle.is_null()),
             hr => panic!("unexpected display deferral HRESULT {:#010x}", hr as u32),
         }
+    }
+
+    /// TryEnableHdrMode as the console's (RVA 0xc25d0, older entry 0xc25c0):
+    /// the info is cleared and the mode is disabled.
+    #[test]
+    fn hdr_clears_the_info_as_the_console_does() {
+        type Try = extern "system" fn(This, u32, *mut [f32; 3]) -> u32;
+        type Old = extern "system" fn(This, *mut [f32; 3]) -> u32;
+        let mut info = [1.0f32; 3];
+        let new = crate::modules::xgameruntime::method::<Try>(&HDR_OBJECT, 0x20);
+        assert_eq!(new(&HDR_OBJECT, 1, &mut info), 2);
+        assert_eq!(info, [0.0; 3]);
+        info = [1.0; 3];
+        let old = crate::modules::xgameruntime::method::<Old>(&HDR_OBJECT, 0x18);
+        assert_eq!(old(&HDR_OBJECT, &mut info), 2);
+        assert_eq!(info, [0.0; 3]);
+        assert_eq!(new(&HDR_OBJECT, 0, std::ptr::null_mut()), 2);
     }
 }
