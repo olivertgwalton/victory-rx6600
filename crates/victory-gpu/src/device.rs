@@ -617,6 +617,12 @@ pub(crate) static FUNCTIONS: Table<160> = {
     f[110] = resource::create_placed1 as *const (); // 0x370 CreatePlacedResource1
     f[112] = resource::copyable_footprints1 as *const (); // 0x380 GetCopyableFootprints1
     f[128] = resource::create_placed2 as *const (); // 0x400 CreatePlacedResource2
+    // CreatePlaced{ShaderResource,UnorderedAccess}ViewX (+0x73cb0, +0x73d90):
+    // the arguments of their Raw twins at 0x230/0x238 (+0x73a50, +0x73bf0),
+    // whose views are kept as their words and made from their own fields.
+    f[46] = descriptor::create_placed_srv as *const (); // 0x170
+    f[47] = descriptor::create_placed_uav as *const (); // 0x178
+    f[60] = pipeline::create_graphics_x as *const (); // 0x1e0 CreateGraphicsPipelineStateX
     f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0

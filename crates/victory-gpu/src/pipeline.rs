@@ -853,6 +853,21 @@ pub(crate) extern "system" fn create_variant(
     object::E_NOTIMPL
 }
 
+/// Device method 0x1e0 `CreateGraphicsPipelineStateX(desc, extended count,
+/// extended descs, iid, out)` (GameOS `xgs12_10.dll` +0x4d520, named by its
+/// debug build): the graphics twin of 0x1f0.
+/// shortcut: the extensions are ignored, as 0x1f0's are.
+pub(crate) extern "system" fn create_graphics_x(
+    this: This,
+    desc: *const GraphicsHead,
+    _extensions: u32,
+    _extended: *const u8,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    create_graphics(this, desc, iid, out)
+}
+
 /// Device method 0x1f0: the plain compute description plus console
 /// extensions `(desc, extension count, extensions, iid, out)`.
 /// shortcut: the extensions (console shader settings) are ignored, as is

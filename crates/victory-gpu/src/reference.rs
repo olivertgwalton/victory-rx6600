@@ -464,8 +464,8 @@ const OWN_AT_CONSTANT: &[(&str, usize, &str)] = &[
 #[cfg(test)]
 #[rustfmt::skip]
 const NOT_WRITTEN: &[(&str, usize)] = &[
-    // device: 32
-    ("device", 0xf0), ("device", 0x150), ("device", 0x168), ("device", 0x170), ("device", 0x178), ("device", 0x188), ("device", 0x1d8), ("device", 0x1e0), ("device", 0x1f8), ("device", 0x220), ("device", 0x240), ("device", 0x268), ("device", 0x290), ("device", 0x2a0), ("device", 0x2e8), ("device", 0x2f0), ("device", 0x2f8), ("device", 0x328), ("device", 0x330), ("device", 0x378), ("device", 0x388), ("device", 0x390), ("device", 0x398), ("device", 0x3a0), ("device", 0x3b0), ("device", 0x3c0), ("device", 0x3d8), ("device", 0x408), ("device", 0x430), ("device", 0x440), ("device", 0x448), ("device", 0x450),
+    // device: 29
+    ("device", 0xf0), ("device", 0x150), ("device", 0x168), ("device", 0x188), ("device", 0x1d8), ("device", 0x1f8), ("device", 0x220), ("device", 0x240), ("device", 0x268), ("device", 0x290), ("device", 0x2a0), ("device", 0x2e8), ("device", 0x2f0), ("device", 0x2f8), ("device", 0x328), ("device", 0x330), ("device", 0x378), ("device", 0x388), ("device", 0x390), ("device", 0x398), ("device", 0x3a0), ("device", 0x3b0), ("device", 0x3c0), ("device", 0x3d8), ("device", 0x408), ("device", 0x430), ("device", 0x440), ("device", 0x448), ("device", 0x450),
     // queue: 6
     ("queue", 0x40), ("queue", 0x48), ("queue", 0xc8), ("queue", 0xe8), ("queue", 0xf0), ("queue", 0x128),
     // list: 36
@@ -894,5 +894,47 @@ mod sample_mask {
         assert_eq!(crate::pipeline::noted_sample_mask(), 0xffff_0003);
         crate::pipeline::note_sample_mask(u32::MAX);
         assert_eq!(crate::pipeline::noted_sample_mask(), u32::MAX);
+    }
+}
+
+/// Device 0x170/0x178 (+0x73cb0/+0x73d90) as their raw twins 0x230/0x238,
+/// and 0x1e0 CreateGraphicsPipelineStateX (+0x4d520) as 0x50 with no
+/// extensions.
+#[cfg(test)]
+mod device_twins {
+    use crate::object::{HRESULT, Iid, This, slot};
+
+    #[test]
+    fn placed_views_record_what_their_raw_twins_record() {
+        let d = crate::device::device();
+        let resource = [0u32; 14];
+        let mut view = [0u32; 16];
+        view[0] = 42; // a format
+        for (x, raw) in [(0x170, 0x230), (0x178, 0x238)] {
+            let (mut a, mut b) = ([0u64; 16], [0u64; 16]);
+            let f = slot::<extern "system" fn(This, *const [u32; 14], *const [u32; 16], u64)>(d, x);
+            let g = slot::<extern "system" fn(This, *const [u32; 14], *const [u32; 16], u64)>(d, raw);
+            f(d, &resource, &view, a.as_mut_ptr() as u64);
+            g(d, &resource, &view, b.as_mut_ptr() as u64);
+            assert_eq!(a[..2], b[..2], "{x:#x}");
+            assert_ne!(a[0], 0, "{x:#x} recorded a view");
+        }
+    }
+
+    #[test]
+    fn graphics_x_is_graphics_without_extensions() {
+        let d = crate::device::device();
+        let desc = [0u8; 0x400];
+        let iid = crate::pipeline::PIPELINE_IIDS[0];
+        let (mut a, mut b): (This, This) = (std::ptr::null(), std::ptr::null());
+        let x = slot::<extern "system" fn(This, *const u8, u32, *const u8, *const Iid, *mut This) -> HRESULT>(d, 0x1e0);
+        let plain = slot::<extern "system" fn(This, *const u8, *const Iid, *mut This) -> HRESULT>(d, 0x50);
+        assert_eq!(x(d, desc.as_ptr(), 0, std::ptr::null(), &iid, &mut a), plain(d, desc.as_ptr(), &iid, &mut b));
+        assert_eq!(a.is_null(), b.is_null());
+        for p in [a, b] {
+            if !p.is_null() {
+                slot::<extern "system" fn(This) -> u32>(p, 0x10)(p);
+            }
+        }
     }
 }
