@@ -114,11 +114,13 @@ pub(crate) const LIST: [Slot; 150] = [
     c(0x40e0, 0x80004001), b(0x38820), b(0xa59b0), v(0xa880), b(0x38b30), b(0x38b70),  // 0x480
 ];
 
-/// allocator: the driver's table at 0x133740, 12 slots.
+/// allocator: the driver's table at 0x133740, 10 slots (the two words
+/// after it are the allocator's memory callbacks, the `XMemFree` and
+/// `XMemAlloc` import thunks +0x3fd0 and +0x3fc0, not methods).
 #[rustfmt::skip]
-pub(crate) const ALLOCATOR: [Slot; 12] = [
+pub(crate) const ALLOCATOR: [Slot; 10] = [
     b(0x6d360), b(0x19430), b(0x189d0), b(0xa5680), b(0xa5710), b(0x41e80),  // 0x0
-    c(0x194e0, 0x0), b(0x3e480), b(0x18ab0), b(0x18ac0), b(0x3fd0), b(0x3fc0),  // 0x30
+    c(0x194e0, 0x0), b(0x3e480), b(0x18ab0), b(0x18ac0),  // 0x30
 ];
 
 /// pipeline: the driver's table at 0x133670, 14 slots.
@@ -468,8 +470,6 @@ const NOT_WRITTEN: &[(&str, usize)] = &[
     ("queue", 0x40), ("queue", 0x48), ("queue", 0xc8), ("queue", 0xe8), ("queue", 0xf0), ("queue", 0x128),
     // list: 38
     ("list", 0x58), ("list", 0x90), ("list", 0xd8), ("list", 0x188), ("list", 0x210), ("list", 0x218), ("list", 0x260), ("list", 0x268), ("list", 0x270), ("list", 0x278), ("list", 0x298), ("list", 0x2a0), ("list", 0x2e8), ("list", 0x2f0), ("list", 0x2f8), ("list", 0x300), ("list", 0x330), ("list", 0x338), ("list", 0x340), ("list", 0x350), ("list", 0x368), ("list", 0x370), ("list", 0x378), ("list", 0x3b8), ("list", 0x3c0), ("list", 0x3c8), ("list", 0x3d0), ("list", 0x3d8), ("list", 0x3e0), ("list", 0x3e8), ("list", 0x3f8), ("list", 0x400), ("list", 0x410), ("list", 0x428), ("list", 0x430), ("list", 0x460), ("list", 0x478), ("list", 0x4a8),
-    // allocator: 2
-    ("allocator", 0x50), ("allocator", 0x58),
     // pipeline: 2
     ("pipeline", 0x58), ("pipeline", 0x68),
     // descriptor heap: 1
