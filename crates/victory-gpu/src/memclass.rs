@@ -73,11 +73,14 @@ pub(crate) fn line(frames: f64) {
 
 /// Bytes of title memory held in copies in the PC's memory, by class:
 /// every copy's CPU side (copies with a card side too), since the start.
-static HELD_PC: [std::sync::atomic::AtomicI64; 9] = [const { std::sync::atomic::AtomicI64::new(0) }; 9];
+static HELD_PC: [[std::sync::atomic::AtomicI64; 7]; 9] = [const { [const { std::sync::atomic::AtomicI64::new(0) }; 7] }; 9];
+
+/// The makers of copies, in the order `shadow::KIND` numbers them.
+pub(crate) const KINDS: [&str; 7] = ["other", "unbacked", "title buffer", "lookup", "by address", "window", "exact view"];
 
 /// A copy of `n` bytes from title address `at` was made (`n` > 0) or let go.
-pub(crate) fn held(at: usize, n: i64) {
-    HELD_PC[class(at)].fetch_add(n, Ordering::Relaxed);
+pub(crate) fn held(at: usize, n: i64, kind: u8) {
+    HELD_PC[class(at)][usize::from(kind).min(6)].fetch_add(n, Ordering::Relaxed);
 }
 
 /// For the census: per class, MB of copies in the PC's memory, of card
@@ -86,10 +89,12 @@ pub(crate) fn held(at: usize, n: i64) {
 pub(crate) fn held_line(card: &[[u64; 2]; 9]) -> String {
     (0..CLASSES.len())
         .filter_map(|i| {
-            let pc = HELD_PC[i].load(Ordering::Relaxed).max(0) as u64;
+            let kinds: Vec<u64> = HELD_PC[i].iter().map(|k| k.load(Ordering::Relaxed).max(0) as u64).collect();
+            let pc: u64 = kinds.iter().sum();
             let [local, shared] = card[i];
+            let by: Vec<String> = kinds.iter().zip(KINDS).filter(|(b, _)| **b >= 1 << 20).map(|(b, k)| format!("{k} {}", b >> 20)).collect();
             (pc + local + shared >= 1 << 20).then(|| {
-                format!("{}: PC {} MB, card {} MB, card sides in PC memory {} MB", CLASSES[i], pc >> 20, local >> 20, shared >> 20)
+                format!("{}: PC {} MB ({}), card {} MB, card sides in PC memory {} MB", CLASSES[i], pc >> 20, by.join(", "), local >> 20, shared >> 20)
             })
         })
         .collect::<Vec<_>>()

@@ -89,6 +89,8 @@ pub(crate) struct Shadow {
     /// With [`cards`], for a big title buffer: `buffer` is in the card's
     /// own memory, and this is the rest of the copy.
     card: Option<Card>,
+    /// Where it was made, for the census ([`KIND`]).
+    kind: u8,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
     /// Of a copy with two sides: only the dwords the title changed go up,
@@ -2737,7 +2739,7 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
-        crate::memclass::held(self.start as usize, -(self.len as i64));
+        crate::memclass::held(self.start as usize, -(self.len as i64), self.kind);
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -3297,7 +3299,7 @@ impl Shadow {
         // title wrote there.
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
-        crate::memclass::held(start as usize, -(len as i64));
+        crate::memclass::held(start as usize, -(len as i64), shadow.kind);
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
@@ -3318,11 +3320,16 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+        Self::new_as(buffer, data, gpu, start, len, KIND.with(std::cell::Cell::get))
+    }
+
+    fn new_as(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, kind: u8) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
-        crate::memclass::held(start as usize, len as i64);
+        crate::memclass::held(start as usize, len as i64, kind);
         Shadow {
+            kind,
             landings: Mutex::default(),
             landing: Default::default(),
             width: Default::default(),
@@ -4977,7 +4984,7 @@ impl Shadow {
     pub(crate) fn unbacked(start: u64, data: *mut u8, len: u64, card: bool) -> Arc<Shadow> {
         // SAFETY: an interface pointer nothing calls.
         let none = || unsafe { std::mem::transmute::<usize, ID3D12Resource>(8) };
-        let mut shadow = Shadow::new(none(), data, 0, start, len);
+        let mut shadow = Shadow::new_as(none(), data, 0, start, len, 1);
         if card {
             shadow.card = Some(Card {
                 staging: none(),
@@ -5163,7 +5170,7 @@ mod land_tests {
         let (buffer, data) = crate::host::host()?.shared_buffer(len as u64)?;
         // SAFETY: the mapping, `len` bytes.
         unsafe { std::ptr::write_bytes(data, 0, len) };
-        let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
+        let mut shadow = Shadow::new_as(buffer.clone(), data, 0, title as u64, len as u64, 2);
         shadow.card = Some(Card {
             staging: buffer,
             before: Mutex::default(),
@@ -5702,7 +5709,7 @@ fn lookup_with(address: u64, len: u64, any: bool, quick: bool, buckets: bool) ->
                 "buffer copied to the host"
             );
         }
-        let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+        let mut shadow = Shadow::new_as(buffer, data, gpu, key.0, len, 3);
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
@@ -6165,7 +6172,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     WINDOW_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+    let mut shadow = Shadow::new_as(buffer, data, gpu, start, len, 4);
     shadow.window = true;
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
@@ -6242,7 +6249,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+        let mut shadow = Shadow::new_as(buffer, data, gpu, start, len, 5);
         shadow.window = true;
         shadow.mapped = true;
         let shadow = Arc::new(shadow);
@@ -6276,7 +6283,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         len,
         "loose memory copied to the host"
     );
-    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+    let mut shadow = Shadow::new_as(buffer, data, gpu, start, len, 5);
     shadow.window = true;
     shadow.card = card;
     let shadow = Arc::new(shadow);
@@ -6362,7 +6369,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let shadow = Arc::new(Shadow::new_as(buffer, data, gpu, address, len, 6));
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
@@ -6685,5 +6692,18 @@ pub(crate) fn card_sides_by_class() -> [[u64; 2]; 9] {
             && (props.Type == D3D12_HEAP_TYPE_DEFAULT || props.MemoryPoolPreference == D3D12_MEMORY_POOL_L1);
         out[crate::memclass::class_of(shadow.start as usize).min(8)][usize::from(!local)] += card.size;
     }
+    out
+}
+
+std::thread_local! {
+    /// Which maker a copy comes from, for the census by kind
+    /// (`crate::memclass::KINDS`): set around each maker.
+    static KIND: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+fn as_kind<R>(kind: u8, f: impl FnOnce() -> R) -> R {
+    let before = KIND.with(|k| k.replace(kind));
+    let out = f();
+    KIND.with(|k| k.set(before));
     out
 }

@@ -147,6 +147,97 @@ fn views_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_VIEWS").is_some_and(|v| v == "1"))
 }
 
+/// `crate::memclass::CLASSES`' index of the tiled range (GPU page mappings).
+const TILED_CLASS: usize = 8;
+
+/// Bytes of the section of zeros holes are shown from.
+const ZEROS: u64 = 16 << 20;
+
+/// Whether windows in the tiled range show its holes from a section of
+/// zeros (`VICTORY_INPLACE_ZERO_HOLES=0`: such windows are copies).
+///
+/// Run tip2: of the windows views were asked for, 1,373 (6.5 GB) had pages
+/// not mapped and 763 (3.7 GB) began in one, against 160 (648 MB) placed;
+/// the tiled class still held 3.7 GB of copies in the PC's memory. The title
+/// maps pages there for the card only (no CPU access: protection 0x801), a
+/// copy shows unmapped pages as zeros, and nothing comes back from the class
+/// (copy-back 0.0 MB a frame): the same zeros, from pages no one writes.
+fn zero_holes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_ZERO_HOLES").is_none_or(|v| v != "0"))
+}
+
+/// The section of zeros, [`ZEROS`] bytes, made once (a memfd, as xmem's).
+fn zero_section() -> Option<usize> {
+    static SECTION: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *SECTION.get_or_init(|| {
+        // SAFETY: a new pagefile-backed section, nothing else named.
+        let h = unsafe {
+            mem::CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                mem::PAGE_READWRITE | mem::SEC_COMMIT,
+                0,
+                ZEROS as u32,
+                std::ptr::null(),
+            )
+        };
+        (!h.is_null()).then_some(h as usize)
+    })
+}
+
+/// [`pieces`], with what no view holds taken from the section of zeros;
+/// `None` past udmabuf's 1,024 pieces.
+fn pieces_with_zeros(at: usize, len: usize) -> Option<Vec<(usize, u64, u64)>> {
+    let zero = zero_section()?;
+    let end = at.checked_add(len)?;
+    let v = views();
+    let mut out: Vec<(usize, u64, u64)> = Vec::new();
+    let mut reached = at;
+    let mut fill = |out: &mut Vec<(usize, u64, u64)>, from: usize, to: usize| {
+        let mut left = (to - from) as u64;
+        while left > 0 {
+            let n = left.min(ZEROS);
+            out.push((zero, 0, n));
+            left -= n;
+        }
+    };
+    let first = v.views.range(..=at).next_back().map_or(at, |(&base, _)| base);
+    for (&start, &(bytes, section, offset)) in v.views.range(first..end) {
+        let (from, to) = (start.max(at), (start + bytes).min(end));
+        if to <= from {
+            continue;
+        }
+        if from > reached {
+            fill(&mut out, reached, from);
+        }
+        let piece = (section, offset + (from - start) as u64, (to - from) as u64);
+        match out.last_mut() {
+            Some(last) if last.0 == piece.0 && last.0 != zero && last.1 + last.2 == piece.1 => last.2 += piece.2,
+            _ => out.push(piece),
+        }
+        reached = to;
+    }
+    if reached < end {
+        fill(&mut out, reached, end);
+    }
+    let sections = out.iter().map(|p| p.0).collect::<std::collections::HashSet<_>>().len();
+    (out.len() <= 1024 && sections <= 64).then_some(out)
+}
+
+/// Windows not put in views since the start, `[count, bytes]`: in no view
+/// at all, in views with holes (pages not mapped).
+pub(crate) static VIEW_MISSES: [[AtomicU64; 2]; 2] = [const { [const { AtomicU64::new(0) }; 2] }; 2];
+
+pub(crate) fn view_misses_line() -> String {
+    let v = |i: usize, j: usize| VIEW_MISSES[i][j].load(Ordering::Relaxed);
+    format!(
+        "windows not in views: in none {} ({} MB), with holes {} ({} MB); opened {} ({} MB), refused {}",
+        v(0, 0), v(0, 1) >> 20, v(1, 0), v(1, 1) >> 20,
+        VIEW_OPENS[0].load(Ordering::Relaxed), VIEW_OPENS[1].load(Ordering::Relaxed) >> 20, VIEW_OPENS[2].load(Ordering::Relaxed)
+    )
+}
+
 /// Heaps opened on views so far, and their bytes (each pins its pages until
 /// the copy that holds it goes).
 static VIEW_OPENS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
@@ -157,7 +248,16 @@ static VIEW_OPENS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 fn place_in_views(device: &ID3D12Device, start: u64, len: u64) -> Option<Placed> {
     let at = start & !(K64 as u64 - 1);
     let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
-    let pieces = pieces(at as usize, bytes as usize)?;
+    // The tiled range is sparse: its holes read as zeros, from one section
+    // of zeros (`pieces_with_zeros`).
+    let tiled = crate::memclass::class_of(at as usize) == TILED_CLASS;
+    let found = if tiled && zero_holes() { pieces_with_zeros(at as usize, bytes as usize) } else { pieces(at as usize, bytes as usize) };
+    let Some(pieces) = found else {
+        let i = if cover(at as usize, bytes as usize) == Cover::None { 0 } else { 1 };
+        VIEW_MISSES[i][0].fetch_add(1, Ordering::Relaxed);
+        VIEW_MISSES[i][1].fetch_add(bytes, Ordering::Relaxed);
+        return None;
+    };
     let heap = match crate::dmabuf::open_heap_list(device, &pieces) {
         Ok(heap) => heap,
         Err(e) => {
