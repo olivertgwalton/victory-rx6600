@@ -521,11 +521,13 @@ fn call_case(f: Any8, kinds: &[Kind], case: &[Value], width: Width, s: &Session)
 }
 
 /// The driver answers this fuzzer replays every case under.
-fn drivers() -> Vec<(&'static str, Box<dyn Fn(&Session)>)> {
+fn drivers(keep: &'static [std::ops::Range<usize>]) -> Vec<(&'static str, Box<dyn Fn(&Session)>)> {
     vec![
-        ("accepts, pattern body", Box::new(|s: &Session| s.reply(accepting(|_, body| {
+        ("accepts, pattern body", Box::new(move |s: &Session| s.reply(accepting(move |_, body| {
             for (i, b) in body.iter_mut().enumerate() {
-                *b = (i as u8).wrapping_mul(13).wrapping_add(3);
+                if !keep.iter().any(|r| r.contains(&i)) {
+                    *b = (i as u8).wrapping_mul(13).wrapping_add(3);
+                }
             }
         })))),
         ("accepts as sent", Box::new(|s: &Session| s.reply(accepting(|_, _| {})))),
@@ -543,8 +545,18 @@ pub fn fuzz(name: &str, kinds: &[Kind], width: Width) {
     fuzz_pair(name, name, kinds, width);
 }
 
+/// As `fuzz`; the pattern answer leaves these body bytes as sent (fields
+/// the library trusts, such as offsets it reads back).
+pub fn fuzz_keeping(name: &str, kinds: &[Kind], width: Width, keep: &'static [std::ops::Range<usize>]) {
+    fuzz_impl(name, name, kinds, width, keep);
+}
+
 /// As `fuzz`, the reference's `name` against the layer's `layer_name`.
 pub fn fuzz_pair(name: &str, layer_name: &str, kinds: &[Kind], width: Width) {
+    fuzz_impl(name, layer_name, kinds, width, &[]);
+}
+
+fn fuzz_impl(name: &str, layer_name: &str, kinds: &[Kind], width: Width, keep: &'static [std::ops::Range<usize>]) {
     let s = session();
     trace_all(&s);
     let Some(r) = reference::reference(name) else {
@@ -563,10 +575,16 @@ pub fn fuzz_pair(name: &str, layer_name: &str, kinds: &[Kind], width: Width) {
             cases.push(c);
         }
     }
-    for (what, driver) in drivers() {
+    for (what, driver) in drivers(keep) {
         for (n, case) in cases.iter().enumerate() {
+            if std::env::var_os("VICTORY_FUZZ_TRACE").is_some() {
+                eprintln!("{name} case {n} ({what})");
+            }
             driver(&s);
             let a = call_case(r, kinds, case, width, &s);
+            if std::env::var_os("VICTORY_FUZZ_TRACE").is_some() {
+                eprintln!("  reference done");
+            }
             driver(&s);
             let b = call_case(l, kinds, case, width, &s);
             if a != b {
@@ -601,9 +619,6 @@ fn fuzz_fixed_bodies() {
     fuzz("XCrdSetTelemetry", &[Adp, Int(BYTES), Int(BYTES)], W32);
     fuzz("XCrdSetTitleQuirks", &[Adp, Int(FLAG1)], W32);
     fuzz("XCrdStreamingQueryActiveInstanceId", &[Adp, Out(8)], W32);
-    // TODO: StreamingStop, SuspendResumeIoBalancer, XpfOp, DeriveMsixvc2Key,
-    // EncryptBuffer, StreamingQueueInsertRegion: their fuzz cases crashed the
-    // test process (a case to find); ported, not yet verified.
 }
 
 /// The fuzzer finds a difference when there is one.
@@ -615,3 +630,30 @@ fn fuzz_catches_a_wrong_port() {
     }
     fuzz_pair("XCrdSetTelemetry", "XCrdRemapReload", &[Adp, Int(BYTES), Int(BYTES)], W32);
 }
+
+#[test]
+fn fuzz_streaming_stop() {
+    fuzz("XCrdStreamingStop", &[Adp, Int(&[7, 0, u64::MAX]), Int(&[0, 1, 0x8000_0000_0000_0000])], W32);
+}
+#[test]
+fn fuzz_io_balancer() {
+    fuzz("XCrdSuspendResumeIoBalancer", &[Adp, Int(BYTES)], W32);
+}
+#[test]
+fn fuzz_xpf_op() {
+    fuzz("XCrdXpfOp", &[Adp, Int(&[1, 0, 2, 3, 0xffff_ffff]), Int(&[0, 1]), Int(&[0, 0x10])], W32);
+}
+const SIZES32: &[u64] = &[0x10, 0, 1, 0x20, 0x21, 0xffff_ffff];
+#[test]
+fn fuzz_derive_key() {
+    fuzz("XCrdDeriveMsixvc2Key", &[Adp, InOpt(0x40), Int(SIZES32), Int(&[5, 0, 0xffff_ffff]), InOpt(0x40), Int(&[0x20, 0, 0x40, 0x41]), OutOpt(0x40), Int(SIZES32)], W32);
+}
+#[test]
+fn fuzz_encrypt_buffer() {
+    fuzz_keeping("XCrdEncryptBuffer", &[Adp, InOpt(0x2000), Int(&[0x1000, 0, 0x800, 0x2000, 0x1001]), Int(&[0x3000, 0, 0x10, u64::MAX & !0xfff]), InOpt(32), InOpt(16)], W32, &[0x3c..0x40]);
+}
+#[test]
+fn fuzz_insert_region() {
+    fuzz("XCrdStreamingQueueInsertRegion", &[Adp, Int(&[9, 0]), Int(&[3, 0, 1, 64]), In(0x100), Int(&[0, 1])], W32);
+}
+

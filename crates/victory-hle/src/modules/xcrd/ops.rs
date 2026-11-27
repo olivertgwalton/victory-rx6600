@@ -203,8 +203,14 @@ pub extern "system" fn XCrdEncryptBuffer(adapter: *const Adapter, buffer: *mut u
         p.u32(0x3c, 0x40);
         p.put(0x40, data);
     }, |p| {
-        // SAFETY: as above.
-        unsafe { std::ptr::copy_nonoverlapping(body(p)[0x40..].as_ptr(), buffer, len as usize) };
+        // The data is read back from the offset the driver left at +0x3c
+        // (as the console's; an offset past the body is the driver's error,
+        // where the console's would read past its block: nothing copied).
+        let at = p.read_u32(0x3c) as usize;
+        if let Some(data) = body(p).get(at..at + len as usize) {
+            // SAFETY: as above.
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buffer, len as usize) };
+        }
     })
 }
 
