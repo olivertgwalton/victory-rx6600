@@ -1804,6 +1804,7 @@ fn unmount_machine(s: &Session, mode: u32) {
             let status: u32 = match code {
                 0x7800_0078 if mode == 12 => 0xc05e_0007,
                 0x7800_0008 if mode == 11 => 0xc05e_0003,
+                c if mode == 14 && c != 0x7800_0078 => 0xc05e_0003,
                 _ => 0,
             };
             if code == 0x7800_0078 {
@@ -2028,4 +2029,22 @@ fn mount_tests_reach_their_paths() {
     assert_eq!(super::mount::XCrdMount(&mut d, &a, p.as_ptr(), 1), 0);
     assert!(!d.is_null());
     heap_free(d.cast());
+}
+
+#[test]
+fn detach_external_device() {
+    let s = session();
+    trace_all(&s);
+    let (r, l) = both!("XCrdStorageDetachExternalDevice": extern "system" fn(*const Adapter, u64) -> HRESULT);
+    let a = adapter();
+    // The machine's disk 3 answers to port 0, path 1, target 2, lun 3.
+    let at = |id: u32, lun: u8| u64::from_le_bytes([lun, 2, 1, 0, 0, 0, 0, 0]) | (u64::from(id) << 32);
+    for id in [0xa, 0xb, 0xc, 0x11, 0x12, 0x13, 0, 0xffff_ffff] {
+        for lun in [3u8, 9] {
+            for mode in [0, 1, 3, 4, 8, 14] {
+                same(&format!("id {id:#x} lun {lun} mode {mode}"), run(&s, |s| unmount_machine(s, mode), |side| if side { r(&a, at(id, lun)) } else { l(&a, at(id, lun)) }));
+            }
+        }
+    }
+    same("null adapter", run(&s, |_| {}, |side| if side { r(std::ptr::null(), at(0xb, 3)) } else { l(std::ptr::null(), at(0xb, 3)) }));
 }

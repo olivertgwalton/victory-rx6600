@@ -446,7 +446,37 @@ pub extern "system" fn XCrdUnmountByPath(adapter: *const Adapter, path: *const u
     if hr >= 0 || hr == NO_VOLUME { detach(adapter, &address) } else { hr }
 }
 
+/// 0x1800077c0: detaches an external storage device (ids 0xb to 0x12) at
+/// a SCSI address passed by value (`{lun, target, path, port, id}`, bytes
+/// in that order): its disk's volumes are dismounted when it is found, then
+/// the storage operation 0xb asks the driver to let it go.
+pub extern "system" fn XCrdStorageDetachExternalDevice(adapter: *const Adapter, device: u64) -> HRESULT {
+    if adapter.is_null() {
+        log(1, "Invalid Adapter Handle.\n");
+        return E_INVALIDARG;
+    }
+    let [b0, b1, b2, b3, ..] = device.to_le_bytes();
+    let id = (device >> 32) as u32;
+    if !(0xb..=0x12).contains(&id) {
+        log(1, "Invalid XCrdId.\n");
+        return E_INVALIDARG;
+    }
+    let address: Address = [8, 0, 0, 0, b3, b2, b1, b0];
+    match disk_number(&address) {
+        Ok(disk) => {
+            let hr = dismount_disk(disk);
+            if hr < 0 {
+                log(1, &format!("[XCRD]: XCrdStorageDetachExternalDevice - Failed to dismount disk volumes {} - {:x}\n", disk as i32, hr as u32));
+            }
+        }
+        Err(hr) => log(1, &format!("[XCRD]: XCrdStorageDetachExternalDevice - Failed to get disk number {:x}\n", hr as u32)),
+    }
+    let hr = super::storage::operate(adapter, &super::storage::Request::new(id, 0xb));
+    log(4, &format!("[XCRD]: Detached device address Lun:{b0}, Path:{b1}, Target:{b2}, Port:{b3}. Status {:x}\n", hr as u32));
+    hr
+}
+
 pub(crate) fn exports() -> Vec<crate::HleExport> {
     use crate::hle_export;
-    vec![hle_export!(XCrdMount), hle_export!(XCrdMountContentType), hle_export!(XCrdUnmount), hle_export!(XCrdUnmountEx), hle_export!(XCrdUnmountByPath)]
+    vec![hle_export!(XCrdMount), hle_export!(XCrdMountContentType), hle_export!(XCrdUnmount), hle_export!(XCrdUnmountEx), hle_export!(XCrdUnmountByPath), hle_export!(XCrdStorageDetachExternalDevice)]
 }

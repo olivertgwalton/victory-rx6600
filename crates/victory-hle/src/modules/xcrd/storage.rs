@@ -11,7 +11,7 @@ use super::{Adapter, E_INVALIDARG, HRESULT, XCrdIsInternalStorageDevice, handle_
 /// The library's request (0x68 bytes, on its stack).
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Request {
+pub(crate) struct Request {
     id: u32,
     op: u32,
     /// Strings: at most 0x20 characters, then three of at most 0x103.
@@ -30,7 +30,7 @@ struct Request {
 }
 
 impl Request {
-    fn new(id: u32, op: u32) -> Request {
+    pub(crate) fn new(id: u32, op: u32) -> Request {
         use std::ptr::null;
         Request {
             id,
@@ -62,7 +62,7 @@ fn removable_or_external(id: u32) -> bool {
 }
 
 /// 0x18000ddc0.
-fn operate(adapter: *const Adapter, r: &Request) -> HRESULT {
+pub(crate) fn operate(adapter: *const Adapter, r: &Request) -> HRESULT {
     let invalid = || {
         log(1, "Invalid parameter.\n");
         E_INVALIDARG
