@@ -2737,6 +2737,7 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        crate::memclass::held(self.start as usize, -(self.len as i64));
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -3296,6 +3297,7 @@ impl Shadow {
         // title wrote there.
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
+        crate::memclass::held(start as usize, -(len as i64));
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
@@ -3319,6 +3321,7 @@ impl Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
+        crate::memclass::held(start as usize, len as i64);
         Shadow {
             landings: Mutex::default(),
             landing: Default::default(),
@@ -6665,4 +6668,22 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// For the census: per xmem class, bytes of card sides of live copies in
+/// the card's memory and in the PC's memory (`card_for` puts them there when
+/// the card has no room).
+pub(crate) fn card_sides_by_class() -> [[u64; 2]; 9] {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let mut out = [[0u64; 2]; 9];
+    let carded: Vec<Arc<Shadow>> = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect();
+    for shadow in carded {
+        let Some(card) = &shadow.card else { continue };
+        let mut props = D3D12_HEAP_PROPERTIES::default();
+        // SAFETY: a live buffer; a plain query.
+        let local = unsafe { shadow.buffer.GetHeapProperties(Some(&mut props), None) }.is_ok()
+            && (props.Type == D3D12_HEAP_TYPE_DEFAULT || props.MemoryPoolPreference == D3D12_MEMORY_POOL_L1);
+        out[crate::memclass::class_of(shadow.start as usize).min(8)][usize::from(!local)] += card.size;
+    }
+    out
 }

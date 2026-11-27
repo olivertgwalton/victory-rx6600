@@ -894,8 +894,9 @@ pub(crate) unsafe fn texture(
         now(),
         Ripe::now(SPARES.load(Ordering::Relaxed).min(texture_spare_cap())),
         || {
-            // Free ranges only, while the card has no room (`resource::pool_gaps_only`).
-            if crate::resource::gaps_only_now() {
+            // Free ranges only, while the card has no room (`resource::pool_gaps_only`),
+            // and no block past the room kept for targets and buffers.
+            if crate::resource::gaps_only_now() || !crate::resource::texture_memory_fits(BLOCK) {
                 return None;
             }
             if !crate::budget::admit_pool_growth(crate::host::host().and_then(|host| host.video_memory()), BLOCK) {

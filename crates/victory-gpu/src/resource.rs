@@ -1854,6 +1854,27 @@ pub(crate) fn targets_room_kept() -> u64 {
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
+    // Targets that have not grown for a while are made: no more room is
+    // kept for them (`VICTORY_TARGETS_SETTLE_MS`, 10,000; 0: kept always, as
+    // before). Runs kr1 and kr2: the targets settled at 1.36 GB, the room
+    // kept for the other 1.7 GB of the 3 GB never came, 1.2 GB of the
+    // card's budget stood unused and 41,000 textures waited.
+    static SETTLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let settle = *SETTLE.get_or_init(|| {
+        std::env::var("VICTORY_TARGETS_SETTLE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10_000)
+    });
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static GREW_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    if targets > SEEN.fetch_max(targets, Relaxed) || GREW_AT.load(Relaxed) == 0 {
+        GREW_AT.store(now.max(1), Relaxed);
+    }
+    // (And only once they are a third of the room kept: ts2 settled on a
+    // loading screen at 172 MB, the pool took 5.6 GB, and the world's 1.4 GB
+    // of targets came after.)
+    if settle != 0 && targets >= most / 3 && now.saturating_sub(GREW_AT.load(Relaxed)) > settle {
+        return 0;
+    }
     most.saturating_sub(targets).saturating_sub(crate::pool::target_room())
 }
 
@@ -2574,6 +2595,31 @@ pub(crate) fn pool_gaps_only<R>(f: impl FnOnce() -> R) -> (R, bool) {
     (out, POOL_MISSED.with(|c| c.replace(false)))
 }
 
+/// Whether `bytes` more of the card's memory for textures stays under the
+/// line [`room`] keeps: the memory in use, the room kept for card copies of
+/// title buffers and for targets not made yet (`VICTORY_TEXTURE_KEEPS_ROOM=0`:
+/// no such test, as before).
+///
+/// Runs gap2 and place1: by frame 960, while the world loads and before its
+/// targets are made, the texture pool had grown to 5.4-5.7 GB, as its
+/// blocks and textures of their own looked only at 90 % of the budget; the
+/// targets (1.36 GB) and buffer copies (0.5 GB) came after, and the card
+/// stood at 8.8-9.2 GB of 8.2 (14.8 fps in place1).
+#[cfg(windows)]
+pub(crate) fn texture_memory_fits(bytes: u64) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_KEEPS_ROOM").is_none_or(|v| v != "0")) {
+        return true;
+    }
+    match crate::host::host().and_then(|h| h.video_memory()) {
+        Some([budget, used, ..]) => {
+            u128::from(used) + u128::from(bytes) + u128::from(crate::shadow::card_room_kept()) + u128::from(targets_room_kept())
+                < u128::from(budget) * u128::from(room_percent()) / 100
+        }
+        None => true,
+    }
+}
+
 /// Whether this thread is in [`pool_gaps_only`]: the pool takes no new
 /// block for it either (run gap1: blocks 4,288 -> 5,888 MB, the room kept
 /// for targets and buffers taken, the card 1.4 GB over its budget).
@@ -2730,6 +2776,14 @@ fn host_texture_as(
     if POOL_ONLY.with(std::cell::Cell::get) {
         // Not in a free range of the pool: no memory of its own now.
         POOL_MISSED.with(|c| c.set(true));
+        return None;
+    }
+    // A texture the title fills, of memory of its own, only within the
+    // room kept for targets and buffers ([`texture_memory_fits`]): else it
+    // waits (not refused) until the sweep makes room.
+    if fills(desc) && !reserved && !texture_memory_fits(footprint(desc).map_or(0, |f| f.size)) {
+        POOL_MISSED.with(|c| c.set(true));
+        KEPT_ROOM_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return None;
     }
     let mut texture: Option<ID3D12Resource> = None;
@@ -5017,11 +5071,16 @@ mod overloads {
 pub(crate) static POOL_MISS: [[std::sync::atomic::AtomicU64; 2]; 5] =
     [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 5];
 
+/// Textures the title fills that waited rather than take memory of their
+/// own past the room kept ([`texture_memory_fits`]), since the start.
+pub(crate) static KEPT_ROOM_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The census line of [`POOL_MISS`].
 pub(crate) fn pool_miss_line() -> String {
     let v = |i: usize, j: usize| POOL_MISS[i][j].load(std::sync::atomic::Ordering::Relaxed);
     format!(
-        "textures made, why not in a block (count, Mpixels): not title-filled {} {}, samples or clear {} {}, xor swizzle {} {}, eligible {} {} of which in a block {}",
-        v(0, 0), v(0, 1) >> 20, v(1, 0), v(1, 1) >> 20, v(2, 0), v(2, 1) >> 20, v(3, 0), v(3, 1) >> 20, v(4, 0)
+        "textures made, why not in a block (count, Mpixels): not title-filled {} {}, samples or clear {} {}, xor swizzle {} {}, eligible {} {} of which in a block {}; waited for the kept room {}",
+        v(0, 0), v(0, 1) >> 20, v(1, 0), v(1, 1) >> 20, v(2, 0), v(2, 1) >> 20, v(3, 0), v(3, 1) >> 20, v(4, 0),
+        KEPT_ROOM_WAITS.load(std::sync::atomic::Ordering::Relaxed)
     )
 }

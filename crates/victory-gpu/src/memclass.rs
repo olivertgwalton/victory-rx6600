@@ -70,3 +70,33 @@ pub(crate) fn line(frames: f64) {
         tracing::info!("copies by xmem class, MB a frame: {}", parts.join("; "));
     }
 }
+
+/// Bytes of title memory held in copies in the PC's memory, by class:
+/// every copy's CPU side (copies with a card side too), since the start.
+static HELD_PC: [std::sync::atomic::AtomicI64; 9] = [const { std::sync::atomic::AtomicI64::new(0) }; 9];
+
+/// A copy of `n` bytes from title address `at` was made (`n` > 0) or let go.
+pub(crate) fn held(at: usize, n: i64) {
+    HELD_PC[class(at)].fetch_add(n, Ordering::Relaxed);
+}
+
+/// For the census: per class, MB of copies in the PC's memory, of card
+/// sides in the card's memory, and of card sides that are in the PC's
+/// memory all the same (`card` gives those two, from the live copies).
+pub(crate) fn held_line(card: &[[u64; 2]; 9]) -> String {
+    (0..CLASSES.len())
+        .filter_map(|i| {
+            let pc = HELD_PC[i].load(Ordering::Relaxed).max(0) as u64;
+            let [local, shared] = card[i];
+            (pc + local + shared >= 1 << 20).then(|| {
+                format!("{}: PC {} MB, card {} MB, card sides in PC memory {} MB", CLASSES[i], pc >> 20, local >> 20, shared >> 20)
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The class of a title address (an index into [`CLASSES`]).
+pub(crate) fn class_of(at: usize) -> usize {
+    class(at)
+}
