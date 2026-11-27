@@ -916,3 +916,122 @@ fn blobs_read_and_write() {
         same("address", run(&s, |_| {}, |r| { let mut o = [0xcc; 8]; ((if r { rq(&mut o, v) } else { lq(&mut o, v) }), o) }));
     }
 }
+
+/// A small deterministic generator for header fields.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    /// Interesting values: small, page edges, big, random.
+    fn value(&mut self) -> u64 {
+        match self.next() % 8 {
+            0 => 0,
+            1 => self.next() % 8,
+            2 => 0x1000 * (self.next() % 64),
+            3 => 0x1000 * (self.next() % 64) + 1,
+            4 => 0xa_a000 * (self.next() % 300) + self.next() % 3,
+            5 => u64::from(u32::MAX) - self.next() % 4,
+            6 => self.next() >> (self.next() % 64),
+            _ => self.next(),
+        }
+    }
+}
+
+fn put(b: &mut [u8], at: usize, v: &[u8]) {
+    b[at..at + v.len()].copy_from_slice(v);
+}
+
+#[test]
+fn headers_against_the_library() {
+    let s = session();
+    trace_all(&s);
+    let (rm, lm) = both!("XCrdGetStreamingRoamableXvdConsoleMode": extern "system" fn(*const u8, *mut u16) -> HRESULT);
+    let (ro, lo) = both!("XCrdGetXvcOffsetFromHeader": extern "system" fn(*const u8, *mut u64) -> HRESULT);
+    let (rb, lb) = both!("XCrdGetUabBitmapOffset": extern "system" fn(*const u8, u64, u8, *mut *const u8, *mut u32, *mut *const u8, *mut u32) -> HRESULT);
+    let (rv, lv) = both!("XCrdValidateUab": extern "system" fn(*const u8, u64, u8, *const u8) -> HRESULT);
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let (mut modes, mut offsets, mut valid) = (0, 0, 0);
+    for i in 0..4000 {
+        let mut h = vec![0u8; 0x1000];
+        for chunk in h.chunks_mut(8).take(0x60) {
+            let v = rng.value();
+            chunk.copy_from_slice(&v.to_le_bytes());
+        }
+        if i % 7 != 0 {
+            put(&mut h, 0, b"msft-xvd");
+        }
+        put(&mut h, 8, &((rng.next() as u32) & if i % 2 == 0 { 0x204 } else { u32::MAX }).to_le_bytes());
+        put(&mut h, 0x80, &((rng.next() % 3) as u32).to_le_bytes());
+        put(&mut h, 0x84, &((rng.next() % 0x2c) as u32).to_le_bytes());
+        for at in [0x88usize, 0x8c, 0x90, 0x94] {
+            put(&mut h, at, &(rng.value() as u32).to_le_bytes());
+        }
+        put(&mut h, 0x18, &rng.value().to_le_bytes());
+        h[0x270] = rng.next() as u8;
+        h[0x276] = (rng.next() % 6) as u8;
+        let mut o = 0u64;
+        modes += i32::from(rm(h.as_ptr(), &mut 0) == 0);
+        offsets += i32::from(ro(h.as_ptr(), &mut o) == 0);
+        s.take();
+        same(&format!("mode {i}"), run(&s, |_| {}, |r| { let mut m = 0xcccc; ((if r { rm(h.as_ptr(), &mut m) } else { lm(h.as_ptr(), &mut m) }), m) }));
+        same(&format!("offset {i}"), run(&s, |_| {}, |r| { let mut o = 0xcccc; ((if r { ro(h.as_ptr(), &mut o) } else { lo(h.as_ptr(), &mut o) }), o) }));
+        // UAB data: magic, sizes and the duplicated layout, sometimes right.
+        let mut u = vec![0u8; 0x1000];
+        put(&mut u, 0x200, if i % 9 == 0 { b"MS-XUAX " } else { b"MS-XUAB " });
+        let total = rng.value() % 0x20_0000_0000;
+        let meta = total.min(rng.value() % 0x8_0000_0000);
+        put(&mut u, 0x2a0, &total.to_le_bytes());
+        put(&mut u, 0x2c0, &meta.to_le_bytes());
+        let md = (meta.wrapping_add(0xa_9fff) / 0xa_a000 + 7) >> 3;
+        let data = (total.wrapping_sub(meta).wrapping_add(0xa_9fff) / 0xa_a000 + 7) >> 3;
+        let pages = ((md + data + 0xfff) & !0xfff) as u32;
+        let doubled = u64::from(pages) * 2 + 0x1000;
+        let double = rng.next() % 2 == 0;
+        put(&mut u, 0x208, &(if i % 11 == 0 { 0x2000u64 } else { 0x1000 }).to_le_bytes());
+        put(&mut u, 0x218, &(if i % 13 == 0 { pages + 1 } else { pages }).to_le_bytes());
+        if double {
+            put(&mut u, 0x21c, &pages.to_le_bytes());
+            put(&mut u, 0x210, &(0x1000 + u64::from(pages)).to_le_bytes());
+            put(&mut u, 0x284, &(pages * 2 + 0x1000).to_le_bytes());
+        } else {
+            put(&mut u, 0x284, &(pages + 0x1000).to_le_bytes());
+        }
+        let size = match rng.next() % 4 { 0 => doubled, 1 => 0x800, 2 => u64::from(pages) + 0x1000, _ => rng.value() };
+        let mut info = vec![0u8; 0x100];
+        put(&mut info, 0x78, &(if i % 5 == 0 { total + 1 } else { total }).to_le_bytes());
+        let id: [u8; 16] = std::array::from_fn(|k| (k as u8).wrapping_mul(i as u8));
+        put(&mut info, 0x30, &id);
+        put(&mut info, 0x40, &id);
+        put(&mut u, 0x220, &id);
+        put(&mut u, 0x230, &id);
+        put(&mut u, 0x240, &id);
+        if i % 17 == 0 {
+            u[0x245] ^= 1;
+        }
+        for strict in [0u8, 1] {
+            valid += i32::from(rv(u.as_ptr(), size, strict, info.as_ptr()) == 0);
+            s.take();
+            same(&format!("validate {i} {strict}"), run(&s, |_| {}, |r| if r { rv(u.as_ptr(), size, strict, info.as_ptr()) } else { lv(u.as_ptr(), size, strict, info.as_ptr()) }));
+        }
+        for alt in [0u8, 1] {
+            same(&format!("bitmaps {i}"), run(&s, |_| {}, |r| {
+                let (mut a, mut b) = (std::ptr::null(), std::ptr::null());
+                let (mut al, mut bl) = (0u32, 0u32);
+                let hr = if r { rb(u.as_ptr(), size, alt, &mut a, &mut al, &mut b, &mut bl) } else { lb(u.as_ptr(), size, alt, &mut a, &mut al, &mut b, &mut bl) };
+                (hr, (a as usize).wrapping_sub(u.as_ptr() as usize), al, (b as usize).wrapping_sub(u.as_ptr() as usize), bl)
+            }));
+        }
+    }
+    // The cases reach the success paths, not only the early refusals.
+    assert!(modes > 100 && offsets > 300 && valid > 100, "modes {modes} offsets {offsets} valid {valid}");
+    // The null checks, in order.
+    let h = [0u8; 0x300];
+    same("mode null header", run(&s, |_| {}, |r| { let mut m = 0u16; if r { rm(std::ptr::null(), &mut m) } else { lm(std::ptr::null(), &mut m) } }));
+    same("mode null out", run(&s, |_| {}, |r| if r { rm(h.as_ptr(), std::ptr::null_mut()) } else { lm(h.as_ptr(), std::ptr::null_mut()) }));
+    same("offset null", run(&s, |_| {}, |r| if r { ro(h.as_ptr(), std::ptr::null_mut()) } else { lo(h.as_ptr(), std::ptr::null_mut()) }));
+    same("validate null info", run(&s, |_| {}, |r| if r { rv(h.as_ptr(), 0x1000, 0, std::ptr::null()) } else { lv(h.as_ptr(), 0x1000, 0, std::ptr::null()) }));
+}
