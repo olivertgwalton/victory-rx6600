@@ -2578,7 +2578,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 68] = [
+const METHODS: [(usize, *const ()); 79] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -2641,6 +2641,19 @@ const METHODS: [(usize, *const ()); 68] = [
     (111, write_immediate as *const ()),          // 0x388 WriteBufferImmediate
     (135, write32_bottom2 as *const ()),          // 0x448 Write32BitValueBottomOfPipe2X
     (136, write64_bottom2 as *const ()),          // 0x450 Write64BitValueBottomOfPipe2X
+    // GPU tuning and hints without a host counterpart: nothing to do
+    // (GameOS xgs12_10.dll; the driver's function in each).
+    (67, object::VOID_STUB), // 0x228 FlushPipelineX (+0x39120): caches the host keeps coherent
+    (79, object::VOID_STUB), // 0x288 SetHiStencilStateX (+0x5e390): hierarchical stencil, an accelerator
+    (80, object::VOID_STUB), // 0x290 RSSetMSAAParametersX (+0x392f0). shortcut: the console's sample settings are not applied
+    (95, object::VOID_STUB), // 0x308 SetGraphicsShaderLimitsX (+0x5e1a0): wave limits
+    (96, object::VOID_STUB), // 0x310 SetComputeShaderLimitsX (+0x5df40): wave limits
+    (97, object::VOID_STUB), // 0x318 SetResourceCompressionStateX (+0x34350): the host has no compression state
+    (103, object::VOID_STUB), // 0x348 SetDeferredPrimitiveBatchBinningX (+0x5dfd0): binning
+    (133, object::VOID_STUB), // 0x438 PrefetchMemoryX (+0x385e0): a prefetch
+    (134, object::VOID_STUB), // 0x440 PrefetchPipelineStateX (+0x385f0): a prefetch
+    (139, object::VOID_STUB), // 0x468 SetShaderScratchSpaceX (+0x38870): translated shaders keep their scratch
+    (143, object::VOID_STUB), // 0x488 SetComputeShaderLaunchParametersX (+0x38820): wave launch tuning
     (68, state::depth_bounds as *const ()),       // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230

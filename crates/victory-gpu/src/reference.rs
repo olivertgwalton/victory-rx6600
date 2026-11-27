@@ -466,8 +466,8 @@ const NOT_WRITTEN: &[(&str, usize)] = &[
     ("device", 0xf0), ("device", 0x150), ("device", 0x160), ("device", 0x168), ("device", 0x170), ("device", 0x178), ("device", 0x188), ("device", 0x1d8), ("device", 0x1e0), ("device", 0x1f8), ("device", 0x220), ("device", 0x240), ("device", 0x268), ("device", 0x290), ("device", 0x2a0), ("device", 0x2e0), ("device", 0x2e8), ("device", 0x2f0), ("device", 0x2f8), ("device", 0x328), ("device", 0x330), ("device", 0x368), ("device", 0x370), ("device", 0x378), ("device", 0x380), ("device", 0x388), ("device", 0x390), ("device", 0x398), ("device", 0x3a0), ("device", 0x3b0), ("device", 0x3c0), ("device", 0x3d8), ("device", 0x400), ("device", 0x408), ("device", 0x430), ("device", 0x440), ("device", 0x448), ("device", 0x450),
     // queue: 6
     ("queue", 0x40), ("queue", 0x48), ("queue", 0xc8), ("queue", 0xe8), ("queue", 0xf0), ("queue", 0x128),
-    // list: 49
-    ("list", 0x58), ("list", 0x90), ("list", 0xd8), ("list", 0x188), ("list", 0x210), ("list", 0x218), ("list", 0x228), ("list", 0x260), ("list", 0x268), ("list", 0x270), ("list", 0x278), ("list", 0x288), ("list", 0x290), ("list", 0x298), ("list", 0x2a0), ("list", 0x2e8), ("list", 0x2f0), ("list", 0x2f8), ("list", 0x300), ("list", 0x308), ("list", 0x310), ("list", 0x318), ("list", 0x330), ("list", 0x338), ("list", 0x340), ("list", 0x348), ("list", 0x350), ("list", 0x368), ("list", 0x370), ("list", 0x378), ("list", 0x3b8), ("list", 0x3c0), ("list", 0x3c8), ("list", 0x3d0), ("list", 0x3d8), ("list", 0x3e0), ("list", 0x3e8), ("list", 0x3f8), ("list", 0x400), ("list", 0x410), ("list", 0x428), ("list", 0x430), ("list", 0x438), ("list", 0x440), ("list", 0x460), ("list", 0x468), ("list", 0x478), ("list", 0x488), ("list", 0x4a8),
+    // list: 38
+    ("list", 0x58), ("list", 0x90), ("list", 0xd8), ("list", 0x188), ("list", 0x210), ("list", 0x218), ("list", 0x260), ("list", 0x268), ("list", 0x270), ("list", 0x278), ("list", 0x298), ("list", 0x2a0), ("list", 0x2e8), ("list", 0x2f0), ("list", 0x2f8), ("list", 0x300), ("list", 0x330), ("list", 0x338), ("list", 0x340), ("list", 0x350), ("list", 0x368), ("list", 0x370), ("list", 0x378), ("list", 0x3b8), ("list", 0x3c0), ("list", 0x3c8), ("list", 0x3d0), ("list", 0x3d8), ("list", 0x3e0), ("list", 0x3e8), ("list", 0x3f8), ("list", 0x400), ("list", 0x410), ("list", 0x428), ("list", 0x430), ("list", 0x460), ("list", 0x478), ("list", 0x4a8),
     // allocator: 2
     ("allocator", 0x50), ("allocator", 0x58),
     // pipeline: 2
@@ -845,5 +845,24 @@ mod list_writes {
         at::<extern "system" fn(This, u64, u64, *const [u8; 16])>(0x208)(NONE, base + 32, 16, &v);
         assert_eq!(&m[32..48], &v);
         assert_eq!(m[8..16], [0; 8]);
+    }
+}
+
+/// The list's GPU tuning and hint methods (each the driver's function in
+/// `crate::list::METHODS`) return nothing and change nothing here: called
+/// through the table with arguments a title could pass, every one returns.
+#[cfg(test)]
+mod list_hints {
+    #[test]
+    fn tuning_and_hint_methods_return() {
+        let mut scratch = [0u64; 16];
+        let p = scratch.as_mut_ptr() as u64;
+        for o in [0x228, 0x288, 0x290, 0x308, 0x310, 0x318, 0x348, 0x438, 0x440, 0x468, 0x488] {
+            let f = crate::list::NEWER_LIST_FUNCTIONS.0[o / 8];
+            // SAFETY: the stubs read none of their arguments.
+            let f: extern "system" fn(*const (), u64, u64, u64) = unsafe { std::mem::transmute(f) };
+            f(std::ptr::null(), p, 64, 0);
+        }
+        assert_eq!(scratch, [0; 16]);
     }
 }

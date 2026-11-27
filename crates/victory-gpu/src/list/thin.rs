@@ -954,7 +954,7 @@ mod tests {
     /// left in both tables alike records nothing.
     #[test]
     fn every_recording_method_is_written_down() {
-        const NOTHING: [usize; 20] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 28, 29, 33, 34, 55, 56, 57, 58, 73, 99, 124];
+        const NOTHING: [usize; 31] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 28, 29, 33, 34, 55, 56, 57, 58, 67, 73, 79, 80, 95, 96, 97, 99, 103, 124, 133, 134, 139, 143];
         let mine: Vec<usize> = MINE.iter().map(|m| m.0).collect();
         for (slot, _) in METHODS.iter().chain(MORE_METHODS.iter()) {
             assert!(mine.contains(slot) != NOTHING.contains(slot), "slot {slot}");
