@@ -438,6 +438,7 @@ plain! {
     DISPATCH_MESH_X dispatch_mesh_x = state::dispatch_mesh_x, (x: u32, flags: u64, indirect: u64, payload: u64);
     COPY_BUFFER copy_buffer_region = super::copy_buffer_region, (dst: This, dst_offset: u64, src: This, src_offset: u64, len: u64);
     COPY_RESOURCE copy_resource = super::copy_resource, (dst: This, src: This);
+    SAMPLE_MASK set_sample_mask = super::set_sample_mask, (mask: u64);
     SET_PREDICATION set_predication = super::set_predication, (buffer: This, offset: u64, op: u32);
     COPY_RESOURCE_X copy_resource_x = super::copy_resource_x, (dst: This, src: This, flags: u32);
     COPY_MEMORY copy_memory = super::copy_memory, (dst: u64, src: u64, len: u64, flags: u32);
@@ -875,6 +876,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
         i += 1;
     }
     if newer {
+        f[142] = set_sample_mask as *const ();
         f[146] = barrier_groups as *const ();
         f[148] = allocate_upload as *const ();
     }

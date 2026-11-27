@@ -438,9 +438,10 @@ struct Pipeline {
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
-/// Render target formats, their count, depth format and samples, as bound.
+/// Render target formats, their count, depth format and samples, as bound,
+/// and the list's sample mask ([`note_sample_mask`]).
 #[cfg(windows)]
-type Bound = ([i32; 8], u32, i32, u32);
+type Bound = ([i32; 8], u32, i32, u32, u32);
 
 /// A pipeline the title made with device method 0x1c8: its register image
 /// and vertex layout, and its host pipelines by the targets bound.
@@ -454,7 +455,7 @@ pub(crate) struct NativeGraphics {
 #[cfg(windows)]
 thread_local! {
     /// The targets the list this thread records has bound (`draw.rs`).
-    static BOUND: std::cell::Cell<Bound> = const { std::cell::Cell::new(([0; 8], 0, 0, 1)) };
+    static BOUND: std::cell::Cell<Bound> = const { std::cell::Cell::new(([0; 8], 0, 0, 1, u32::MAX)) };
 }
 
 /// The render targets (host formats), depth format and sample count the
@@ -466,7 +467,34 @@ pub(crate) fn note_targets(formats: &[DXGI_FORMAT], depth: DXGI_FORMAT, samples:
     for (slot, x) in f.iter_mut().zip(formats) {
         *slot = x.0;
     }
-    BOUND.set((f, formats.len().min(8) as u32, depth.0, samples.max(1)));
+    let mask = BOUND.get().4;
+    BOUND.set((f, formats.len().min(8) as u32, depth.0, samples.max(1), mask));
+}
+
+/// The sample mask the list being recorded on this thread set (list method
+/// 0x470), for the native graphics pipelines it draws with; all samples
+/// after a reset.
+#[cfg(windows)]
+pub(crate) fn note_sample_mask(mask: u32) {
+    let mut b = BOUND.get();
+    b.4 = mask;
+    BOUND.set(b);
+}
+
+/// The mask [`note_sample_mask`] keeps on this thread.
+#[cfg(all(test, windows))]
+pub(crate) fn noted_sample_mask() -> u32 {
+    BOUND.get().4
+}
+
+/// `SetSampleMaskX(mask)`'s 64 bits as D3D12's sample mask. The driver
+/// (GameOS `xgs12_10.dll` +0x38580) writes them to PA_SC_AA_MASK_X0Y0_X1Y0
+/// and _X0Y1_X1Y1: 16 sample bits for each pixel of a 2x2 quad. The same 16
+/// for every pixel are D3D12's mask (samples 16 and up kept); otherwise
+/// D3D12 has no per-pixel mask, and their union is taken.
+pub(crate) fn sample_mask_of(mask: u64) -> u32 {
+    let p = |i: u32| (mask >> (16 * i)) as u32 & 0xffff;
+    0xffff_0000 | p(0) | p(1) | p(2) | p(3)
 }
 
 /// Stage names, in description order.
@@ -510,7 +538,8 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
                 Some((_, pending)) => pending.clone(),
                 None => {
                     let targets: Vec<DXGI_FORMAT> = bound.0[..bound.1 as usize].iter().map(|&f| DXGI_FORMAT(f)).collect();
-                    let g = host::GraphicsState::native(&n.regs, &n.layout, &targets, DXGI_FORMAT(bound.2), bound.3);
+                    let mut g = host::GraphicsState::native(&n.regs, &n.layout, &targets, DXGI_FORMAT(bound.2), bound.3);
+                    g.sample_mask = bound.4;
                     let pending = Arc::new(make::Pending::new(p.shaders.clone(), Some(Box::new(g))));
                     v.push((bound, pending.clone()));
                     pending

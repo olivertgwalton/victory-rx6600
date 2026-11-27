@@ -866,3 +866,33 @@ mod list_hints {
         assert_eq!(scratch, [0; 16]);
     }
 }
+
+/// List 0x470 `SetSampleMaskX` (GameOS `xgs12_10.dll` +0x38580: the mask's
+/// 64 bits to PA_SC_AA_MASK, 16 sample bits per pixel of a 2x2 quad).
+#[cfg(test)]
+mod sample_mask {
+    use crate::pipeline::sample_mask_of;
+
+    #[test]
+    fn one_mask_for_every_pixel_is_d3d12s() {
+        assert_eq!(sample_mask_of(u64::MAX), u32::MAX);
+        assert_eq!(sample_mask_of(0x0005_0005_0005_0005), 0xffff_0005);
+        assert_eq!(sample_mask_of(0), 0xffff_0000);
+        // Pixels disagreeing: their union.
+        assert_eq!(sample_mask_of(0x0001_0002_0004_0008), 0xffff_000f);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_list_method_sets_the_mask_native_pipelines_are_made_with() {
+        let f: extern "system" fn(*const (), u64) = {
+            let p = crate::list::NEWER_LIST_FUNCTIONS.0[0x470 / 8];
+            // SAFETY: the slot's signature.
+            unsafe { std::mem::transmute(p) }
+        };
+        f(std::ptr::null(), 0x0003_0003_0003_0003);
+        assert_eq!(crate::pipeline::noted_sample_mask(), 0xffff_0003);
+        crate::pipeline::note_sample_mask(u32::MAX);
+        assert_eq!(crate::pipeline::noted_sample_mask(), u32::MAX);
+    }
+}

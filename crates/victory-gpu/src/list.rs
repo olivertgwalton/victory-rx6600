@@ -1637,6 +1637,17 @@ pub(super) extern "system" fn set_predication(this: This, buffer: This, offset: 
     let _ = (this, buffer, offset, op);
 }
 
+/// List method 0x470, `SetSampleMaskX(mask)` (+0x38580): the sample mask
+/// of the native graphics pipelines drawn after it ([`crate::pipeline::sample_mask_of`]).
+/// shortcut: kept per recording thread as the bound targets are, and not
+/// applied to pipelines made from D3D12 descriptions, which keep their own.
+pub(super) extern "system" fn set_sample_mask(_this: This, mask: u64) {
+    #[cfg(windows)]
+    crate::pipeline::note_sample_mask(crate::pipeline::sample_mask_of(mask));
+    #[cfg(not(windows))]
+    let _ = mask;
+}
+
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
@@ -2705,7 +2716,7 @@ const fn newer_slot(slot: usize) -> usize {
 const NEWER_METHODS: [(usize, *const ()); 4] = [
     // A marker of a kind (+0x39160), as the others.
     (59, object::VOID_STUB),
-    (142, ignored_state as *const ()),
+    (142, set_sample_mask as *const ()),
     (146, barrier_groups as *const ()),
     (148, allocate_upload as *const ()),
 ];

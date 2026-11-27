@@ -1170,6 +1170,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
+        crate::pipeline::note_sample_mask(u32::MAX);
         self.pipeline = pipeline as usize;
     }
 
@@ -1423,6 +1424,7 @@ impl State {
     }
 
     pub(crate) fn replay(&mut self, list: &HostList) {
+        crate::pipeline::note_sample_mask(u32::MAX);
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
