@@ -12,6 +12,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
 
+pub mod ops;
 pub mod srb;
 pub mod sys;
 #[cfg(test)]
@@ -400,7 +401,7 @@ pub extern "system" fn XCrdCloseAdapter(adapter: *mut Adapter) -> HRESULT {
 
 /// The adapter's handle: the library reads it (a null adapter fails the
 /// check first).
-fn handle_of(adapter: *const Adapter) -> Handle {
+pub(crate) fn handle_of(adapter: *const Adapter) -> Handle {
     // SAFETY: an adapter the caller got from XCrdOpenAdapter.
     unsafe { (*adapter).handle }
 }
@@ -500,7 +501,8 @@ pub extern "system" fn XCrdCloseMetadataHandle(handle: *mut *mut Metadata, adapt
 }
 
 pub(crate) fn exports() -> Vec<HleExport> {
-    vec![
+    let mut all = ops::exports();
+    all.extend([
         hle_export!(XCrdSetTraceFlags),
         hle_export!(XCrdBuildPath),
         hle_export!(XCrdParsePath),
@@ -522,5 +524,6 @@ pub(crate) fn exports() -> Vec<HleExport> {
         hle_export!(XCrdCancelUpdate),
         hle_export!(XCrdOpenMetadataHandle),
         hle_export!(XCrdCloseMetadataHandle),
-    ]
+    ]);
+    all
 }

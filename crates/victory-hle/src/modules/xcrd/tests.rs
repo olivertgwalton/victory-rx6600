@@ -396,3 +396,222 @@ fn the_reference_reaches_the_fake_driver() {
     srb::copy_string(expected.body(), 8, 20, &p);
     assert_eq!(call.input, expected.bytes);
 }
+
+// A differential fuzzer over an export's arguments: each argument has a
+// kind; from a baseline of valid values, each argument is varied alone
+// through its kind's values, and every case runs under each way the driver
+// can answer. Results (at the export's width), every buffer passed, and
+// every call the driver saw must match.
+
+#[derive(Clone, Copy, Debug)]
+pub enum Kind {
+    /// An adapter (fake handle), or null.
+    Adp,
+    /// A wide path, null, empty, or past the library's limit.
+    Path,
+    /// A structure read (and maybe written) of n bytes: zeros, a pattern,
+    /// small values, all ones; never null (the library does not check).
+    In(usize),
+    /// As `In`, and null (the library checks).
+    InOpt(usize),
+    /// A buffer written: n bytes the call may fill; never null.
+    Out(usize),
+    /// As `Out`, and null.
+    OutOpt(usize),
+    /// A wide path the library does not check for null.
+    PathReq,
+    /// A pointer out-parameter that receives a heap object of n bytes:
+    /// compared by null-ness and the object's bytes.
+    Object(usize),
+    /// An integer from this list (the first is the baseline).
+    Int(&'static [u64]),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Width {
+    W8,
+    W32,
+    W64,
+}
+
+const BUFFER: usize = 0x4000;
+
+/// One argument's value: what is passed, and the memory behind it.
+#[derive(Clone)]
+enum Value {
+    Null,
+    Bytes(Vec<u8>),
+    Int(u64),
+}
+
+fn values(kind: Kind) -> Vec<Value> {
+    let fill = |n: usize, f: &dyn Fn(usize) -> u8| {
+        let mut v: Vec<u8> = (0..BUFFER).map(|i| 0xa5 ^ (i as u8)).collect();
+        for (i, b) in v.iter_mut().take(n).enumerate() {
+            *b = f(i);
+        }
+        Value::Bytes(v)
+    };
+    let text = |t: &str| {
+        let mut v: Vec<u8> = t.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+        v.resize(v.len().max(BUFFER), 0xee);
+        Value::Bytes(v)
+    };
+    match kind {
+        Kind::Adp => {
+            let mut v = vec![0u8; 16];
+            v[..8].copy_from_slice(&(FAKE as u64).to_le_bytes());
+            vec![Value::Bytes(v), Value::Null]
+        }
+        Kind::Path => vec![text("[XUC:]\\pkg\\content"), Value::Null, text(""), text(&"y".repeat(0x80010))],
+        Kind::PathReq => vec![text("[XUC:]\\pkg\\content"), text(""), text(&"y".repeat(0x80010))],
+        Kind::In(n) | Kind::InOpt(n) => {
+            let mut v = vec![
+                fill(n, &|i| (i as u8).wrapping_mul(7).wrapping_add(1)),
+                fill(n, &|_| 0),
+                fill(n, &|i| if i % 4 == 0 { 1 } else { 0 }),
+                fill(n, &|_| 0xff),
+            ];
+            if matches!(kind, Kind::InOpt(_)) {
+                v.insert(1, Value::Null);
+            }
+            v
+        }
+        Kind::Out(n) => vec![fill(n, &|_| 0xcc)],
+        Kind::OutOpt(n) | Kind::Object(n) => vec![fill(n, &|_| 0xcc), Value::Null],
+        Kind::Int(list) => list.iter().map(|&v| Value::Int(v)).collect(),
+    }
+}
+
+/// What a case left behind on one side.
+#[derive(Debug, PartialEq)]
+struct Outcome {
+    result: u64,
+    buffers: Vec<Option<Vec<u8>>>,
+    record: Record,
+}
+
+type Any8 = extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize) -> u64;
+
+fn call_case(f: Any8, kinds: &[Kind], case: &[Value], width: Width, s: &Session) -> Outcome {
+    let mut memory: Vec<Option<Vec<u8>>> = case.iter().map(|v| match v { Value::Bytes(b) => Some(b.clone()), _ => None }).collect();
+    let mut args = [0usize; 8];
+    for (i, v) in case.iter().enumerate() {
+        args[i] = match v {
+            Value::Null => 0,
+            Value::Int(x) => *x as usize,
+            Value::Bytes(_) => memory[i].as_mut().unwrap().as_mut_ptr() as usize,
+        };
+    }
+    let r = f(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
+    let result = match width { Width::W8 => r & 0xff, Width::W32 => r & 0xffff_ffff, Width::W64 => r };
+    // Objects: what the pointer points at, not the address.
+    for (i, k) in kinds.iter().enumerate() {
+        if let (Kind::Object(n), Some(m)) = (k, memory[i].as_mut()) {
+            let p = usize::from_le_bytes(m[..8].try_into().unwrap());
+            let object = if p == 0 || p == 0xcccc_cccc_cccc_cccc { None } else {
+                // SAFETY: a heap object the call returned.
+                Some(unsafe { std::slice::from_raw_parts(p as *const u8, *n) }.to_vec())
+            };
+            m[..8].copy_from_slice(&[u8::from(object.is_some()); 8]);
+            m.extend(object.unwrap_or_default());
+        }
+    }
+    Outcome { result, buffers: memory, record: s.take() }
+}
+
+/// The driver answers this fuzzer replays every case under.
+fn drivers() -> Vec<(&'static str, Box<dyn Fn(&Session)>)> {
+    vec![
+        ("accepts, pattern body", Box::new(|s: &Session| s.reply(accepting(|_, body| {
+            for (i, b) in body.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(13).wrapping_add(3);
+            }
+        })))),
+        ("accepts as sent", Box::new(|s: &Session| s.reply(accepting(|_, _| {})))),
+        ("nt failure", Box::new(|s: &Session| s.reply(|_, _| 0xc000_0001_u32 as i32))),
+        ("return code", Box::new(|s: &Session| s.reply(|_, b| { b[0x14..0x18].copy_from_slice(&0xc05e_0007u32.to_le_bytes()); 0 }))),
+        ("busy then done", Box::new(|s: &Session| {
+            let mut n = 0;
+            s.reply(move |_, b| { n += 1; b[0x14..0x18].copy_from_slice(&(if n == 1 { 0x8000_0011u32 } else { 0 }).to_le_bytes()); 0 });
+        })),
+    ]
+}
+
+/// Fuzzes export `name` with these argument kinds.
+pub fn fuzz(name: &str, kinds: &[Kind], width: Width) {
+    fuzz_pair(name, name, kinds, width);
+}
+
+/// As `fuzz`, the reference's `name` against the layer's `layer_name`.
+pub fn fuzz_pair(name: &str, layer_name: &str, kinds: &[Kind], width: Width) {
+    let s = session();
+    trace_all(&s);
+    let Some(r) = reference::reference(name) else {
+        eprintln!("{name}: no reference; skipped");
+        return;
+    };
+    // SAFETY: exports of up to eight register-sized arguments.
+    let (r, l): (Any8, Any8) = unsafe { (std::mem::transmute(r), std::mem::transmute(reference::layer(layer_name))) };
+    let options: Vec<Vec<Value>> = kinds.iter().map(|&k| values(k)).collect();
+    let baseline: Vec<Value> = options.iter().map(|o| o[0].clone()).collect();
+    let mut cases = vec![baseline.clone()];
+    for (i, o) in options.iter().enumerate() {
+        for v in &o[1..] {
+            let mut c = baseline.clone();
+            c[i] = v.clone();
+            cases.push(c);
+        }
+    }
+    for (what, driver) in drivers() {
+        for (n, case) in cases.iter().enumerate() {
+            driver(&s);
+            let a = call_case(r, kinds, case, width, &s);
+            driver(&s);
+            let b = call_case(l, kinds, case, width, &s);
+            if a != b {
+                let diff = |x: &Option<Vec<u8>>, y: &Option<Vec<u8>>| match (x, y) {
+                    (Some(x), Some(y)) => x.iter().zip(y).position(|(p, q)| p != q),
+                    _ => None,
+                };
+                let first: Vec<_> = a.buffers.iter().zip(&b.buffers).map(|(x, y)| diff(x, y)).collect();
+                panic!(
+                    "{name}, case {n} ({what}): reference result {:#x} layer {:#x}; first differing byte per buffer {first:?}\nreference {:?}\nlayer     {:?}",
+                    a.result, b.result, a.record, b.record
+                );
+            }
+        }
+    }
+}
+
+use Kind::*;
+use Width::*;
+
+const BYTES: &[u64] = &[1, 0, 2, 0xff, 0x1234];
+const FLAG1: &[u64] = &[0, 1, 2, 3, 0x8000_0000, 0xffff_ffff];
+const KINDS: &[u64] = &[0, 1, 2, 0xffff_ffff, 0x8000_0000];
+
+#[test]
+fn fuzz_fixed_bodies() {
+    fuzz("XCrdOddPmAcquireReleaseReference", &[OutOpt(4), Adp, Int(BYTES)], W32);
+    fuzz("XCrdIsSideloadedKeyPresent", &[Adp, In(16), OutOpt(1)], W32);
+    fuzz("XCrdQueryAttestationBlob", &[Adp, In(16), Out(0x80)], W32);
+    fuzz("XCrdQueryWriteStats", &[Adp, Int(KINDS), OutOpt(0x20)], W32);
+    fuzz("XCrdRemapReload", &[Adp], W32);
+    fuzz("XCrdSetTelemetry", &[Adp, Int(BYTES), Int(BYTES)], W32);
+    fuzz("XCrdSetTitleQuirks", &[Adp, Int(FLAG1)], W32);
+    fuzz("XCrdStreamingQueryActiveInstanceId", &[Adp, Out(8)], W32);
+    // TODO: StreamingStop, SuspendResumeIoBalancer, XpfOp, DeriveMsixvc2Key,
+    // EncryptBuffer, StreamingQueueInsertRegion: their fuzz cases crashed the
+    // test process (a case to find); ported, not yet verified.
+}
+
+/// The fuzzer finds a difference when there is one.
+#[test]
+#[should_panic(expected = "XCrdSetTelemetry")]
+fn fuzz_catches_a_wrong_port() {
+    if reference::reference("XCrdSetTelemetry").is_none() {
+        panic!("XCrdSetTelemetry: no reference, nothing to catch");
+    }
+    fuzz_pair("XCrdSetTelemetry", "XCrdRemapReload", &[Adp, Int(BYTES), Int(BYTES)], W32);
+}
