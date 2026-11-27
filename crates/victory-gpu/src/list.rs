@@ -1354,6 +1354,27 @@ extern "system" fn resolve(
     let _ = (this, dst, dst_sub, src, src_sub, format);
 }
 
+/// List method 0x58 `ClearState(pipeline)` (GameOS `xgs12_10.dll` +0x5db90,
+/// named by its debug build): the host list's state cleared and the title's
+/// as a new list's ([`crate::draw::State::clear_state`]).
+pub(super) extern "system" fn clear_state(this: This, pipeline: This) {
+    #[cfg(windows)]
+    with_state(this, |host, state| {
+        // SAFETY: an open list.
+        unsafe { host.list.ClearState(None) };
+        state.clear_state(pipeline);
+    });
+    crate::pipeline::bound(pipeline);
+}
+
+/// The title's state of a list (tests).
+#[cfg(all(test, windows))]
+pub(crate) fn state_of(this: This) -> Option<(u32, bool, Option<u32>)> {
+    let mut out = None;
+    with_state(this, |_, s| out = Some(s.topology_and_stencil()));
+    out
+}
+
 /// What the host steps of the methods below were given, last first (tests).
 #[cfg(test)]
 pub(crate) static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -2737,13 +2758,14 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 83] = [
+const METHODS: [(usize, *const ()); 84] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
     (8, list_type as *const ()),                  // 0x40
     (9, close as *const ()),                      // 0x48
     (10, reset as *const ()),                     // 0x50
+    (11, clear_state as *const ()),               // 0x58 ClearState
     (12, state::draw as *const ()),               // 0x60 instanced
     (13, state::draw_indexed as *const ()),       // 0x68 indexed
     (14, state::dispatch as *const ()),           // 0x70
@@ -3051,5 +3073,30 @@ mod uav_clear_on_the_card {
         assert!(words.iter().all(|&w| w == 0xdead_beef), "{words:x?}");
         let words = cleared([1.5f32.to_bits(), 0, 0, 0], true, DXGI_FORMAT_R32_FLOAT).unwrap();
         assert!(words.iter().all(|&w| w == 1.5f32.to_bits()), "{words:x?}");
+    }
+}
+
+/// List 0x58 ClearState on a list with a host list: the stencil reference
+/// and topology set before are a new list's after.
+#[cfg(all(test, windows))]
+mod clear_state_test {
+    use super::*;
+
+    #[test]
+    fn clear_state_forgets_what_the_title_set() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        if host_list(list).is_none() {
+            eprintln!("no host GPU here: ClearState not checked");
+            return;
+        }
+        state::stencil_ref(list, 7);
+        state::topology(list, 4);
+        assert_eq!(state_of(list), Some((4, true, Some(7))));
+        clear_state(list, null);
+        assert_eq!(state_of(list), Some((0, false, None)));
     }
 }

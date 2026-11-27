@@ -438,6 +438,7 @@ plain! {
     DISPATCH_MESH_X dispatch_mesh_x = state::dispatch_mesh_x, (x: u32, flags: u64, indirect: u64, payload: u64);
     COPY_BUFFER copy_buffer_region = super::copy_buffer_region, (dst: This, dst_offset: u64, src: This, src_offset: u64, len: u64);
     COPY_RESOURCE copy_resource = super::copy_resource, (dst: This, src: This);
+    CLEAR_STATE clear_state = super::clear_state, (pipeline: This);
     SAMPLE_MASK set_sample_mask = super::set_sample_mask, (mask: u64);
     SET_PREDICATION set_predication = super::set_predication, (buffer: This, offset: u64, op: u32);
     COPY_RESOURCE_X copy_resource_x = super::copy_resource_x, (dst: This, src: This, flags: u32);
@@ -923,9 +924,10 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     f
 }
 
-const MINE: [(usize, *const ()); 66] = [
+const MINE: [(usize, *const ()); 67] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
+    (11, clear_state as *const ()),
     (12, draw as *const ()),
     (13, draw_indexed as *const ()),
     (14, dispatch as *const ()),

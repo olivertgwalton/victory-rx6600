@@ -1417,6 +1417,33 @@ impl State {
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
+    /// `ClearState(pipeline)`: what the title set goes back to a new list's
+    /// (no heaps, root arguments, buffers, targets, viewports, scissors;
+    /// default blend factor, stencil reference and depth bounds; the given
+    /// pipeline), what the list keeps for itself (its tables, slots and
+    /// host bookkeeping) stays, and the host's bindings are given again.
+    pub(crate) fn clear_state(&mut self, pipeline: This) {
+        let mut fresh = State::default();
+        macro_rules! reset {
+            ($($f:ident)*) => { $(std::mem::swap(&mut self.$f, &mut fresh.$f);)* };
+        }
+        reset!(heaps graphics compute vertex index targets depth depth_state topology topology_set
+            target_handles depth_handle targets_set host_targets viewports scissors blend stencil depth_bounds);
+        self.pipeline = pipeline as usize;
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        self.host_heaps_set = false;
+        self.sets.forget_all();
+        crate::pipeline::note_sample_mask(u32::MAX);
+    }
+
+    /// The title's topology and stencil reference as set (tests).
+    #[cfg(test)]
+    pub(crate) fn topology_and_stencil(&self) -> (u32, bool, Option<u32>) {
+        (self.topology, self.topology_set, self.stencil)
+    }
+
     /// Something of ours bound its own heaps on the list (a UAV clear):
     /// the next draw binds the title's again.
     pub(crate) fn heaps_changed(&mut self) {
