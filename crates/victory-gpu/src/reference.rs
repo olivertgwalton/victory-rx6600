@@ -461,3 +461,89 @@ mod x_methods {
         let _ = object::ignore;
     }
 }
+
+/// Timings of the D3D12 paths the title calls most, through the layer's
+/// tables. Run by hand in a release build:
+/// `cargo test --release -p victory-gpu --lib bench_d3d12 -- --ignored --nocapture`.
+#[cfg(test)]
+mod bench_d3d12 {
+    use crate::object::{Iid, S_OK, This, slot};
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    fn report(what: &str, n: usize, f: impl FnMut(usize)) {
+        let mut f = f;
+        let mut samples = [0.0f64; 5];
+        for s in &mut samples {
+            let start = Instant::now();
+            for i in 0..n {
+                f(i);
+            }
+            *s = start.elapsed().as_secs_f64() * 1e9 / n as f64;
+        }
+        samples.sort_by(f64::total_cmp);
+        println!("{what:44} {:9.1} ns/call (median of 5 x {n})", samples[2]);
+    }
+
+    #[test]
+    #[ignore = "benchmark: run by hand, in a release build"]
+    fn bench_d3d12_descriptor_views() {
+        let d = crate::device::device();
+        let cbv = slot::<extern "system" fn(This, *const [u32; 4], u64)>(d, 0x88);
+        let srv = slot::<extern "system" fn(This, This, *const [u32; 10], u64)>(d, 0x90);
+        let mut slots = vec![[0u64; 4]; 4096];
+        let base = slots.as_mut_ptr() as u64;
+        report("device 0x88 CreateConstantBufferView", 1 << 20, |i| {
+            let desc = [0x1000_0000u32 + ((i as u32 & 1023) << 8), 0x2, 256, 0];
+            cbv(d, &desc, base + 32 * (i as u64 & 4095));
+        });
+        let desc = [28u32, 4, 0x1688, 0, 1, 0, 0, 0, 0, 0];
+        report("device 0x90 CreateShaderResourceView", 1 << 20, |i| {
+            srv(d, (0x5000_0000 + (i & 255) * 0x100) as This, &desc, base + 32 * (i as u64 & 4095));
+        });
+        black_box(&slots);
+    }
+
+    #[test]
+    #[ignore = "benchmark: run by hand, in a release build"]
+    fn bench_d3d12_private_data() {
+        let mut fence = std::ptr::null();
+        assert_eq!(crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence), S_OK);
+        let set = slot::<extern "system" fn(This, *const Iid, u32, *const u8) -> i32>(fence, 0x20);
+        let get = slot::<extern "system" fn(This, *const Iid, *mut u32, *mut u8) -> i32>(fence, 0x18);
+        let id: Iid = [9; 16];
+        set(fence, &id, 8, [1u8; 8].as_ptr());
+        let mut out = [0u8; 8];
+        report("GetPrivateData (8 bytes)", 1 << 20, |_| {
+            let mut size = 8;
+            black_box(get(fence, &id, &mut size, out.as_mut_ptr()));
+        });
+        report("SetPrivateData (8 bytes)", 1 << 20, |i| {
+            black_box(set(fence, &id, 8, (i as u64).to_le_bytes().as_ptr()));
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "benchmark: run by hand, in a release build"]
+    fn bench_d3d12_pipeline_variants() {
+        let regs: Vec<u8> = {
+            let mut w = vec![0u32; 0x184 / 4];
+            w[31] = 0x00cc_0010;
+            w.iter().flat_map(|x| x.to_le_bytes()).collect()
+        };
+        let mut base: This = std::ptr::null();
+        let iid = crate::pipeline::PIPELINE_IIDS[0];
+        assert_eq!(crate::pipeline::hand_out_native_graphics(Vec::new(), regs, vec![0; 0x60], &iid, &mut base), S_OK);
+        let d = crate::device::device();
+        let f = slot::<extern "system" fn(This, This, u32, *const u8, *const Iid, *mut This) -> i32>(d, 0x1b8);
+        let mut records = vec![0u8; 2 * crate::pipeline::variant::RECORD];
+        records[crate::pipeline::variant::RECORD..][..4].copy_from_slice(&2u32.to_le_bytes());
+        report("device 0x1b8 pipeline variant (kinds 0, 2) + release", 1 << 14, |_| {
+            let mut v: This = std::ptr::null();
+            assert_eq!(f(d, base, 2, records.as_ptr(), &iid, &mut v), S_OK);
+            let release = slot::<extern "system" fn(This) -> u32>(v, 0x10);
+            black_box(release(v));
+        });
+    }
+}

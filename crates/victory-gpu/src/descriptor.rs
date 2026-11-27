@@ -1051,7 +1051,7 @@ const DSV_TAG: u32 = u32::from_le_bytes(*b"vDSV");
 
 /// A shader view or sampler as the title described it (descriptions in the
 /// host's layout, kept as words), for the host to build its own from.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum View {
     /// Constant buffer: GPU address and size.
     Constant(u64, u32),
@@ -1111,7 +1111,9 @@ impl View {
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
-    index: std::collections::BTreeMap<View, u32>,
+    /// Looked up on every view written: hashed (an ordered tree compared
+    /// views word by word down its depth, 4% of a descriptor benchmark).
+    index: std::collections::HashMap<View, u32, std::hash::BuildHasherDefault<WordHasher>>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
     free: Vec<u32>,
@@ -1120,13 +1122,44 @@ struct Views {
     shape_index: std::collections::BTreeMap<Shape, u32>,
 }
 
+/// A hasher for views, which are a few machine words: a multiply and a
+/// rotate a word (as rustc's FxHasher), no SipHash rounds. Not resistant to
+/// chosen inputs, which titles' descriptors are not.
+#[derive(Default)]
+pub(crate) struct WordHasher(u64);
+
+impl std::hash::Hasher for WordHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut w = [0u8; 8];
+            w[..chunk.len()].copy_from_slice(chunk);
+            self.write_u64(u64::from_le_bytes(w));
+        }
+    }
+    fn write_u64(&mut self, w: u64) {
+        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x51_7cc1_b727_220a95);
+    }
+    fn write_u32(&mut self, w: u32) {
+        self.write_u64(u64::from(w));
+    }
+    fn write_usize(&mut self, w: usize) {
+        self.write_u64(w as u64);
+    }
+    fn write_u8(&mut self, w: u8) {
+        self.write_u64(u64::from(w));
+    }
+}
+
 /// Read far more often than written: every slot a draw reads through a
 /// table is looked up here, on several recording threads at once in the
 /// world. Readers share it; only a view not seen before (a new table entry
 /// or shape) and a released resource take it alone.
 static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
-    index: std::collections::BTreeMap::new(),
+    index: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
     shapes: Vec::new(),

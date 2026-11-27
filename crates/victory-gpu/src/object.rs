@@ -259,7 +259,17 @@ extern "system" fn set_private_data(
         } else {
             // SAFETY: the title passes `size` bytes.
             let value = unsafe { std::slice::from_raw_parts(data, size as usize) };
-            map.insert((this as usize, id), value.to_vec())
+            match map.get_mut(&(this as usize, id)) {
+                // Written again: into the entry's own buffer, without an
+                // allocation (36.8 -> 11.0 ns, crate::reference::bench_d3d12),
+                // unless it held an interface, whose reference goes.
+                Some(old) if INTERFACE_COUNT.load(Ordering::Acquire) == 0 => {
+                    old.clear();
+                    old.extend_from_slice(value);
+                    None
+                }
+                _ => map.insert((this as usize, id), value.to_vec()),
+            }
         }
     };
     if let Some(old) = old {
