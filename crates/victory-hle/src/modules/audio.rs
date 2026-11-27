@@ -1135,6 +1135,18 @@ const LOAD_FLOWGRAPH: u32 = 1;
 const REGISTER_MESSAGES: u32 = 2;
 const UNREGISTER_MESSAGES: u32 = 3;
 
+/// The interface's own errors (AcpHal.dll 0x1800029a0, 0x180002e70,
+/// 0x180003130).
+const ALREADY_CONNECTED: HRESULT = 0x8AC8_0009_u32 as i32;
+const NOT_CONNECTED: HRESULT = 0x8AC8_000A_u32 as i32;
+const SUBMIT_UNCONNECTED: HRESULT = 0x8000_000E_u32 as i32;
+const E_UNEXPECTED: HRESULT = 0x8000_FFFF_u32 as i32;
+/// Interfaces the device takes at once.
+const INTERFACES: u32 = 4;
+/// The highest command kind; 4 is the one that carries no data.
+const LAST_COMMAND: u32 = 27;
+const NO_DATA_COMMAND: u32 = 4;
+
 const FLOWGRAPH_COMPLETED: u32 = 0x02;
 const COMMAND_COMPLETED: u32 = 0x10;
 const DISCONNECTED: u32 = 0x80;
@@ -1153,6 +1165,11 @@ struct Message {
 
 struct State {
     connected: bool,
+    /// The command ring, its completion words and the message ring, in
+    /// heap 1 (offsets of their blocks), and the counts they were sized
+    /// for.
+    rings: [Option<u32>; 3],
+    sized: (u32, u32),
     /// Message kinds the title registered for.
     mask: u32,
     messages: VecDeque<Message>,
@@ -1226,14 +1243,60 @@ fn state(this: *mut Acp) -> MutexGuard<'static, State> {
     lock(unsafe { &(*this).state })
 }
 
+/// Connects with rings for `commands` commands and `messages` messages,
+/// taken from heap 1 as the console takes them (256 bytes per command, 12
+/// per command for completions, 256 per message), kept across a
+/// reconnection with the same counts.
 extern "system" fn connect(this: *mut Acp, commands: u32, messages: u32) -> HRESULT {
+    let mut state = state(this);
+    if state.connected {
+        return ALREADY_CONNECTED;
+    }
     if commands == 0 {
         return E_INVALIDARG;
     }
-    let mut state = state(this);
-    if !state.connected {
-        device().connected += 1;
+    let mut device = device();
+    let heaps = match device.open() {
+        Ok(h) => h,
+        Err(e) => return e,
+    };
+    let heap = &mut heaps[0];
+    let mut free = |offset: &mut Option<u32>| {
+        if let Some(o) = offset.take() {
+            heap.give_back(o);
+        }
+    };
+    if state.rings[0].is_none() || state.sized.0 != commands {
+        free(&mut state.rings[0]);
+        free(&mut state.rings[1]);
     }
+    if state.rings[2].is_none() || state.sized.1 != messages {
+        free(&mut state.rings[2]);
+    }
+    let sizes = [commands.checked_mul(256), commands.checked_mul(12), messages.checked_mul(256)];
+    let mut failed = false;
+    for (ring, size) in state.rings.iter_mut().zip(sizes) {
+        match size {
+            Some(0) => {}
+            Some(size) if ring.is_none() => match heaps[0].take(size, 256) {
+                Some(o) => *ring = Some(o),
+                None => failed = true,
+            },
+            Some(_) => {}
+            None => failed = true,
+        }
+    }
+    if failed || device.connected >= INTERFACES {
+        let heap = &mut device.heaps.as_mut().expect("opened above")[0];
+        for ring in &mut state.rings {
+            if let Some(o) = ring.take() {
+                heap.give_back(o);
+            }
+        }
+        return if failed { E_OUTOFMEMORY } else { E_UNEXPECTED };
+    }
+    device.connected += 1;
+    state.sized = (commands, messages);
     state.connected = true;
     state.capacity = messages as usize;
     S_OK
@@ -1242,7 +1305,7 @@ extern "system" fn connect(this: *mut Acp, commands: u32, messages: u32) -> HRES
 extern "system" fn disconnect(this: *mut Acp) -> HRESULT {
     let mut state = state(this);
     if !state.connected {
-        return E_FAIL;
+        return NOT_CONNECTED;
     }
     state.post(DISCONNECTED, &[]);
     state.connected = false;
@@ -1263,6 +1326,14 @@ extern "system" fn submit(
     notification: u32,
 ) -> HRESULT {
     static SEEN: Mutex<u64> = Mutex::new(0);
+    if !state(this).connected {
+        return SUBMIT_UNCONNECTED;
+    }
+    if (data.is_null() && command != NO_DATA_COMMAND)
+        || (!data.is_null() && (command == NO_DATA_COMMAND || !(1..=LAST_COMMAND).contains(&command)))
+    {
+        return E_INVALIDARG;
+    }
     if command < 64 && *lock(&SEEN) & 1 << command == 0 {
         *lock(&SEEN) |= 1 << command;
         tracing::info!(command, "first coprocessor command of this kind");
@@ -1301,14 +1372,16 @@ extern "system" fn submit(
     S_OK
 }
 
+/// The oldest message, if there is one and room for it.
 extern "system" fn pop_message(this: *mut Acp, out: *mut Message) -> bool {
+    if out.is_null() {
+        return false;
+    }
     let Some(message) = state(this).messages.pop_front() else {
         return false;
     };
-    if !out.is_null() {
-        // SAFETY: the title passes room for one message.
-        unsafe { out.write_unaligned(message) };
-    }
+    // SAFETY: the title passes room for one message.
+    unsafe { out.write_unaligned(message) };
     true
 }
 
@@ -1316,7 +1389,21 @@ extern "system" fn message_count(this: *mut Acp) -> u32 {
     state(this).messages.len() as u32
 }
 
+/// Disconnects if connected, gives back the rings and frees the object.
 extern "system" fn release(this: *mut Acp) {
+    let _ = disconnect(this);
+    let rings = std::mem::take(&mut state(this).rings);
+    let mut device = device();
+    if let Some(heaps) = device.heaps.as_mut() {
+        for o in rings.into_iter().flatten() {
+            heaps[0].give_back(o);
+        }
+    }
+    let reset = device.close_if_idle();
+    drop(device);
+    if reset {
+        reset_xma();
+    }
     // SAFETY: made by `AcpHalCreate` with `Box::into_raw`; released once.
     drop(unsafe { Box::from_raw(this) });
 }
@@ -1329,6 +1416,8 @@ pub extern "system" fn AcpHalCreate(out: *mut *mut Acp) -> HRESULT {
         vtable: &ACP_METHODS,
         state: Mutex::new(State {
             connected: false,
+            rings: [None; 3],
+            sized: (0, 0),
             mask: 0,
             messages: VecDeque::new(),
             capacity: 0,
@@ -1509,6 +1598,60 @@ mod tests {
         }
     }
 
+    /// The interface as AcpHal.dll's methods check it (connect
+    /// 0x1800029a0, disconnect 0x180002e70, submit 0x180003130, pop
+    /// 0x180003060, release via 0x180002854).
+    #[test]
+    fn interface_rules_as_the_console() {
+        let _serial = fresh();
+        let mut acps = [std::ptr::null_mut(); 5];
+        for a in &mut acps {
+            assert_eq!(AcpHalCreate(a), S_OK);
+        }
+        assert_eq!(AcpHalCreate(std::ptr::null_mut()), E_INVALIDARG);
+        let acp = acps[0];
+        // SAFETY: just created.
+        let m = unsafe { (*acp).vtable };
+        let word = 0u32;
+        let data = (&raw const word).cast();
+        assert_eq!((m.disconnect)(acp), NOT_CONNECTED);
+        assert_eq!((m.submit)(acp, REGISTER_MESSAGES, 0, 0, data, 0), SUBMIT_UNCONNECTED);
+        assert_eq!((m.connect)(acp, 0, 4), E_INVALIDARG);
+        assert_eq!((m.connect)(acp, 4, 2), S_OK);
+        assert_eq!((m.connect)(acp, 4, 2), ALREADY_CONNECTED);
+        // Rings in heap 1: 4 x 256, 4 x 12 (raised to 256) and 2 x 256
+        // bytes, after the device's own three blocks.
+        let s = state(1);
+        assert_eq!((s.blocks, s.used - 0x1200), (6, 0x400 + 0x100 + 0x200));
+        // Data rules: only command 4 goes without, kinds 1-27.
+        assert_eq!((m.submit)(acp, REGISTER_MESSAGES, 0, 0, std::ptr::null(), 0), E_INVALIDARG);
+        assert_eq!((m.submit)(acp, NO_DATA_COMMAND, 0, 0, data, 0), E_INVALIDARG);
+        assert_eq!((m.submit)(acp, NO_DATA_COMMAND, 0, 0, std::ptr::null(), 0), S_OK);
+        assert_eq!((m.submit)(acp, 0, 0, 0, data, 0), E_INVALIDARG);
+        assert_eq!((m.submit)(acp, LAST_COMMAND + 1, 0, 0, data, 0), E_INVALIDARG);
+        assert_eq!((m.submit)(acp, LAST_COMMAND, 7, 0, data, 0), S_OK);
+        // A null output pops nothing.
+        let mask = u32::MAX;
+        assert_eq!((m.submit)(acp, REGISTER_MESSAGES, 9, 0, (&raw const mask).cast(), 0), S_OK);
+        assert_eq!((m.message_count)(acp), 1);
+        assert!(!(m.pop_message)(acp, std::ptr::null_mut()));
+        assert_eq!((m.message_count)(acp), 1);
+        // Four interfaces at once, not five.
+        for &other in &acps[1..4] {
+            // SAFETY: created above.
+            assert_eq!(unsafe { ((*other).vtable.connect)(other, 1, 0) }, S_OK);
+        }
+        // SAFETY: as above.
+        assert_eq!(unsafe { ((*acps[4]).vtable.connect)(acps[4], 1, 0) }, E_UNEXPECTED);
+        // Releasing disconnects and gives the rings back; with nothing
+        // left the device closes.
+        for a in acps {
+            // SAFETY: created above, released once.
+            unsafe { ((*a).vtable.release)(a) };
+        }
+        assert_eq!(ApuHeapGetState(&mut HeapState::default(), 1), NO_HEAP);
+    }
+
     /// Context requests as AcpHalAllocateShapeContexts (0x180003428)
     /// checks and sizes them.
     #[test]
@@ -1545,7 +1688,7 @@ mod tests {
         // A second request frees the first and fails.
         assert_eq!(AcpHalAllocateShapeContexts(&mut r), CONTEXTS_ALLOCATED);
         assert_eq!(AcpHalReleaseShapeContexts(), NO_CONTEXTS);
-        assert_eq!(AcpHalAllocateShapeContexts(&mut request([0; 6])), S_OK);
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request([1, 0, 0, 0, 1, 0])), S_OK);
         // Release refuses while an interface is connected.
         let mut acp = std::ptr::null_mut();
         assert_eq!(AcpHalCreate(&mut acp), S_OK);
@@ -1952,8 +2095,10 @@ mod tests {
             ),
             S_OK
         );
+        // Command 12 carries 12 bytes.
+        let payload = [0u32; 3];
         for id in 1..=4 {
-            assert_eq!((m.submit)(acp, 12, id, u32::MAX, std::ptr::null(), 0), S_OK);
+            assert_eq!((m.submit)(acp, 12, id, u32::MAX, payload.as_ptr().cast(), 0), S_OK);
         }
         assert_eq!((m.message_count)(acp), 2);
         let mut message = Message {
@@ -1963,7 +2108,7 @@ mod tests {
             data: [0; 16],
         };
         assert!((m.pop_message)(acp, &mut message) && (m.pop_message)(acp, &mut message));
-        assert_eq!((m.submit)(acp, 12, 5, u32::MAX, std::ptr::null(), 0), S_OK);
+        assert_eq!((m.submit)(acp, 12, 5, u32::MAX, payload.as_ptr().cast(), 0), S_OK);
         assert!((m.pop_message)(acp, &mut message));
         let dropped = message.dropped;
         assert_eq!(dropped, 2);
