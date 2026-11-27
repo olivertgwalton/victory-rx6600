@@ -372,6 +372,22 @@ fn core_bench() {
             &mut before,
         ));
     });
+    // Overrides that only add checks in front of the host: the cost of the checks.
+    let (mut variable, mut lock) = (0usize, 0usize);
+    let host_sleep = host!("kernel32.dll", "SleepConditionVariableSRW": extern "system" fn(*mut c_void, *mut c_void, u32, u32) -> i32);
+    bench("SleepConditionVariableSRW 0 ms (host)", 200_000, || {
+        black_box(host_sleep((&raw mut variable).cast(), (&raw mut lock).cast(), 0, 0));
+    });
+    bench("SleepConditionVariableSRW 0 ms (ours)", 200_000, || {
+        black_box(super::synch::SleepConditionVariableSRW((&raw mut variable).cast(), (&raw mut lock).cast(), 0, 0));
+    });
+    let host_local = host!("kernel32.dll", "LocalAlloc": extern "system" fn(u32, usize) -> *mut c_void);
+    let free = |p: *mut c_void| {
+        // SAFETY: ours.
+        unsafe { windows_sys::Win32::Foundation::LocalFree(p) };
+    };
+    bench("LocalAlloc+LocalFree (host)", 200_000, || free(host_local(0, 64)));
+    bench("LocalAlloc+LocalFree (ours)", 200_000, || free(super::synch::LocalAlloc(0, 64)));
     extern "system" fn nothing(_: *mut c_void) -> u32 {
         0
     }
