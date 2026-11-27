@@ -881,7 +881,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     f
 }
 
-const MINE: [(usize, *const ()); 62] = [
+const MINE: [(usize, *const ()); 64] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
     (12, draw as *const ()),
@@ -918,6 +918,8 @@ const MINE: [(usize, *const ()); 62] = [
     (50, targets as *const ()),
     (51, clear_dsv as *const ()),
     (52, clear_rtv as *const ()),
+    (107, depth_bounds as *const ()),
+    (104, scissors as *const ()),
     (61, fill32 as *const ()),
     (62, fill64 as *const ()),
     (63, fill128 as *const ()),

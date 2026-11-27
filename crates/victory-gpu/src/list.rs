@@ -2578,7 +2578,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 79] = [
+const METHODS: [(usize, *const ()); 81] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -2655,6 +2655,11 @@ const METHODS: [(usize, *const ()); 79] = [
     (139, object::VOID_STUB), // 0x468 SetShaderScratchSpaceX (+0x38870): translated shaders keep their scratch
     (143, object::VOID_STUB), // 0x488 SetComputeShaderLaunchParametersX (+0x38820): wave launch tuning
     (68, state::depth_bounds as *const ()),       // 0x220 depth bounds
+    // OMSetDepthBounds (D3D12's List1; GameOS xgs12_10.dll +0x38110, the
+    // debug build validating it as OMSetDepthBoundsX) and a second
+    // RSSetScissorRects entry (+0x5dd30, the same validation).
+    (107, state::depth_bounds as *const ()),      // 0x368
+    (104, state::scissors as *const ()),          // 0x350
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait_value as *const ()),                // 0x238, 32 bits
