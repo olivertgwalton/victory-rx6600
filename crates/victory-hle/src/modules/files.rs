@@ -461,6 +461,16 @@ pub extern "system" fn FindFirstFileExW(
     filter: *mut c_void,
     flags: u32,
 ) -> Handle {
+    // KernelBase +0x70d70: an info level or search op past the two there
+    // are, or flags beyond case-sensitive/large-fetch/on-disk (7), fail
+    // before the path is looked at: `ERROR_NOT_SUPPORTED` for "limit to
+    // devices" (2), else `ERROR_INVALID_PARAMETER` (Wine takes any flags).
+    if level >= 2 || search >= 2 || flags & !7 != 0 {
+        let code = if search == 2 { 50 } else { 87 };
+        // SAFETY: plain call.
+        unsafe { windows_sys::Win32::Foundation::SetLastError(code) };
+        return -1isize as Handle;
+    }
     let p = wide(path);
     host!("kernel32.dll", "FindFirstFileExW": extern "system" fn(*const u16, i32, *mut c_void, i32, *mut c_void, u32) -> Handle)(
         p.ptr(),
@@ -767,6 +777,20 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KernelBase +0x70d70: bad levels, search ops and flags fail first
+    /// (Wine accepted flag 0x10), "limit to devices" as not supported.
+    #[test]
+    fn directory_searches_check_their_arguments_first() {
+        let path: Vec<u16> = "C:\\*".encode_utf16().chain(Some(0)).collect();
+        let mut data = [0u8; 600];
+        let last = || unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        let null = std::ptr::null_mut();
+        for (level, search, flags, code) in [(2, 0, 0, 87), (0, 3, 0, 87), (0, 0, 0x10, 87), (0, 2, 0, 50), (2, 2, 0, 50)] {
+            let h = FindFirstFileExW(path.as_ptr(), level, data.as_mut_ptr().cast(), search, null, flags);
+            assert_eq!((h as isize, last()), (-1, code), "{level} {search} {flags:#x}");
+        }
+    }
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().chain([0]).collect()

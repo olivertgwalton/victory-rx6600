@@ -34,6 +34,8 @@ pub mod rpcrt4;
 pub mod speech;
 pub mod storage;
 #[cfg(windows)]
+pub mod synch;
+#[cfg(windows)]
 pub mod threads;
 pub mod xasync;
 pub mod xg;
@@ -80,6 +82,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(com::module());
     #[cfg(windows)]
     all.push(threads::module());
+    #[cfg(windows)]
+    all.push(synch::module());
     #[cfg(windows)]
     all.push(xsystem::module());
     all
