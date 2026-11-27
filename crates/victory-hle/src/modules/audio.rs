@@ -106,6 +106,9 @@ struct Arena {
     state: HeapState,
     /// The start of the block counted as the largest free one.
     largest: Option<u32>,
+    /// The largest padding any block has had: how far past its end a
+    /// block in use can still claim addresses (see `claims`).
+    most_pad: u32,
 }
 
 impl Arena {
@@ -131,6 +134,7 @@ impl Arena {
                 ..HeapState::default()
             },
             largest: Some(0),
+            most_pad: 0,
         })
     }
 
@@ -182,6 +186,7 @@ impl Arena {
             );
         }
         let user = block.start + pad;
+        self.most_pad = self.most_pad.max(pad);
         self.blocks[i] = Block {
             size: need,
             asked: size,
@@ -252,24 +257,40 @@ impl Arena {
         true
     }
 
+    /// The block a heap offset maps through, as the console's walk finds
+    /// it (0x18000547c, 0x180005508): blocks in order, the walk ending at
+    /// the first one handed out above the offset, a block in use claiming
+    /// `size` bytes from its handed-out address (so up to its padding past
+    /// its end). Every handed-out address lies inside its own block, so no
+    /// block before the one holding the offset ends the walk, and only
+    /// blocks within `most_pad` before it can claim it: a binary search and
+    /// a short look back give the walk's answer.
+    fn claims(&self, offset: u32) -> bool {
+        let k = self.blocks.partition_point(|b| b.start <= offset);
+        let Some(k) = k.checked_sub(1) else {
+            return false;
+        };
+        for b in self.blocks[..k].iter().rev() {
+            if b.start + b.size + self.most_pad <= offset {
+                break;
+            }
+            if b.used && offset < b.user.unwrap_or(0) + b.size {
+                return true;
+            }
+        }
+        let b = &self.blocks[k];
+        let user = b.user.unwrap_or(0);
+        !(b.user.is_some() && offset < user) && b.used && offset < user + b.size
+    }
+
     /// The device address of a host address inside a block in use, 0 if
-    /// none. Blocks are walked in order and the walk ends at the first one
-    /// handed out above the address, as the console's does.
+    /// none.
     fn map(&self, p: usize) -> u32 {
         if !self.holds_host(p) {
             return 0;
         }
         let offset = (p - self.host) as u32;
-        for b in &self.blocks {
-            let user = b.user.unwrap_or(0);
-            if offset < user && b.user.is_some() {
-                return 0;
-            }
-            if b.used && offset < user + b.size {
-                return self.apu + offset;
-            }
-        }
-        0
+        if self.claims(offset) { self.apu + offset } else { 0 }
     }
 
     /// The host address of a device address inside a block in use.
@@ -278,16 +299,22 @@ impl Arena {
             return None;
         }
         let offset = apu - self.apu;
+        self.claims(offset).then(|| self.host + offset as usize)
+    }
+
+    /// The console's walk itself, which `claims` must agree with.
+    #[cfg(test)]
+    fn walk(&self, offset: u32) -> bool {
         for b in &self.blocks {
             let user = b.user.unwrap_or(0);
             if offset < user && b.user.is_some() {
-                return None;
+                return false;
             }
             if b.used && offset < user + b.size {
-                return Some(self.host + offset as usize);
+                return true;
             }
         }
-        None
+        false
     }
 }
 
@@ -1456,6 +1483,32 @@ mod tests {
         assert_eq!(ApuHeapGetState(&mut HeapState::default(), 1), NO_HEAP);
     }
 
+    /// The binary-search map gives the console walk's answer at every
+    /// offset, after allocations of mixed alignment and frees.
+    #[test]
+    fn map_agrees_with_the_console_walk() {
+        let mut a = Arena::new(0x1_0000, 0x4_0000).unwrap();
+        let mut live = Vec::new();
+        let mut seed = 7u32;
+        for round in 0..300 {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            if live.len() > 8 && seed % 3 == 0 {
+                let user = live.swap_remove((seed as usize >> 8) % live.len());
+                assert!(a.give_back(user));
+            } else {
+                let align = [4, 256, 0x400, 0x1000][(seed >> 4) as usize % 4];
+                if let Some(u) = a.take(0x40 + (seed >> 12) % 0x900, align) {
+                    live.push(u);
+                }
+            }
+            if round % 50 == 49 {
+                for offset in (0..0x4_0000).step_by(0x10) {
+                    assert_eq!(a.claims(offset), a.walk(offset), "offset {offset:#x}");
+                }
+            }
+        }
+    }
+
     /// Context requests as AcpHalAllocateShapeContexts (0x180003428)
     /// checks and sizes them.
     #[test]
@@ -1503,6 +1556,45 @@ mod tests {
         assert_eq!((m.disconnect)(acp), S_OK);
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    /// Time per ApuAlloc/ApuFree pair with 2000 blocks live, and per
+    /// ApuMapVirtualAddress of the last. `cargo test --release --
+    /// --ignored bench --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_heap() {
+        let _serial = fresh();
+        assert_eq!(ApuCreateHeap(256 << 20, 0), S_OK);
+        let mut live = Vec::new();
+        for i in 0..2000u32 {
+            let (mut p, mut apu) = (std::ptr::null_mut(), 0);
+            assert_eq!(ApuAlloc(&mut p, &mut apu, 256 + (i % 7) * 512, 256, 1), S_OK);
+            live.push(p);
+        }
+        let rounds = 20_000;
+        let start = std::time::Instant::now();
+        for i in 0..rounds {
+            let (mut p, mut apu) = (std::ptr::null_mut(), 0);
+            assert_eq!(ApuAlloc(&mut p, &mut apu, 1024, 256, 1), S_OK);
+            ApuFree(p);
+            if i % 2 == 0 {
+                let k = i % live.len();
+                ApuFree(live[k]);
+                assert_eq!(ApuAlloc(&mut live[k], &mut apu, 768, 256, 1), S_OK);
+            }
+        }
+        let pair = start.elapsed().as_secs_f64() * 1e9 / rounds as f64;
+        let last = *live.last().unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..rounds {
+            assert_ne!(ApuMapVirtualAddress(last), 0);
+        }
+        let map = start.elapsed().as_secs_f64() * 1e9 / rounds as f64;
+        println!("bench heap: {pair:.0} ns per alloc/free round, {map:.0} ns per map, 2000 blocks live");
+        for p in live {
+            ApuFree(p);
+        }
     }
 
     /// Two packets of three silent mono frames each: a fixed one-subframe

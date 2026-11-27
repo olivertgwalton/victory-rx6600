@@ -523,19 +523,15 @@ fn run(stream: &mut Stream, command: &Command, envelope: *const f32) {
         }
     }
     stream.phase = (stream.phase + 1) % 8;
-    // Input first, as the output may be the same buffer.
-    // SAFETY: the title's input block.
-    let input = unsafe { std::slice::from_raw_parts(command.input, samples) }.to_vec();
-    // SAFETY: the title's output block.
-    let output = unsafe { std::slice::from_raw_parts_mut(command.output, samples) };
     for c in 0..stream.channels as usize {
-        let gain = command.gains[c.min(1)];
-        conv.block(
-            c,
-            &input[c * frames..(c + 1) * frames],
-            &mut output[c * frames..(c + 1) * frames],
-            gain,
-        );
+        // Channel by channel, input read before output written: the two
+        // may be one buffer.
+        // SAFETY: the title's input block; this channel's frames, not held
+        // past `push`.
+        conv.push(c, unsafe { std::slice::from_raw_parts(command.input.add(c * frames), frames) });
+        // SAFETY: the title's output block; this channel's frames.
+        let output = unsafe { std::slice::from_raw_parts_mut(command.output.add(c * frames), frames) };
+        conv.render(c, output, command.gains[c.min(1)]);
     }
 }
 
@@ -1049,5 +1045,48 @@ mod tests {
         // The stream limit caps the streams counted.
         // (4 x 0x22000 + 1523712 = 2080768 bytes.)
         assert_eq!(ir_pages(2, 4, 1), 254);
+    }
+
+    /// Time per block of a stereo convolution with a 1 s impulse response
+    /// (47 partitions of 1024 frames). `cargo test --release -- --ignored
+    /// bench --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_convolution() {
+        let _serial = lock(&SERIAL);
+        let frames = 0x400usize;
+        let partitions = 47;
+        let mut base = vec![0u8; 0x10_0000];
+        let (hr, dsp) = connect(&mut base, 2, 4);
+        assert_eq!(hr, S_OK);
+        let ir: Vec<f32> = (0..frames * partitions).map(|i| (-(i as f32) / 9000.0).exp()).collect();
+        let spectra = partitioned(&ir, frames);
+        let desc = StreamDesc {
+            kind: CONVOLUTION,
+            options: STEREO_INPUT,
+            frames: frames as u32,
+            channels: 2,
+            ir_floats: spectra.len() as u32,
+            ir: spectra.as_ptr(),
+        };
+        let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
+        assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
+        let io = base.as_mut_ptr().cast::<f32>();
+        let command = Command {
+            gains: [1.0, 1.0],
+            input: io,
+            output: io.wrapping_add(0x1000),
+            aux: std::ptr::null(),
+        };
+        let blocks = 400;
+        let start = std::time::Instant::now();
+        for _ in 0..blocks {
+            assert_eq!(XDspSubmitCommand(stream, &command, std::ptr::null_mut()), S_OK);
+        }
+        let us = start.elapsed().as_secs_f64() * 1e6 / blocks as f64;
+        let budget = frames as f64 / 48_000.0 * 1e6;
+        println!("bench convolution: {us:.1} us per stereo block of 1024 ({:.1}% of real time)", us / budget * 100.0);
+        assert_eq!(XDspDeactivate(stream), S_OK);
+        assert_eq!(XDspDisconnect(dsp), S_OK);
     }
 }

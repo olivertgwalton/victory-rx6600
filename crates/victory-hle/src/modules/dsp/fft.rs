@@ -109,37 +109,46 @@ impl Real {
         }
         self.complex(out, false);
         let z0 = out[0];
-        let mut packed = vec![C::default(); n];
-        packed[0] = C::new(z0.re + z0.im, z0.re - z0.im);
-        for k in 1..n {
-            let a = out[k];
-            let b = out[n - k].conj();
+        out[0] = C::new(z0.re + z0.im, z0.re - z0.im);
+        // Bins k and n - k come from the same pair of complex bins: both
+        // are made at once, in place.
+        let split = |a: C, b: C, w: C| {
+            let b = b.conj();
             let even = a.add(b).scale(0.5);
             let odd = a.sub(b).scale(0.5);
-            // odd / i, times the split twiddle.
-            let odd = C::new(odd.im, -odd.re).mul(self.split[k]);
-            packed[k] = even.add(odd);
+            even.add(C::new(odd.im, -odd.re).mul(w))
+        };
+        for k in 1..=n / 2 {
+            let (a, b) = (out[k], out[n - k]);
+            out[k] = split(a, b, self.split[k]);
+            if n - k != k {
+                out[n - k] = split(b, a, self.split[n - k]);
+            }
         }
-        out.copy_from_slice(&packed);
     }
 
-    /// `bins` packed bins to `2 * bins` samples, scaled by `1 / (2 bins)`.
-    pub fn inverse(&self, input: &[C], out: &mut [f32]) {
+    /// `bins` packed bins to `2 * bins` samples, scaled by `1 / (2 bins)`;
+    /// the bins are used up.
+    pub fn inverse(&self, bins: &mut [C], out: &mut [f32]) {
         let n = self.bins;
-        let mut z = vec![C::default(); n];
-        let x0 = input[0];
-        z[0] = C::new(x0.re + x0.im, x0.re - x0.im).scale(0.5);
-        for k in 1..n {
-            let a = input[k];
-            let b = input[n - k].conj();
+        let x0 = bins[0];
+        bins[0] = C::new(x0.re + x0.im, x0.re - x0.im).scale(0.5);
+        let merge = |a: C, b: C, w: C| {
+            let b = b.conj();
             let even = a.add(b).scale(0.5);
-            let odd = a.sub(b).scale(0.5).mul(self.split[k].conj());
-            // even + i * odd
-            z[k] = even.add(C::new(-odd.im, odd.re));
+            let odd = a.sub(b).scale(0.5).mul(w.conj());
+            even.add(C::new(-odd.im, odd.re))
+        };
+        for k in 1..=n / 2 {
+            let (a, b) = (bins[k], bins[n - k]);
+            bins[k] = merge(a, b, self.split[k]);
+            if n - k != k {
+                bins[n - k] = merge(b, a, self.split[n - k]);
+            }
         }
-        self.complex(&mut z, true);
+        self.complex(bins, true);
         let s = 1.0 / n as f32;
-        for (k, v) in z.iter().enumerate() {
+        for (k, v) in bins.iter().enumerate() {
             out[2 * k] = v.re * s;
             out[2 * k + 1] = v.im * s;
         }
@@ -175,7 +184,7 @@ mod tests {
             assert!((spectrum[k].im as f64 - im).abs() < 1e-3, "bin {k}");
         }
         let mut back = vec![0f32; n];
-        real.inverse(&spectrum, &mut back);
+        real.inverse(&mut spectrum.clone(), &mut back);
         for (a, b) in x.iter().zip(&back) {
             assert!((a - b).abs() < 1e-4);
         }
