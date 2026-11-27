@@ -57,6 +57,11 @@ fn desc_bytes(d: &ResourceDesc) -> [u8; 56] {
 }
 
 pub(super) fn record(index: u32, d: &ResourceDesc, copy_below: u64) -> Vec<u8> {
+    record_with(index, d, copy_below, |d, c| XGCreateTextureComputer(d, c))
+}
+
+/// A record with the computer made by `create`.
+fn record_with(index: u32, d: &ResourceDesc, copy_below: u64, create: impl Fn(&ResourceDesc, *mut This) -> HRESULT) -> Vec<u8> {
     let mut r = Vec::with_capacity(0x2a00);
     let put32 = |r: &mut Vec<u8>, v: u32| r.extend_from_slice(&v.to_le_bytes());
     put32(&mut r, 0x31484758);
@@ -67,7 +72,7 @@ pub(super) fn record(index: u32, d: &ResourceDesc, copy_below: u64) -> Vec<u8> {
     put32(&mut r, shr as u32);
     put32(&mut r, sug);
     let mut c: This = std::ptr::null_mut();
-    let chr = XGCreateTextureComputer(d, &mut c);
+    let chr = create(d, &mut c);
     put32(&mut r, chr as u32);
     let mut layout = vec![0u8; LAYOUT_BYTES];
     let mut lhr = 0;
@@ -665,4 +670,66 @@ fn other_slots_match_the_library_for_use_flags_and_samples() {
 fn other_slots_match_the_library_for_metadata() {
     check_slots("metadata", slot_vectors!("metadata"));
     check_slots("dcc", slot_vectors!("dcc"));
+}
+
+/// The computer `XGCreateTexture{1,2,3}DComputer` makes for the texture a
+/// D3D12-style description stands for (as the harness builds the XG
+/// description: bind flags D3D11-style, the console's flags as misc, the
+/// mode itself).
+fn create_xg(d: &ResourceDesc, out: *mut This) -> HRESULT {
+    let bind = if d.flags & ALLOW_RENDER_TARGET != 0 { BIND_RENDER_TARGET } else { 0 }
+        | if d.flags & ALLOW_DEPTH_STENCIL != 0 { BIND_DEPTH_STENCIL } else { 0 }
+        | if d.flags & ALLOW_UNORDERED_ACCESS != 0 { BIND_UNORDERED_ACCESS } else { 0 };
+    let misc = d.flags & !7 & 0xffff_0000;
+    let swizzle = if d.layout == 1 { 0 } else { d.layout & 0xff };
+    let (w, h, z, mips) = (d.width as u32, d.height, u32::from(d.depth_or_array), u32::from(d.mips));
+    match d.dimension {
+        2 => {
+            let x = Texture1dDesc { width: w, mips, array: z, format: d.format, usage: 0, bind_flags: bind, cpu_access: 0, misc_flags: misc, swizzle, reserved: 0 };
+            XGCreateTexture1DComputer(&x, out)
+        }
+        4 => {
+            let x = Texture3dDesc { width: w, height: h, depth: z, mips, format: d.format, usage: 0, bind_flags: bind, cpu_access: 0, misc_flags: misc, swizzle, reserved: 0 };
+            XGCreateTexture3DComputer(&x, out)
+        }
+        _ => {
+            let x = Texture2dDesc { width: w, height: h, mips, array: z, format: d.format, samples: d.samples, quality: 0, usage: 0, bind_flags: bind, cpu_access: 0, misc_flags: misc, swizzle, reserved: 0 };
+            XGCreateTexture2DComputer(&x, out)
+        }
+    }
+}
+
+/// Records through the XG descriptions against the library's, for the
+/// cases of a suite that name a mode.
+fn check_xg(name: &str, vectors: &[u8]) {
+    let cases: Vec<ResourceDesc> = suite(name).into_iter().filter(|d| d.layout != 0).collect();
+    assert_eq!(cases.len() * 8, vectors.len(), "{name}: cases and vectors");
+    let mut bad = vec![];
+    for (i, (d, want)) in cases.iter().zip(vectors.chunks_exact(8)).enumerate() {
+        if excluded(d) {
+            continue;
+        }
+        let got = record_hash(&record_with(i as u32, d, CHECKED_COPIES, create_xg));
+        if got != u64::from_le_bytes(want.try_into().unwrap()) {
+            bad.push((i, *d));
+        }
+    }
+    assert!(bad.is_empty(), "{name} XG descriptions: {} of {} differ from the library, e.g. {:?}", bad.len(), cases.len(), &bad[..bad.len().min(5)]);
+}
+
+macro_rules! desc_vectors {
+    ($name:literal) => {
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/xg/", $name, ".desc.hashes"))
+    };
+}
+
+#[test]
+fn xg_descriptions_match_the_library() {
+    check_xg("formats", desc_vectors!("formats"));
+    check_xg("flags", desc_vectors!("flags"));
+}
+
+#[test]
+fn xg_descriptions_match_the_library_in_every_dimension_mode_and_size() {
+    check_xg("geometry", desc_vectors!("geometry"));
 }

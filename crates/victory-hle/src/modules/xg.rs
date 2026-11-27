@@ -462,6 +462,172 @@ pub extern "system" fn XGCreateTextureComputer(
     S_OK
 }
 
+/// `XG_TEXTURE1D_DESC`, `XG_TEXTURE2D_DESC`, `XG_TEXTURE3D_DESC`: D3D11-style
+/// descriptions with the swizzle mode itself (0 linear; no pick).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Texture1dDesc {
+    pub width: u32,
+    pub mips: u32,
+    pub array: u32,
+    pub format: u32,
+    pub usage: u32,
+    pub bind_flags: u32,
+    pub cpu_access: u32,
+    pub misc_flags: u32,
+    pub swizzle: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Texture2dDesc {
+    pub width: u32,
+    pub height: u32,
+    pub mips: u32,
+    pub array: u32,
+    pub format: u32,
+    pub samples: u32,
+    pub quality: u32,
+    pub usage: u32,
+    pub bind_flags: u32,
+    pub cpu_access: u32,
+    pub misc_flags: u32,
+    pub swizzle: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Texture3dDesc {
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub mips: u32,
+    pub format: u32,
+    pub usage: u32,
+    pub bind_flags: u32,
+    pub cpu_access: u32,
+    pub misc_flags: u32,
+    pub swizzle: u32,
+    pub reserved: u32,
+}
+
+/// D3D11 bind flags.
+const BIND_RENDER_TARGET: u32 = 0x20;
+const BIND_DEPTH_STENCIL: u32 = 0x40;
+const BIND_UNORDERED_ACCESS: u32 = 0x80;
+
+/// The D3D12-style description an XG one stands for: bind flags as use
+/// flags, the console's flags (`misc`) as they are, the mode as the layout.
+/// `None` for what the library refuses here and not through
+/// `XGCreateTextureComputer`: reserved fields set, block-compressed linear
+/// textures.
+#[allow(clippy::too_many_arguments)]
+fn from_xg(
+    dimension: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    mips: u32,
+    format: u32,
+    samples: u32,
+    bind: u32,
+    misc: u32,
+    swizzle: u32,
+    reserved: u32,
+) -> Option<ResourceDesc> {
+    let compressed = victory_formats::texture::planes(format)
+        .and_then(|p| p.first())
+        .is_some_and(|f| f.block == 4);
+    if reserved != 0 || (compressed && swizzle == 0) || swizzle > 0xff {
+        return None;
+    }
+    let flags = u32::from(bind & BIND_RENDER_TARGET != 0) * ALLOW_RENDER_TARGET
+        | u32::from(bind & BIND_DEPTH_STENCIL != 0) * ALLOW_DEPTH_STENCIL
+        | u32::from(bind & BIND_UNORDERED_ACCESS != 0) * ALLOW_UNORDERED_ACCESS
+        | misc & 0xffff_0000;
+    Some(ResourceDesc {
+        dimension,
+        alignment: 0,
+        width: u64::from(width),
+        height,
+        depth_or_array: u16::try_from(depth).ok()?,
+        mips: u16::try_from(mips).ok()?,
+        format,
+        samples: samples.max(1),
+        quality: 0,
+        layout: SWIZZLED | swizzle,
+        flags,
+    })
+}
+
+fn create_from(desc: Option<ResourceDesc>, out: *mut This) -> HRESULT {
+    match desc {
+        Some(d) => XGCreateTextureComputer(&d, out),
+        None => E_INVALIDARG,
+    }
+}
+
+pub extern "system" fn XGCreateTexture1DComputer(desc: *const Texture1dDesc, out: *mut This) -> HRESULT {
+    // SAFETY: the caller passes a description or null.
+    let Some(d) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    create_from(from_xg(TEXTURE_1D, d.width, 1, d.array, d.mips, d.format, 1, d.bind_flags, d.misc_flags, d.swizzle, d.reserved), out)
+}
+
+pub extern "system" fn XGCreateTexture2DComputer(desc: *const Texture2dDesc, out: *mut This) -> HRESULT {
+    // SAFETY: the caller passes a description or null.
+    let Some(d) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    create_from(from_xg(3, d.width, d.height, d.array, d.mips, d.format, d.samples, d.bind_flags, d.misc_flags, d.swizzle, d.reserved), out)
+}
+
+pub extern "system" fn XGCreateTexture3DComputer(desc: *const Texture3dDesc, out: *mut This) -> HRESULT {
+    // SAFETY: the caller passes a description or null.
+    let Some(d) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    create_from(from_xg(TEXTURE_3D, d.width, d.height, d.depth, d.mips, d.format, 1, d.bind_flags, d.misc_flags, d.swizzle, d.reserved), out)
+}
+
+/// `XGComputeTexture*Layout(desc, layout)`: a computer's layout, the
+/// computer let go.
+fn compute_layout(hr: HRESULT, c: This, out: *mut LayoutOut) -> HRESULT {
+    if hr < 0 {
+        return hr;
+    }
+    let hr = layout(c, out);
+    release(c);
+    hr
+}
+
+pub extern "system" fn XGComputeTexture1DLayout(desc: *const Texture1dDesc, out: *mut LayoutOut) -> HRESULT {
+    if desc.is_null() || out.is_null() {
+        return E_INVALIDARG;
+    }
+    let mut c = std::ptr::null_mut();
+    compute_layout(XGCreateTexture1DComputer(desc, &mut c), c, out)
+}
+
+pub extern "system" fn XGComputeTexture2DLayout(desc: *const Texture2dDesc, out: *mut LayoutOut) -> HRESULT {
+    if desc.is_null() || out.is_null() {
+        return E_INVALIDARG;
+    }
+    let mut c = std::ptr::null_mut();
+    compute_layout(XGCreateTexture2DComputer(desc, &mut c), c, out)
+}
+
+pub extern "system" fn XGComputeTexture3DLayout(desc: *const Texture3dDesc, out: *mut LayoutOut) -> HRESULT {
+    if desc.is_null() || out.is_null() {
+        return E_INVALIDARG;
+    }
+    let mut c = std::ptr::null_mut();
+    compute_layout(XGCreateTexture3DComputer(desc, &mut c), c, out)
+}
+
 const R8_UNORM: u32 = 61;
 const R8_UINT: u32 = 62;
 
@@ -1676,6 +1842,12 @@ pub(crate) fn module() -> HleModule {
         exports: vec![
             hle_export!(XGCreateTextureComputer),
             hle_export!(XGSuggestSwizzleMode),
+            hle_export!(XGCreateTexture1DComputer),
+            hle_export!(XGCreateTexture2DComputer),
+            hle_export!(XGCreateTexture3DComputer),
+            hle_export!(XGComputeTexture1DLayout),
+            hle_export!(XGComputeTexture2DLayout),
+            hle_export!(XGComputeTexture3DLayout),
         ],
     }
 }
@@ -1873,6 +2045,6 @@ mod tests {
         assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
         let bad = desc(256, 256, 1, 28, 0x103);
         assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
-        assert!(module().exports.len() == 2);
+        assert!(module().exports.len() == 8);
     }
 }
