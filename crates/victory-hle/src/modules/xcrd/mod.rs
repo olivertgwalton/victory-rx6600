@@ -13,6 +13,7 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod ops;
+pub mod paths;
 pub mod srb;
 pub mod sys;
 #[cfg(test)]
@@ -69,13 +70,13 @@ fn units(text: &str) -> Vec<u16> {
 // The process heap, which the library allocates from (RtlAllocateHeap on
 // the PEB's heap) and its callers free to.
 
-fn heap_alloc(bytes: usize) -> *mut u8 {
+pub(crate) fn heap_alloc(bytes: usize) -> *mut u8 {
     use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapAlloc};
     // SAFETY: the process heap.
     unsafe { HeapAlloc(GetProcessHeap(), 0, bytes) }.cast()
 }
 
-fn heap_free(block: *mut c_void) {
+pub(crate) fn heap_free(block: *mut c_void) {
     use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
     if !block.is_null() {
         // SAFETY: a block of the process heap.
@@ -502,6 +503,7 @@ pub extern "system" fn XCrdCloseMetadataHandle(handle: *mut *mut Metadata, adapt
 
 pub(crate) fn exports() -> Vec<HleExport> {
     let mut all = ops::exports();
+    all.extend(paths::exports());
     all.extend([
         hle_export!(XCrdSetTraceFlags),
         hle_export!(XCrdBuildPath),

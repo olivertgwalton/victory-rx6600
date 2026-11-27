@@ -423,6 +423,9 @@ pub enum Kind {
     /// A pointer out-parameter that receives a heap object of n bytes:
     /// compared by null-ness and the object's bytes.
     Object(usize),
+    /// A pointer out-parameter that receives a heap wide string: compared
+    /// by null-ness and text.
+    WideObject,
     /// An integer from this list (the first is the baseline).
     Int(&'static [u64]),
 }
@@ -479,6 +482,7 @@ fn values(kind: Kind) -> Vec<Value> {
         }
         Kind::Out(n) => vec![fill(n, &|_| 0xcc)],
         Kind::OutOpt(n) | Kind::Object(n) => vec![fill(n, &|_| 0xcc), Value::Null],
+        Kind::WideObject => vec![fill(8, &|_| 0xcc), Value::Null],
         Kind::Int(list) => list.iter().map(|&v| Value::Int(v)).collect(),
     }
 }
@@ -515,6 +519,15 @@ fn call_case(f: Any8, kinds: &[Kind], case: &[Value], width: Width, s: &Session)
             };
             m[..8].copy_from_slice(&[u8::from(object.is_some()); 8]);
             m.extend(object.unwrap_or_default());
+        }
+        if let (Kind::WideObject, Some(m)) = (k, memory[i].as_mut()) {
+            let p = usize::from_le_bytes(m[..8].try_into().unwrap());
+            let text = if p == 0 || p == 0xcccc_cccc_cccc_cccc { None } else {
+                // SAFETY: a heap string the call returned.
+                Some(unsafe { wide_str(p as *const u16) })
+            };
+            m[..8].copy_from_slice(&[u8::from(text.is_some()); 8]);
+            m.extend(text.unwrap_or_default().into_bytes());
         }
     }
     Outcome { result, buffers: memory, record: s.take() }
@@ -657,3 +670,32 @@ fn fuzz_insert_region() {
     fuzz("XCrdStreamingQueueInsertRegion", &[Adp, Int(&[9, 0]), Int(&[3, 0, 1, 64]), In(0x100), Int(&[0, 1])], W32);
 }
 
+
+#[test]
+fn fuzz_path_bodies() {
+    fuzz("XCrdDeleteXVD", &[Adp, Path, Int(FLAG1)], W32);
+    fuzz("XCrdEnableSharedPls", &[Adp, Path, In(16)], W32);
+    fuzz("XCrdGrowDynamicXvd", &[Adp, Path, Int(&[0x1000, 0, u64::MAX])], W32);
+    fuzz("XCrdIsCorrupt", &[Adp, Path, OutOpt(1)], W32);
+    fuzz("XCrdXBlobDelete", &[Adp, Path], W32);
+    fuzz("XCrdXBlobCreate", &[Adp, Path, Int(&[0x1000, 0, u64::MAX]), Int(&[0, 1])], W32);
+}
+
+#[test]
+fn fuzz_corrupt_xvc() {
+    // The driver's string must end inside the body (the library reads on).
+    fuzz_keeping("XCrdQueryCorruptXvc", &[Adp, WideObject], W32, &[0x40..0x42]);
+}
+
+#[test]
+fn is_corrupt_not_found_is_not_corrupt() {
+    let s = session();
+    let (r, l) = both!("XCrdIsCorrupt": extern "system" fn(*const Adapter, *const u16, *mut u8) -> HRESULT);
+    let a = adapter();
+    let p = wz("[XUC:]\\x");
+    // STATUS_NOT_FOUND -> ERROR_NOT_FOUND (0x80070490): S_OK, not corrupt.
+    same("not found", run(&s, |s| s.reply(|_, b| { b[0x14..0x18].copy_from_slice(&0xc000_0225u32.to_le_bytes()); 0 }), |rf| {
+        let mut c = 9;
+        ((if rf { r(&a, p.as_ptr(), &mut c) } else { l(&a, p.as_ptr(), &mut c) }), c)
+    }));
+}
