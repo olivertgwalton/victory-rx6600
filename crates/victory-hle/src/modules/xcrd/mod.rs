@@ -14,6 +14,7 @@
 
 pub mod ops;
 pub mod paths;
+pub mod blobs;
 pub mod regions;
 pub mod storage;
 pub mod srb;
@@ -508,6 +509,7 @@ pub(crate) fn exports() -> Vec<HleExport> {
     all.extend(paths::exports());
     all.extend(regions::exports());
     all.extend(storage::exports());
+    all.extend(blobs::exports());
     all.extend([
         hle_export!(XCrdSetTraceFlags),
         hle_export!(XCrdBuildPath),

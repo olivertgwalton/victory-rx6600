@@ -48,8 +48,12 @@ fn wz(s: &str) -> Vec<u16> {
 /// Runs `f` once per side (reference first), each against a fresh fake
 /// driver set up by `setup`, and returns each side's result and record.
 fn run<T>(s: &Session, setup: impl Fn(&Session), f: impl Fn(bool) -> T) -> ((T, Record), (T, Record)) {
+    let trace = std::env::var_os("VICTORY_FUZZ_TRACE").is_some();
     setup(s);
     let r = f(true);
+    if trace {
+        eprintln!("  reference done");
+    }
     let rr = s.take();
     setup(s);
     let l = f(false);
@@ -58,6 +62,9 @@ fn run<T>(s: &Session, setup: impl Fn(&Session), f: impl Fn(bool) -> T) -> ((T, 
 }
 
 fn same<T: std::fmt::Debug + PartialEq>(what: &str, ((r, rr), (l, lr)): ((T, Record), (T, Record))) {
+    if std::env::var_os("VICTORY_FUZZ_TRACE").is_some() {
+        eprintln!("{what}: done");
+    }
     assert_eq!(r, l, "{what}: result");
     assert_eq!(rr, lr, "{what}: what the driver saw");
 }
@@ -835,3 +842,77 @@ fn storage_refuses_internal_devices() {
     }
 }
 
+
+/// The blob driver: data a pattern, the count it read as asked, or short,
+/// or "buffer too small".
+fn blob_driver(mode: u8) -> impl FnMut(&reference::Call, &mut [u8]) -> i32 + Send + 'static {
+    move |_, b| {
+        b[0x14..0x18].fill(0);
+        let body = &mut b[0x1c..];
+        let path = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
+        let n = u32::from_le_bytes(body[0xc..0x10].try_into().unwrap()) as usize;
+        let start = 0x20 + path;
+        for (i, x) in body[start..].iter_mut().enumerate().take(n) {
+            *x = (i as u8).wrapping_mul(29).wrapping_add(7);
+        }
+        match mode {
+            1 => body[0xc..0x10].copy_from_slice(&((n / 2) as u32).to_le_bytes()),
+            2 => {
+                b[0x14..0x18].copy_from_slice(&0xc000_0023u32.to_le_bytes());
+                b[0x1c + 0xc..0x1c + 0x10].copy_from_slice(&7u32.to_le_bytes());
+            }
+            _ => {}
+        }
+        0
+    }
+}
+
+#[test]
+fn blobs_read_and_write() {
+    let s = session();
+    trace_all(&s);
+    let (rr, lr) = both!("XCrdStorageReadBlobEx": extern "system" fn(*const Adapter, *const u16, u64, *mut u8, *mut u32) -> HRESULT);
+    let (rw, lw) = both!("XCrdStorageWriteBlobEx": extern "system" fn(*const Adapter, *const u16, u64, *const u8, u32, u32) -> HRESULT);
+    let (rr0, lr0) = both!("XCrdStorageReadBlob": extern "system" fn(*const Adapter, *const u16, *mut u8, *mut u32) -> HRESULT);
+    let (rw0, lw0) = both!("XCrdStorageWriteBlob": extern "system" fn(*const Adapter, *const u16, *const u8, u32) -> HRESULT);
+    let a = adapter();
+    let long = "z".repeat(0x7f900);
+    let paths = [Some(wz("[XUC:]\\blob")), Some(wz(&long)), None];
+    let data: Vec<u8> = (0..0x30_0000).map(|i| (i % 251) as u8).collect();
+    for len in [0u32, 0x10, 0x1234, 0x20_0000] {
+        for path in &paths {
+            // Past 0xff000 bytes of path the library sends a full 1 MiB
+            // chunk whatever is left, so a shorter length wraps its count and
+            // reads or writes past the buffer (0x180007e4e, 0x1800081d1):
+            // the port does the same; not a case to run.
+            if path.as_ref().is_some_and(|p| p.len() > 0x7f000) && len != 0 && len < 0x10_0000 {
+                continue;
+            }
+            let pp = path.as_ref().map_or(std::ptr::null(), |p| p.as_ptr());
+            for mode in [0u8, 1, 2] {
+                for with_buffer in [true, false] {
+                    same(&format!("read {len:#x} {mode} {with_buffer} {}", path.as_ref().map_or(0, |p| p.len())), run(&s, |s| s.reply(blob_driver(mode)), |r| {
+                        let mut buf = vec![0xccu8; 0x30_0000];
+                        let b = if with_buffer { buf.as_mut_ptr() } else { std::ptr::null_mut() };
+                        let mut n = len;
+                        let hr = if r { rr(&a, pp, 0x5000, b, &mut n) } else { lr(&a, pp, 0x5000, b, &mut n) };
+                        let mut m = len;
+                        let hr0 = if r { rr0(&a, pp, b, &mut m) } else { lr0(&a, pp, b, &mut m) };
+                        (hr, n, hr0, m, buf)
+                    }));
+                }
+                for flags in [0u32, 1, 2, 3, 4] {
+                    same(&format!("write {len:#x} {mode} {flags}"), run(&s, |s| s.reply(blob_driver(mode)), |r| {
+                        let hr = if r { rw(&a, pp, 0x5000, data.as_ptr(), len, flags) } else { lw(&a, pp, 0x5000, data.as_ptr(), len, flags) };
+                        let hr0 = if r { rw0(&a, pp, data.as_ptr(), len) } else { lw0(&a, pp, data.as_ptr(), len) };
+                        (hr, hr0)
+                    }));
+                }
+            }
+        }
+    }
+    let (rq, lq) = both!("XCrdStorageQueryExternalDeviceAddress": extern "system" fn(*mut [u8; 8], u32) -> HRESULT);
+    for v in [0u32, 1, 0x1234_5678, u32::MAX] {
+        same("address", run(&s, |_| {}, |r| { let mut o = [0xcc; 8]; ((if r { rq(&mut o, v) } else { lq(&mut o, v) }), o) }));
+    }
+}
