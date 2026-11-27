@@ -2421,7 +2421,7 @@ pub(crate) fn module() -> HleModule {
     HleModule {
         name: "dstorage",
         dlls: &["xcrdapi.dll"],
-        exports: vec![hle_export!(DStorageGetFactory)],
+        exports: [vec![hle_export!(DStorageGetFactory)], super::xcrd::exports()].concat(),
     }
 }
 
