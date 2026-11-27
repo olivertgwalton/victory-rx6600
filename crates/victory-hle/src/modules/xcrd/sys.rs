@@ -49,6 +49,13 @@ pub struct Sys {
     pub rtl_unsubscribe_wnf: unsafe extern "system" fn(*mut std::ffi::c_void) -> i32,
     /// `NtQueryVolumeInformationFile` (handle, status block, buffer, length, class).
     pub nt_query_volume_information_file: unsafe extern "system" fn(Handle, *mut IoStatus, *mut c_void, u32, u32) -> i32,
+    /// Files, for the O: drive's blobs.
+    pub get_drive_type_w: unsafe extern "system" fn(*const u16) -> u32,
+    pub find_first_file_w: unsafe extern "system" fn(*const u16, *mut c_void) -> Handle,
+    pub find_next_file_w: unsafe extern "system" fn(Handle, *mut c_void) -> i32,
+    pub find_close: unsafe extern "system" fn(Handle) -> i32,
+    pub set_file_pointer_ex: unsafe extern "system" fn(Handle, i64, *mut i64, u32) -> i32,
+    pub read_file: unsafe extern "system" fn(Handle, *mut c_void, u32, *mut u32, *mut c_void) -> i32,
 }
 
 unsafe extern "system" fn create_file_w(
@@ -146,6 +153,30 @@ unsafe extern "system" fn nt_query_volume_information_file(file: Handle, io: *mu
     host!("ntdll.dll", "NtQueryVolumeInformationFile": extern "system" fn(Handle, *mut IoStatus, *mut c_void, u32, u32) -> i32)(file, io, buffer, length, class)
 }
 
+unsafe extern "system" fn get_drive_type_w(root: *const u16) -> u32 {
+    host!("kernel32.dll", "GetDriveTypeW": extern "system" fn(*const u16) -> u32)(root)
+}
+
+unsafe extern "system" fn find_first_file_w(pattern: *const u16, data: *mut c_void) -> Handle {
+    host!("kernel32.dll", "FindFirstFileW": extern "system" fn(*const u16, *mut c_void) -> Handle)(pattern, data)
+}
+
+unsafe extern "system" fn find_next_file_w(find: Handle, data: *mut c_void) -> i32 {
+    host!("kernel32.dll", "FindNextFileW": extern "system" fn(Handle, *mut c_void) -> i32)(find, data)
+}
+
+unsafe extern "system" fn find_close(find: Handle) -> i32 {
+    host!("kernel32.dll", "FindClose": extern "system" fn(Handle) -> i32)(find)
+}
+
+unsafe extern "system" fn set_file_pointer_ex(file: Handle, distance: i64, position: *mut i64, method: u32) -> i32 {
+    host!("kernel32.dll", "SetFilePointerEx": extern "system" fn(Handle, i64, *mut i64, u32) -> i32)(file, distance, position, method)
+}
+
+unsafe extern "system" fn read_file(file: Handle, buffer: *mut c_void, length: u32, read: *mut u32, overlapped: *mut c_void) -> i32 {
+    host!("kernel32.dll", "ReadFile": extern "system" fn(Handle, *mut c_void, u32, *mut u32, *mut c_void) -> i32)(file, buffer, length, read, overlapped)
+}
+
 pub const HOST: Sys = Sys {
     create_file_w,
     nt_device_io_control_file,
@@ -160,6 +191,12 @@ pub const HOST: Sys = Sys {
     rtl_subscribe_wnf,
     rtl_unsubscribe_wnf,
     nt_query_volume_information_file,
+    get_drive_type_w,
+    find_first_file_w,
+    find_next_file_w,
+    find_close,
+    set_file_pointer_ex,
+    read_file,
 };
 
 static SYS: RwLock<Sys> = RwLock::new(HOST);

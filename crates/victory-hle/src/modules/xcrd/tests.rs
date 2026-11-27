@@ -2048,3 +2048,303 @@ fn detach_external_device() {
     }
     same("null adapter", run(&s, |_| {}, |side| if side { r(std::ptr::null(), at(0xb, 3)) } else { l(std::ptr::null(), at(0xb, 3)) }));
 }
+
+// Enumerations.
+
+#[test]
+fn find_storage_devices() {
+    let s = session();
+    trace_all(&s);
+    type First = extern "system" fn(*mut *mut c_void, *mut u32) -> HRESULT;
+    type Next = extern "system" fn(*mut c_void, *mut u32) -> HRESULT;
+    type Close = extern "system" fn(*mut c_void) -> HRESULT;
+    let (rf, lf) = both!("XCrdFindFirstStorageDevice": First);
+    let (rn, ln) = both!("XCrdFindNextStorageDevice": Next);
+    let (rc, lc) = both!("XCrdFindCloseStorageDevice": Close);
+    for mode in 0..4u32 {
+        same(&format!("mode {mode}"), run(&s, |s| {
+            s.open(move |n| if n == "\\\\.\\Scsi0:" && mode != 1 { Ok(FAKE) } else { Err(2) });
+            s.reply(accepting(move |code, body| {
+                if code == 0x7800_008c {
+                    let op = u32::from_le_bytes(body[0..4].try_into().unwrap());
+                    let cursor = u32::from_le_bytes(body[8..12].try_into().unwrap());
+                    if (mode == 2 && op == 0) || cursor >= 3 {
+                        body[4..12].fill(0xee);
+                    } else {
+                        body[4..8].copy_from_slice(&(0xb + cursor * 2 + op).to_le_bytes());
+                        body[8..12].copy_from_slice(&(cursor + 1).to_le_bytes());
+                    }
+                }
+            }));
+            // A cursor of 3 or more is the end: the driver says so.
+            if mode != 1 {
+                let mut inner = accepting(move |code, body| {
+                    if code == 0x7800_008c {
+                        let op = u32::from_le_bytes(body[0..4].try_into().unwrap());
+                        let cursor = u32::from_le_bytes(body[8..12].try_into().unwrap());
+                        body[4..8].copy_from_slice(&(0xb + cursor * 2 + op).to_le_bytes());
+                        body[8..12].copy_from_slice(&(cursor + 1).to_le_bytes());
+                    }
+                });
+                s.reply(move |call, b| {
+                    let status = inner(call, b);
+                    if b.len() >= 0x28 && u32::from_le_bytes(b[0x10..0x14].try_into().unwrap()) == 0x7800_008c {
+                        let op = u32::from_le_bytes(b[0x1c..0x20].try_into().unwrap());
+                        let cursor = u32::from_le_bytes(b[0x24..0x28].try_into().unwrap());
+                        if (mode == 2 && op == 0) || (mode == 3 && op == 2) || cursor > 3 {
+                            b[0x14..0x18].copy_from_slice(&0xc05e_0012u32.to_le_bytes());
+                        }
+                    }
+                    status
+                });
+            }
+        }, |side| {
+            let (first, next, close) = if side { (rf, rn, rc) } else { (lf, ln, lc) };
+            let mut h = std::ptr::null_mut();
+            let mut id = 0xccu32;
+            let mut seen = vec![(first(&mut h, &mut id), id, h.is_null())];
+            if !h.is_null() {
+                for _ in 0..5 {
+                    let hr = next(h, &mut id);
+                    seen.push((hr, id, false));
+                }
+                seen.push((next(h, std::ptr::null_mut()), 0, false));
+                seen.push((close(h), 0, false));
+            }
+            seen
+        }));
+    }
+    same("nulls", run(&s, |_| {}, |side| {
+        let (first, next, close) = if side { (rf, rn, rc) } else { (lf, ln, lc) };
+        let mut id = 0;
+        let mut h = std::ptr::null_mut();
+        (first(std::ptr::null_mut(), &mut id), first(&mut h, std::ptr::null_mut()), next(std::ptr::null_mut(), &mut id), close(std::ptr::null_mut()))
+    }));
+}
+
+/// A blob record as the caller sees it (past its first 0x10 bytes), its
+/// info pointer cleared, and the info block it points to.
+fn blob_view(p: *mut u8) -> (Vec<u8>, Option<Vec<u8>>) {
+    // SAFETY: a record a search returned: its size first, the info at 0x28.
+    unsafe {
+        let rec = p.sub(0x10);
+        let total = rec.cast::<u32>().read_unaligned() as usize;
+        let mut bytes = std::slice::from_raw_parts(p, total - 0x10).to_vec();
+        bytes[0x18..0x20].fill(0);
+        let info = rec.add(0x28).cast::<*const u8>().read_unaligned();
+        (bytes, (!info.is_null()).then(|| std::slice::from_raw_parts(info, 0xe08).to_vec()))
+    }
+}
+
+type FindFirstBlob = extern "system" fn(*mut *mut c_void, *mut *mut u8, u32, *const u16, u32) -> HRESULT;
+type FindNextBlob = extern "system" fn(*mut c_void, *mut *mut u8) -> HRESULT;
+type FindCloseBlob = extern "system" fn(*mut c_void) -> HRESULT;
+
+fn blob_walk(f: FindFirstBlob, n: FindNextBlob, c: FindCloseBlob, kind: u32, path: *const u16, flags: u32) -> Vec<(HRESULT, Option<(Vec<u8>, Option<Vec<u8>>)>)> {
+    let mut h = std::ptr::null_mut();
+    let mut rec = std::ptr::null_mut();
+    let hr = f(&mut h, &mut rec, kind, path, flags);
+    let mut seen = vec![(hr, (hr >= 0).then(|| blob_view(rec)))];
+    if hr >= 0 {
+        for _ in 0..6 {
+            let hr = n(h, &mut rec);
+            seen.push((hr, (hr >= 0).then(|| blob_view(rec))));
+            if hr < 0 {
+                break;
+            }
+        }
+        seen.push((c(h), None));
+    }
+    seen
+}
+
+/// The blobs the fake driver lists: a file, a directory, a small file, one
+/// whose name is too long, then the end.
+fn blob_entries() -> Vec<(String, u32, u64, u64)> {
+    vec![
+        ("game.xvc".into(), 0x20, 0x20_0000, 0x1d9_0000_0000_0001),
+        ("updates".into(), 0x10, 0, 2),
+        ("tiny".into(), 0x80, 0x100, 3),
+        ("x".repeat(300), 0x20, 0x10000, 4),
+    ]
+}
+
+/// Modes: 0 all well; 1 no adapter; 2 the first step fails; 3 the info
+/// query fails; 4 the end step fails.
+fn blob_machine(s: &Session, mode: u32) {
+    let entries = blob_entries();
+    s.open(move |n| if n == "\\\\.\\Scsi0:" && mode != 1 { Ok(FAKE) } else if n.starts_with("O:") && mode != 5 { Ok(FAKE + 0xa00) } else { Err(2) });
+    let mut next = 0usize;
+    s.reply(move |_, b| {
+        if b.len() < 0x1c {
+            return 0;
+        }
+        b[0x14..0x18].fill(0);
+        let code = u32::from_le_bytes(b[0x10..0x14].try_into().unwrap());
+        let body = &mut b[0x1c..];
+        let mut status = 0u32;
+        match code {
+            0x7800_000c => {}
+            0x7800_0084 => {
+                let op = u32::from_le_bytes(body[0x18..0x1c].try_into().unwrap());
+                if op == 0 {
+                    next = 0;
+                }
+                if (mode == 2 && op == 0) || (mode == 4 && op == 2) {
+                    status = 0xc05e_0011;
+                } else if op != 2 {
+                    match entries.get(next) {
+                        Some((name, attributes, size, time)) => {
+                            body[0x20..0x3d0].fill(0);
+                            for (i, ch) in name.encode_utf16().take(0x1d0).enumerate() {
+                                body[0x20 + 2 * i..0x22 + 2 * i].copy_from_slice(&ch.to_le_bytes());
+                            }
+                            body[0x228..0x230].copy_from_slice(&size.to_le_bytes());
+                            body[0x230..0x238].copy_from_slice(&time.to_le_bytes());
+                            body[0x348..0x34c].copy_from_slice(&attributes.to_le_bytes());
+                            body[0..0x10].fill(0x40 + next as u8);
+                            next += 1;
+                        }
+                        None => status = 0x8000_001a,
+                    }
+                }
+            }
+            0x7800_0050 => {
+                if mode == 3 {
+                    status = 0xc05e_0002;
+                } else {
+                    for (i, x) in body.iter_mut().enumerate().skip(0x10).take(0x3f0) {
+                        *x = (i as u8).wrapping_mul(7);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if code == 0x7800_000c {
+            b[4..12].copy_from_slice(&srb::SIGNATURE);
+        }
+        b[0x14..0x18].copy_from_slice(&status.to_le_bytes());
+        0
+    });
+}
+
+#[test]
+fn find_blobs_in_the_driver() {
+    let s = session();
+    trace_all(&s);
+    let (rf, lf) = both!("XCrdFindFirstBlob": FindFirstBlob);
+    let (rn, ln) = both!("XCrdFindNextBlob": FindNextBlob);
+    let (rc, lc) = both!("XCrdFindCloseBlob": FindCloseBlob);
+    let paths: Vec<Option<Vec<u16>>> = vec![None, Some(wz("")), Some(wz("sub")), Some(wz("\\sub")), Some(wz("a\\b"))];
+    for kind in [0u32, 1, 0x12, 0x24, 9] {
+        for (pi, path) in paths.iter().enumerate() {
+            let p = path.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
+            for flags in [0u32, 1, 2] {
+                for mode in 0..5 {
+                    same(&format!("kind {kind:#x} path {pi} flags {flags} mode {mode}"), run(&s, |s| blob_machine(s, mode), |side| {
+                        if side { blob_walk(rf, rn, rc, kind, p, flags) } else { blob_walk(lf, ln, lc, kind, p, flags) }
+                    }));
+                }
+            }
+        }
+    }
+}
+
+/// An XVD file whose header (at 0x200) passes the library's checks, or
+/// fails the one named.
+fn xvd_file(break_at: Option<usize>) -> Vec<u8> {
+    let mut f: Vec<u8> = (0..0x1200u32).map(|i| (i as u8).wrapping_mul(11).wrapping_add(5)).collect();
+    let h = &mut f[0x200..];
+    h[..8].copy_from_slice(b"msft-xvd");
+    h[0xa..0xc].fill(0);
+    h[0xc..0x10].copy_from_slice(&3u32.to_le_bytes());
+    h[0x18..0x20].copy_from_slice(&0x20_0000u64.to_le_bytes());
+    h[0x80..0x84].copy_from_slice(&1u32.to_le_bytes());
+    h[0x84..0x88].copy_from_slice(&6u32.to_le_bytes());
+    h[0x88..0x8c].copy_from_slice(&0x1000u32.to_le_bytes());
+    h[0x90..0x94].copy_from_slice(&1u32.to_le_bytes());
+    if let Some(at) = break_at {
+        h[at] ^= 0x41;
+    }
+    f
+}
+
+#[test]
+fn find_blobs_on_the_disc() {
+    let s = session();
+    trace_all(&s);
+    let (rf, lf) = both!("XCrdFindFirstBlob": FindFirstBlob);
+    let (rn, ln) = both!("XCrdFindNextBlob": FindNextBlob);
+    let (rc, lc) = both!("XCrdFindCloseBlob": FindCloseBlob);
+    let entry = |name: &str, attributes: u32, size: u64| reference::Entry { name: name.into(), attributes, size, time: 0x1d9_0000_0000_0000 + size };
+    let listings: Vec<Result<Vec<reference::Entry>, u32>> = vec![
+        Ok(vec![entry("game.xvd", 0x20, 0x20_0000), entry("Content", 0x10, 0), entry("small.bin", 0x20, 0x10), entry("big.xvd", 0x20, 0x1_0000_0000)]),
+        Ok(vec![]),
+        Err(3),
+        Err(0),
+    ];
+    let paths: Vec<Option<Vec<u16>>> = vec![None, Some(wz("")), Some(wz("Content")), Some(wz("\\a\\b"))];
+    let files = [xvd_file(None), xvd_file(Some(0)), xvd_file(Some(0xc)), xvd_file(Some(0x19)), xvd_file(Some(0x84)), xvd_file(None)[..0x900].to_vec()];
+    for drive in [5u32, 3] {
+        for (li, listing) in listings.iter().enumerate() {
+            for (pi, path) in paths.iter().enumerate() {
+                let p = path.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
+                for flags in [0u32, 1] {
+                    for (fi, file) in files.iter().enumerate() {
+                        for (errors, open_fails) in [((None, None), false), ((Some(0x19), None), false), ((None, Some(0x1e)), false), ((None, None), true)] {
+                            if (fi > 0 || errors != (None, None) || open_fails) && (flags == 0 || li != 0 || drive != 5 || pi > 1) {
+                                continue;
+                            }
+                            same(&format!("drive {drive} listing {li} path {pi} flags {flags} file {fi} {errors:?} {open_fails}"), run(&s, |s| {
+                                blob_machine(s, if open_fails { 5 } else { 0 });
+                                let (listing, file) = (listing.clone(), file.clone());
+                                s.fs(move |f| {
+                                    f.drive_type = drive;
+                                    f.entries = listing;
+                                    f.content = file;
+                                    f.seek_error = errors.0;
+                                    f.read_error = errors.1;
+                                });
+                            }, |side| if side { blob_walk(rf, rn, rc, 9, p, flags) } else { blob_walk(lf, ln, lc, 9, p, flags) }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The blob tests reach records, info blocks and the header checks.
+#[test]
+fn blob_tests_reach_their_paths() {
+    use super::find::{XCrdFindCloseBlob, XCrdFindFirstBlob, XCrdFindNextBlob};
+    let s = session();
+    trace_all(&s);
+    let crd = |view: &(Vec<u8>, Option<Vec<u8>>)| {
+        let at = u32::from_le_bytes(view.0[0x10..0x14].try_into().unwrap()) as usize;
+        String::from_utf16_lossy(&view.0[at..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).collect::<Vec<_>>())
+    };
+    let f: FindFirstBlob = unsafe { std::mem::transmute(XCrdFindFirstBlob as *const ()) };
+    let n: FindNextBlob = unsafe { std::mem::transmute(XCrdFindNextBlob as *const ()) };
+    let c: FindCloseBlob = unsafe { std::mem::transmute(XCrdFindCloseBlob as *const ()) };
+    blob_machine(&s, 0);
+    let sub = wz("sub");
+    let walk = blob_walk(f, n, c, 1, sub.as_ptr(), 1);
+    assert_eq!(walk.iter().filter(|(hr, v)| *hr >= 0 && v.is_some()).count(), 3, "{:?}", walk.iter().map(|w| w.0).collect::<Vec<_>>());
+    let first = walk[0].1.as_ref().unwrap();
+    assert!(crd(first).ends_with("\\sub\\game.xvc"), "{}", crd(first));
+    assert_eq!(first.1.as_ref().unwrap()[4], 1);
+    assert!(walk[1].1.as_ref().unwrap().1.is_none(), "a directory has no info");
+    blob_machine(&s, 0);
+    s.fs(|fs| {
+        fs.drive_type = 5;
+        fs.entries = Ok(vec![reference::Entry { name: "game.xvd".into(), attributes: 0x20, size: 0x20_0000, time: 1 }]);
+        fs.content = xvd_file(None);
+    });
+    let walk = blob_walk(f, n, c, 9, std::ptr::null(), 1);
+    let first = walk[0].1.as_ref().unwrap();
+    assert_eq!(crd(first), "[XOD:]\\O:\\game.xvd");
+    let info = first.1.as_ref().unwrap();
+    assert_eq!((info[4], u32::from_le_bytes(info[0x10..0x14].try_into().unwrap())), (1, 6));
+    assert!(s.take().fs.iter().any(|l| l.starts_with("read ") && l.contains(" 0xe00 at 0x200")));
+}

@@ -27,6 +27,8 @@ pub struct Record {
     pub messages: Vec<String>,
     pub sleeps: Vec<u32>,
     pub closed: Vec<usize>,
+    /// File-system calls, described.
+    pub fs: Vec<String>,
 }
 
 type Open = Box<dyn FnMut(&str) -> Result<usize, u32> + Send>;
@@ -38,6 +40,145 @@ struct Driver {
     record: Record,
     open: Open,
     reply: Reply,
+    fs: Fs,
+}
+
+/// A directory entry the fake file system lists.
+#[derive(Clone, Debug)]
+pub struct Entry {
+    pub name: String,
+    pub attributes: u32,
+    pub size: u64,
+    pub time: u64,
+}
+
+/// The fake file system: a drive type, one listing (or the error listing
+/// gives), one file's bytes (every handle reads the same), and errors to
+/// give for seeks and reads.
+#[derive(Clone, Debug)]
+pub struct Fs {
+    pub drive_type: u32,
+    pub entries: Result<Vec<Entry>, u32>,
+    pub content: Vec<u8>,
+    pub seek_error: Option<u32>,
+    pub read_error: Option<u32>,
+    next: usize,
+    position: u64,
+}
+
+impl Default for Fs {
+    fn default() -> Fs {
+        Fs { drive_type: 1, entries: Err(3), content: Vec::new(), seek_error: None, read_error: None, next: 0, position: 0 }
+    }
+}
+
+/// `WIN32_FIND_DATAW` for an entry; the times step by one.
+fn find_data(e: &Entry, data: *mut c_void) {
+    let mut b = [0u8; 0x250];
+    b[0..4].copy_from_slice(&e.attributes.to_le_bytes());
+    for (i, at) in [4usize, 0xc, 0x14].into_iter().enumerate() {
+        b[at..at + 8].copy_from_slice(&(e.time + i as u64).to_le_bytes());
+    }
+    b[0x1c..0x20].copy_from_slice(&((e.size >> 32) as u32).to_le_bytes());
+    b[0x20..0x24].copy_from_slice(&(e.size as u32).to_le_bytes());
+    b[0x24..0x28].copy_from_slice(&0x1234u32.to_le_bytes());
+    b[0x28..0x2c].copy_from_slice(&0x5678u32.to_le_bytes());
+    for (i, c) in e.name.encode_utf16().take(259).enumerate() {
+        b[0x2c + 2 * i..0x2e + 2 * i].copy_from_slice(&c.to_le_bytes());
+    }
+    for (i, c) in "ALT~1".encode_utf16().enumerate() {
+        b[0x234 + 2 * i..0x236 + 2 * i].copy_from_slice(&c.to_le_bytes());
+    }
+    // SAFETY: the caller's WIN32_FIND_DATAW.
+    unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), data.cast(), b.len()) };
+}
+
+fn set_last_error(e: u32) {
+    // SAFETY: plain.
+    unsafe { windows_sys::Win32::Foundation::SetLastError(e) };
+}
+
+/// The handle FindFirstFileW gives.
+pub const FIND: usize = FAKE + 0xf00;
+
+unsafe extern "system" fn fake_drive_type(root: *const u16) -> u32 {
+    // SAFETY: a NUL-terminated root.
+    let root = unsafe { super::wide_str(root) };
+    let mut d = driver();
+    d.record.fs.push(format!("drive type {root}"));
+    d.fs.drive_type
+}
+
+unsafe extern "system" fn fake_find_first(pattern: *const u16, data: *mut c_void) -> Handle {
+    // SAFETY: a NUL-terminated pattern.
+    let pattern = unsafe { super::wide_str(pattern) };
+    let mut d = driver();
+    d.record.fs.push(format!("find first {pattern}"));
+    match d.fs.entries.clone() {
+        Ok(list) if !list.is_empty() => {
+            find_data(&list[0], data);
+            d.fs.next = 1;
+            FIND as Handle
+        }
+        Ok(_) => {
+            set_last_error(2);
+            -1isize as Handle
+        }
+        Err(e) => {
+            set_last_error(e);
+            -1isize as Handle
+        }
+    }
+}
+
+unsafe extern "system" fn fake_find_next(find: Handle, data: *mut c_void) -> i32 {
+    let mut d = driver();
+    d.record.fs.push(format!("find next {:#x}", find as usize));
+    let list = d.fs.entries.clone().unwrap_or_default();
+    if d.fs.next < list.len() {
+        find_data(&list[d.fs.next], data);
+        d.fs.next += 1;
+        1
+    } else {
+        set_last_error(0x12);
+        0
+    }
+}
+
+unsafe extern "system" fn fake_find_close(find: Handle) -> i32 {
+    driver().record.fs.push(format!("find close {:#x}", find as usize));
+    1
+}
+
+unsafe extern "system" fn fake_seek(file: Handle, distance: i64, position: *mut i64, method: u32) -> i32 {
+    let mut d = driver();
+    d.record.fs.push(format!("seek {:#x} {distance:#x} {} {method}", file as usize, position.is_null()));
+    if let Some(e) = d.fs.seek_error {
+        set_last_error(e);
+        return 0;
+    }
+    d.fs.position = distance as u64;
+    1
+}
+
+unsafe extern "system" fn fake_read(file: Handle, buffer: *mut c_void, length: u32, read: *mut u32, overlapped: *mut c_void) -> i32 {
+    let mut d = driver();
+    let line = format!("read {:#x} {length:#x} at {:#x} {}", file as usize, d.fs.position, overlapped.is_null());
+    d.record.fs.push(line);
+    if let Some(e) = d.fs.read_error {
+        set_last_error(e);
+        return 0;
+    }
+    let from = (d.fs.position as usize).min(d.fs.content.len());
+    let n = (d.fs.content.len() - from).min(length as usize);
+    // SAFETY: the caller's buffer of `length` bytes.
+    unsafe { std::ptr::copy_nonoverlapping(d.fs.content[from..].as_ptr(), buffer.cast(), n) };
+    d.fs.position += n as u64;
+    if !read.is_null() {
+        // SAFETY: the caller's.
+        unsafe { *read = n as u32 };
+    }
+    1
 }
 
 /// Fake device handles start here (no real handle is this high and even).
@@ -51,6 +192,7 @@ fn driver() -> MutexGuard<'static, Driver> {
                 record: Record::default(),
                 open: Box::new(|_| Err(2)),
                 reply: Box::new(|_, _| 0xc000_0010_u32 as i32),
+                fs: Fs::default(),
             })
         })
         .lock()
@@ -246,6 +388,12 @@ const FAKE_SYS: Sys = Sys {
     rtl_subscribe_wnf: fake_subscribe_wnf,
     rtl_unsubscribe_wnf: fake_unsubscribe_wnf,
     nt_query_volume_information_file: fake_query_volume,
+    get_drive_type_w: fake_drive_type,
+    find_first_file_w: fake_find_first,
+    find_next_file_w: fake_find_next,
+    find_close: fake_find_close,
+    set_file_pointer_ex: fake_seek,
+    read_file: fake_read,
     ..sys::HOST
 };
 
@@ -286,7 +434,13 @@ fn load() -> Option<Library> {
 /// `base` is a loaded PE module.
 unsafe fn patch_imports(base: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let fakes: [(&str, usize); 12] = [
+    let fakes: [(&str, usize); 18] = [
+        ("GetDriveTypeW", fake_drive_type as *const () as usize),
+        ("FindFirstFileW", fake_find_first as *const () as usize),
+        ("FindNextFileW", fake_find_next as *const () as usize),
+        ("FindClose", fake_find_close as *const () as usize),
+        ("SetFilePointerEx", fake_seek as *const () as usize),
+        ("ReadFile", fake_read as *const () as usize),
         ("NtQueryVolumeInformationFile", fake_query_volume as *const () as usize),
         ("RtlQueryWnfStateData", fake_query_wnf as *const () as usize),
         ("RtlSubscribeWnfStateChangeNotification", fake_subscribe_wnf as *const () as usize),
@@ -367,6 +521,7 @@ pub fn session() -> Session {
         d.record = Record::default();
         d.open = Box::new(|_| Err(2));
         d.reply = Box::new(|_, _| 0xc000_0010_u32 as i32);
+        d.fs = Fs::default();
     }
     STEP.store(0, std::sync::atomic::Ordering::Relaxed);
     TICK.store(1_000_000, std::sync::atomic::Ordering::Relaxed);
@@ -382,6 +537,13 @@ impl Session {
     /// How the driver answers.
     pub fn reply(&self, reply: impl FnMut(&Call, &mut [u8]) -> i32 + Send + 'static) {
         driver().reply = Box::new(reply);
+    }
+
+    /// How the fake file system looks (its cursors reset).
+    pub fn fs(&self, edit: impl FnOnce(&mut Fs)) {
+        let mut d = driver();
+        d.fs = Fs { next: 0, position: 0, ..d.fs.clone() };
+        edit(&mut d.fs);
     }
 
     /// The clock restarts, advancing `step` ms each time it is read.
