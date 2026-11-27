@@ -49,6 +49,40 @@ pub(crate) fn on_wine() -> bool {
 /// Standard memory the title has handed to the system.
 static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
 
+/// Title memory committed through `XMemVirtualAlloc` (the heaps of a memory
+/// type included), less what the title decommitted or released since.
+static COMMITTED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// The title's committed memory and physical pages, for the GPU side's
+/// memory census.
+fn title_bytes() -> u64 {
+    let pages = page_table().pages.len() as u64 * PAGE as u64;
+    COMMITTED.load(Ordering::Relaxed).max(0) as u64 + pages
+}
+
+/// Bytes committed (private, not views) in `[at, at + len)`.
+fn committed_in(at: usize, len: usize) -> usize {
+    let mut sum = 0;
+    let mut p = at;
+    while p < at.saturating_add(len) {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe {
+            windows_sys::Win32::System::Memory::VirtualQuery(p as *const c_void, &mut info, size_of_val(&info))
+        };
+        if n == 0 || info.RegionSize == 0 {
+            break;
+        }
+        let end = (info.BaseAddress as usize + info.RegionSize).min(at + len);
+        if info.State == MEM_COMMIT && info.Type == windows_sys::Win32::System::Memory::MEM_PRIVATE {
+            sum += end - p;
+        }
+        p = end;
+    }
+    sum
+}
+
 #[doc(hidden)]
 pub mod spec;
 #[doc(hidden)]
@@ -223,6 +257,9 @@ pub extern "system" fn XMemVirtualAlloc(
         LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
     }
     if !at.is_null() {
+        if asked_kind & MEM_COMMIT != 0 {
+            COMMITTED.fetch_add(size as i64, Ordering::Relaxed);
+        }
         regions().note(at as usize, size, Region { kind: asked_kind, flags, protect: asked });
         // As the console: success clears the thread's error.
         set_last_error(0);
@@ -306,8 +343,9 @@ impl Regions {
     }
 }
 
-/// A region the title releases is forgotten (see [`title_virtual_free`]).
-fn forget_region(address: usize) {
+/// A region the title releases is forgotten (see [`title_virtual_free`]);
+/// returns the end of the allocation (`address` if none starts there).
+fn forget_region(address: usize) -> usize {
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
@@ -315,7 +353,7 @@ fn forget_region(address: usize) {
         windows_sys::Win32::System::Memory::VirtualQuery(address as *const c_void, &mut info, size_of_val(&info))
     };
     if n == 0 || info.AllocationBase as usize != address {
-        return;
+        return address;
     }
     // The whole allocation: up to the first region of another one.
     let mut end = address;
@@ -331,6 +369,7 @@ fn forget_region(address: usize) {
         end = next.BaseAddress as usize + next.RegionSize;
     }
     regions().cut(address, end);
+    end
 }
 
 /// What the title asks its memory to be (the console's protection, with the
@@ -2600,7 +2639,10 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
         victory_gpu::title_memory_freed(address as usize, size);
     }
     if kind & MEM_RELEASE != 0 && kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
-        forget_region(address as usize);
+        let end = forget_region(address as usize);
+        COMMITTED.fetch_sub(committed_in(address as usize, end.saturating_sub(address as usize)) as i64, Ordering::Relaxed);
+    } else if kind & windows_sys::Win32::System::Memory::MEM_DECOMMIT != 0 {
+        COMMITTED.fetch_sub(committed_in(address as usize, size) as i64, Ordering::Relaxed);
     }
     // SAFETY: the title's own arguments.
     unsafe { VirtualFree(address, size, kind) }
@@ -2634,6 +2676,7 @@ fn memory_class(at: usize) -> u8 {
 
 pub(crate) fn module() -> HleModule {
     victory_gpu::memclass::set_classifier(memory_class);
+    victory_gpu::census::set_title_bytes(title_bytes);
     HleModule {
         name: "xmem",
         dlls: &["xmem.dll", "kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],

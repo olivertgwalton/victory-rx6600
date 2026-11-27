@@ -26,8 +26,19 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// The title's own memory, committed (told by the runtime's xmem: its
+/// commits and its physical pages).
+static TITLE_BYTES: OnceLock<fn() -> u64> = OnceLock::new();
+
+/// Set once, by the runtime's xmem.
+pub fn set_title_bytes(f: fn() -> u64) {
+    let _ = TITLE_BYTES.set(f);
+}
+
 /// The keys, in the order they are printed.
-const KEYS: [&str; 22] = [
+const KEYS: [&str; 24] = [
+    "title_committed",
+    "duplicates",
     "private_commit",
     "working_set",
     "title_copies",
@@ -107,7 +118,14 @@ fn log(frame: u64) {
     // their twins, windows there, and host textures. (Pool blocks hold
     // placed host textures, which the textures count already.)
     let known_local = copies[2] + copies[3] + copies[4] + copies[5] + host_textures;
+    // Bytes of title data held again somewhere else: host copies of title
+    // memory, their card sides and twins, windows on the card (mapped or
+    // not), host textures (each made from title memory), view copies. The
+    // console holds each byte once; the goal is for this to be near 0.
+    let duplicates = copies[1] + known_local + crate::shadow::view_copy_bytes();
     let values: [u64; KEYS.len()] = [
+        TITLE_BYTES.get().map_or(UNKNOWN, |f| f()),
+        duplicates,
         private,
         working,
         copies[1],
@@ -193,11 +211,11 @@ mod tests {
         let mut values = [0u64; KEYS.len()];
         values[0] = 300 * MIB;
         let first = format_line(&values, &peaks);
-        assert!(first.starts_with("private_commit=300/300 "));
+        assert!(first.starts_with("title_committed=300/300 "));
         values[0] = 100 * MIB;
         values[1] = UNKNOWN;
         let second = format_line(&values, &peaks);
-        assert!(second.starts_with("private_commit=100/300 working_set=?/0 "));
+        assert!(second.starts_with("title_committed=100/300 duplicates=?/0 "));
         assert_eq!(second.split(' ').count(), KEYS.len());
     }
 }

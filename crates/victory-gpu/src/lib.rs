@@ -38,7 +38,7 @@ mod native;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
-mod census;
+pub mod census;
 #[cfg(windows)]
 mod compose;
 pub mod console;
