@@ -68,6 +68,96 @@ fn package_bytes() -> u64 {
     })
 }
 
+/// The package folder (the title's executable's).
+fn package_dir() -> Option<std::path::PathBuf> {
+    let exe = runtime::main_image().and_then(runtime::image_path)?;
+    Path::new(&exe).parent().map(Path::to_path_buf)
+}
+
+/// The package's chunk ids, from its layout (`layout_*.xml`, `<Chunk
+/// Id="...">`), in layout order; none without a layout.
+fn chunk_ids() -> &'static [u32] {
+    static IDS: OnceLock<Vec<u32>> = OnceLock::new();
+    IDS.get_or_init(|| {
+        let Some(dir) = package_dir() else {
+            return Vec::new();
+        };
+        let layout = std::fs::read_dir(&dir).into_iter().flatten().flatten().find(|e| {
+            let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+            name.starts_with("layout") && name.ends_with(".xml")
+        });
+        let Some(text) = layout.and_then(|e| std::fs::read_to_string(e.path()).ok()) else {
+            return Vec::new();
+        };
+        let ids = layout_chunks(&text);
+        tracing::info!(chunks = ids.len(), "package layout read");
+        ids
+    })
+}
+
+fn layout_chunks(text: &str) -> Vec<u32> {
+    text.split("<Chunk")
+        .skip(1)
+        .filter_map(|tag| {
+            let after = tag.split_once("Id=\"")?.1;
+            after.split('"').next()?.trim().parse().ok()
+        })
+        .collect()
+}
+
+/// The package's languages (`MicrosoftGame.config`'s `<Resource
+/// Language="...">`), in its order.
+fn languages() -> &'static [String] {
+    static LANGUAGES: OnceLock<Vec<String>> = OnceLock::new();
+    LANGUAGES.get_or_init(|| {
+        let config = package_dir().and_then(|dir| {
+            std::fs::read_dir(&dir).into_iter().flatten().flatten().find(|e| {
+                e.file_name().to_string_lossy().eq_ignore_ascii_case("MicrosoftGame.config")
+            })
+        });
+        config
+            .and_then(|e| std::fs::read_to_string(e.path()).ok())
+            .map(|text| config_languages(&text))
+            .unwrap_or_default()
+    })
+}
+
+fn config_languages(text: &str) -> Vec<String> {
+    text.split("<Resource ")
+        .skip(1)
+        .filter_map(|tag| Some(tag.split_once("Language=\"")?.1.split('"').next()?.to_string()))
+        .collect()
+}
+
+/// The package language that best fits `user` (the user's locale): the
+/// same, else one of the same language, else the package's first.
+fn best_locale<'a>(user: &str, languages: &'a [String]) -> Option<&'a str> {
+    let same = |l: &&String| l.eq_ignore_ascii_case(user);
+    let base = |l: &String| l.split('-').next().unwrap_or(l).to_ascii_lowercase();
+    let user_base = user.split('-').next().unwrap_or(user).to_ascii_lowercase();
+    languages
+        .iter()
+        .find(same)
+        .or_else(|| languages.iter().find(|l| base(l) == user_base))
+        .or(languages.first())
+        .map(String::as_str)
+}
+
+fn user_locale() -> String {
+    #[cfg(windows)]
+    {
+        let mut name = [0u16; 85];
+        // SAFETY: a buffer of LOCALE_NAME_MAX_LENGTH characters.
+        let n = unsafe {
+            windows_sys::Win32::Globalization::GetUserDefaultLocaleName(name.as_mut_ptr(), name.len() as i32)
+        };
+        if n > 1 {
+            return String::from_utf16_lossy(&name[..n as usize - 1]);
+        }
+    }
+    "en-US".into()
+}
+
 type This = *const Object;
 
 extern "system" fn current_identifier(_: This, size: usize, buffer: *mut u8) -> HRESULT {
@@ -247,6 +337,86 @@ extern "system" fn uninstall_package(_: This, id: *const c_char) -> bool {
     false
 }
 
+/// 0x40: progress is final, so there is nothing to bring up to date.
+extern "system" fn update_monitor(_: This, _: *const c_void) {}
+
+/// 0x58 (`XPackageGetUserLocale`): the package language that best fits the
+/// user's locale (en-US when the package lists none).
+extern "system" fn get_user_locale(_: This, size: usize, out: *mut u8) -> HRESULT {
+    let user = user_locale();
+    let locale = best_locale(&user, languages()).unwrap_or("en-US").to_string();
+    tracing::debug!(user, locale, "package user locale");
+    put_string(&locale, size, out, std::ptr::null_mut())
+}
+
+/// `XPackageChunkSelector`: a type (0 language, 1 tag, 2 chunk, 3 feature)
+/// and a chunk id or a string.
+#[repr(C)]
+struct Selector {
+    kind: u32,
+    value: usize,
+}
+
+const CHUNK_SELECTOR: u32 = 2;
+
+type AvailabilityCallback = extern "system" fn(*mut c_void, *const Selector, u32) -> bool;
+
+/// 0x68 (`XPackageEnumerateChunkAvailability`): every chunk of the layout,
+/// ready, for the chunk type; the layout's chunks name no languages, tags
+/// or features, so those types list nothing.
+extern "system" fn enumerate_availability(
+    _: This,
+    id: *const c_char,
+    kind: u32,
+    context: *mut c_void,
+    callback: Option<AvailabilityCallback>,
+) -> HRESULT {
+    if !is_ours(id) {
+        return NO_PACKAGE;
+    }
+    let Some(callback) = callback else {
+        return xasync::E_INVALIDARG;
+    };
+    if kind == CHUNK_SELECTOR {
+        for &chunk in chunk_ids() {
+            let selector = Selector { kind, value: chunk as usize };
+            if !callback(context, &selector, 0) {
+                break;
+            }
+        }
+    }
+    S_OK
+}
+
+/// 0x78 (`XPackageInstallChunks`): everything is installed; the monitor
+/// watches the finished installation.
+extern "system" fn install_chunks(
+    _: This,
+    id: *const c_char,
+    _count: u32,
+    _selectors: *const c_void,
+    _interval_ms: u32,
+    _suppress_confirmation: bool,
+    out: *mut *const c_void,
+) -> HRESULT {
+    if !is_ours(id) {
+        return NO_PACKAGE;
+    }
+    put(out, monitor())
+}
+
+/// 0xb8 (`XPackageMount`, the older synchronous mount): no other package
+/// is installed.
+extern "system" fn mount(_: This, id: *const c_char, _: *mut *const c_void) -> HRESULT {
+    tracing::info!(id = text(id).unwrap_or_default(), "package mount: not installed");
+    NO_PACKAGE
+}
+
+/// 0xc0 (`XPackageGetMountPathSize`): as `mount_path`, there are no mounts.
+extern "system" fn mount_path_size(_: This, _: *const c_void, _: *mut usize) -> HRESULT {
+    xasync::E_INVALIDARG
+}
+
 static MOUNT: u8 = 0;
 
 extern "system" fn mount_async(_: This, id: *const c_char, block: *mut AsyncBlock) -> HRESULT {
@@ -287,14 +457,14 @@ static VTABLE: Methods<40> = Methods([
     create_monitor as *const (),        // 0x28
     close_monitor as *const (),         // 0x30
     progress as *const (),              // 0x38
-    missing::<8> as *const (),          // 0x40 update a monitor
+    update_monitor as *const (),        // 0x40
     register_progress as *const (),     // 0x48
     unregister_progress as *const (),   // 0x50
-    missing::<11> as *const (),         // 0x58 user locale
+    get_user_locale as *const (),       // 0x58
     find_availability as *const (),     // 0x60
-    missing::<13> as *const (),         // 0x68 enumerate chunk availability
+    enumerate_availability as *const (), // 0x68
     change_order as *const (),          // 0x70
-    missing::<15> as *const (),         // 0x78 install chunks
+    install_chunks as *const (),        // 0x78
     install_chunks_async as *const (),  // 0x80
     install_chunks_result as *const (), // 0x88
     estimate_download as *const (),     // 0x90
@@ -302,8 +472,8 @@ static VTABLE: Methods<40> = Methods([
     missing::<20> as *const (),         // 0xa0
     missing::<21> as *const (),         // 0xa8
     missing::<22> as *const (),         // 0xb0
-    missing::<23> as *const (),         // 0xb8 mount (deprecated)
-    missing::<24> as *const (),         // 0xc0 mount path size
+    mount as *const (),                 // 0xb8 (deprecated)
+    mount_path_size as *const (),       // 0xc0
     mount_path as *const (),            // 0xc8
     close_mount as *const (),           // 0xd0
     missing::<27> as *const (),         // 0xd8
@@ -405,5 +575,24 @@ mod tests {
             S_OK
         );
         assert_eq!(xasync::XAsyncGetStatus(&mut block, true), NO_PACKAGE);
+    }
+
+    #[test]
+    fn layout_chunks_and_config_languages() {
+        let layout = r#"<Package>
+  <Chunk Id="1000">
+    <FileGroup SourcePath=".\" DestinationPath="\" Include="a.rpf" />
+  </Chunk>
+  <Chunk Id="3004" Marker="Launch">
+  </Chunk>
+</Package>"#;
+        assert_eq!(layout_chunks(layout), [1000, 3004]);
+        let config = r#"<Resources><Resource Language="en-US" /><Resource Language="fr-FR" /></Resources>"#;
+        let languages = config_languages(config);
+        assert_eq!(languages, ["en-US", "fr-FR"]);
+        assert_eq!(best_locale("fr-FR", &languages), Some("fr-FR"));
+        assert_eq!(best_locale("fr-CA", &languages), Some("fr-FR"));
+        assert_eq!(best_locale("de-DE", &languages), Some("en-US"));
+        assert_eq!(best_locale("de-DE", &[]), None);
     }
 }
