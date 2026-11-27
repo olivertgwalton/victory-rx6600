@@ -2363,7 +2363,8 @@ fn same_unordered<T: std::fmt::Debug + PartialEq>(what: &str, ((r, mut rr), (l, 
 
 /// Peer modes: 0 all well; 1 start refused; 2 start answered wrongly; 3
 /// reads fail; 4 reads answer another transfer; 5 reads give nothing; 6
-/// data short (the read waits for the teardown); 7 stop answered by a
+/// data short (the read waits for the teardown, so it is the only read: a
+/// later answer would feed it); 7 stop answered by a
 /// late read first; 8 stop refused; 9 stop answered wrongly; 10 the read
 /// request's write fails.
 fn xfer_peer(mode: u32) -> reference::Peer {
@@ -2457,7 +2458,7 @@ fn xfer_session(api: &XferApi, mode: u32) -> Vec<String> {
         log.push(format!("start again {:#x}", (api.start)(x, path.as_ptr())));
         if hr >= 0 {
             let mut pending = Vec::new();
-            for (offset, size) in [(0x1000u64, 0x200u32), (0x2_0000_0001, 0x400), (7, 1)].into_iter().take(if round == 0 { 3 } else { 1 }) {
+            for (offset, size) in [(0x1000u64, 0x200u32), (0x2_0000_0001, 0x400), (7, 1)].into_iter().take(if round == 0 && mode != 6 { 3 } else { 1 }) {
                 let mut buf = vec![0xccu8; size as usize];
                 let mut o = Box::new(super::xfer::Overlapped { internal: 0, internal_high: 0, offset: 0, event: new_event() });
                 let hr = (api.read)(x, offset, size, buf.as_mut_ptr(), &mut *o);
@@ -2580,4 +2581,57 @@ fn xfer_tests_reach_their_paths() {
     assert_eq!(logs[0].last().unwrap(), "uninit 0x0 true");
     assert!(logs[1].iter().any(|l| l.starts_with("result 0x80070016")), "{:?}", logs[1]);
     assert!(logs[2].iter().any(|l| l.starts_with("late result 0x800703e3")), "{:?}", logs[2]);
+}
+
+#[test]
+fn mapped_control_page() {
+    let s = session();
+    trace_all(&s);
+    let Some((rf, _)) = both_or_none::<extern "system" fn(*const c_void, *mut *mut c_void) -> HRESULT>("DStorageGetFactory") else {
+        return;
+    };
+    let (rp, lp) = both!("DStorageGetMappedControlPage": extern "system" fn(*mut u64) -> HRESULT);
+    super::control::reset();
+    let page = |side: bool| {
+        let mut p = 0xccu64;
+        let hr = if side { rp(&mut p) } else { lp(&mut p) };
+        (hr, p)
+    };
+    same("before any start", run(&s, |_| {}, page));
+    // The reference starts its factory in DStorageGetFactory; a GUID it
+    // does not know makes the query fail after the start.
+    let bogus = [0x5au8; 16];
+    let start = |side: bool| {
+        if side {
+            let mut out = std::ptr::null_mut();
+            let hr = rf(bogus.as_ptr().cast(), &mut out);
+            if hr == 0x8000_4002_u32 as i32 { 0 } else { hr }
+        } else {
+            super::control::initialize()
+        }
+    };
+    // The pages are real memory: the factory reads its debug flags (0
+    // here) from the first.
+    let pages: &'static [u32; 0x400] = Box::leak(Box::new([0u32; 0x400]));
+    let (first, second) = (pages.as_ptr() as u64, pages.as_ptr() as u64 + 0x800);
+    let mut answer = [0u8; 16];
+    answer[..8].copy_from_slice(&first.to_le_bytes());
+    answer[8..].copy_from_slice(&second.to_le_bytes());
+    for (what, adapter_ok, status) in [("no adapter", false, 0u32), ("refused", true, 0xc000_0022), ("mapped", true, 0), ("again", true, 0xc000_0022)] {
+        same(what, run(&s, move |s| {
+            s.open(move |n| if adapter_ok && n == "\\\\.\\Scsi0:" { Ok(FAKE) } else { Err(2) });
+            s.reply(move |call, b| {
+                if call.code == 0x7800_013c {
+                    b[..16].copy_from_slice(&answer);
+                    return status as i32;
+                }
+                b[4..12].copy_from_slice(&srb::SIGNATURE);
+                b[0x14..0x18].fill(0);
+                0
+            });
+        }, |side| (start(side), page(side))));
+    }
+    let mut p = 0;
+    lp(&mut p);
+    assert_eq!(p, second, "the layer maps the second page");
 }
