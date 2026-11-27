@@ -74,7 +74,10 @@ extern "system" fn launch_new_game(
     args: *const c_char,
     _user: *const c_void,
 ) {
-    let (exe, args) = (text(exe).unwrap_or_default(), text(args).unwrap_or_default());
+    let (exe, args) = (
+        text(exe).unwrap_or_default(),
+        text(args).unwrap_or_default(),
+    );
     tracing::info!(exe, args, "XLaunchNewGame");
     let current = runtime::main_image()
         .and_then(runtime::image_path)
@@ -184,16 +187,21 @@ extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
 }
 
 /// Accepted and dropped; the name goes to the debug log.
+/// As the console (RVA 0xc5210): user, service configuration id, play
+/// session id and event name are required (E_INVALIDARG).
 extern "system" fn write_event(
     _: This,
-    _user: *const c_void,
-    _service_config: *const c_char,
-    _session: *const c_char,
+    user: *const c_void,
+    service_config: *const c_char,
+    session: *const c_char,
     name: *const c_char,
     _dimensions: *const c_char,
     _measurements: *const c_char,
 ) -> HRESULT {
-    if !name.is_null() {
+    if user.is_null() || service_config.is_null() || session.is_null() || name.is_null() {
+        return super::xasync::E_INVALIDARG;
+    }
+    {
         // SAFETY: a non-null name is a NUL-terminated string.
         let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
         tracing::debug!(%name, "game event dropped");
@@ -238,15 +246,32 @@ mod tests {
 
     #[test]
     fn a_relaunch_keeps_our_options() {
-        let ours: Vec<std::ffi::OsString> =
-            ["run", "G:/game.exe", "--execute", "--console", "series-s", "--", "-old"]
-                .map(Into::into)
-                .into();
+        let ours: Vec<std::ffi::OsString> = [
+            "run",
+            "G:/game.exe",
+            "--execute",
+            "--console",
+            "series-s",
+            "--",
+            "-old",
+        ]
+        .map(Into::into)
+        .into();
         let current = std::ffi::OsStr::new("G:/game.exe");
         let again = relaunch_args(ours.clone(), current, "G:/game.exe", " -config=x  -y ");
-        let expected = ["run", "G:/game.exe", "--execute", "--console", "series-s", "--"];
+        let expected = [
+            "run",
+            "G:/game.exe",
+            "--execute",
+            "--console",
+            "series-s",
+            "--",
+        ];
         assert_eq!(again[..6], expected.map(std::ffi::OsString::from));
-        assert_eq!(again[6..], ["-config=x", "-y"].map(std::ffi::OsString::from));
+        assert_eq!(
+            again[6..],
+            ["-config=x", "-y"].map(std::ffi::OsString::from)
+        );
         let other = relaunch_args(ours, current, "G:/other.exe", "");
         assert_eq!(other.len(), 5);
         assert_eq!(other[1], "G:/other.exe");
@@ -256,10 +281,17 @@ mod tests {
     fn a_relaunch_replaces_a_relative_startup_executable() {
         // `runtime::set_image_path` makes this absolute before the launch.
         let current = std::path::absolute("game.exe").unwrap();
-        let ours: Vec<std::ffi::OsString> =
-            ["run", "game.exe", "--execute", "--console", "series-s", "--", "-old"]
-                .map(Into::into)
-                .into();
+        let ours: Vec<std::ffi::OsString> = [
+            "run",
+            "game.exe",
+            "--execute",
+            "--console",
+            "series-s",
+            "--",
+            "-old",
+        ]
+        .map(Into::into)
+        .into();
         let again = relaunch_args(
             ours,
             current.as_os_str(),
@@ -311,5 +343,38 @@ mod tests {
             token,
             true
         ));
+    }
+
+    /// XGameEventWrite's argument checks, as the console's (RVA 0xc5210).
+    #[test]
+    fn event_write_requires_what_the_console_requires() {
+        type Write = extern "system" fn(
+            This,
+            *const c_void,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+        ) -> HRESULT;
+        let write = crate::modules::xgameruntime::method::<Write>(&EVENTS_OBJECT, 0x18);
+        let user = std::ptr::dangling::<c_void>();
+        let (s, n) = (c"scid".as_ptr(), std::ptr::null());
+        assert_eq!(
+            write(&EVENTS_OBJECT, user, s, s, s, n, n),
+            S_OK,
+            "dimensions and measurements may be null"
+        );
+        for (u, a, b, c) in [
+            (std::ptr::null(), s, s, s),
+            (user, n, s, s),
+            (user, s, n, s),
+            (user, s, s, n),
+        ] {
+            assert_eq!(
+                write(&EVENTS_OBJECT, u, a, b, c, s, s),
+                crate::modules::xasync::E_INVALIDARG
+            );
+        }
     }
 }

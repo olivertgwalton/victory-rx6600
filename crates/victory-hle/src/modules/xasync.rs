@@ -700,7 +700,13 @@ pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
     if block.is_null() {
         return E_INVALIDARG;
     }
-    if wait && let Some(call) = call(block) {
+    let current = call(block);
+    // Console (RVA 0xc089c): waiting on a pending block with no call
+    // behind it is E_INVALIDARG.
+    if wait && current.is_none() && status(block) == E_PENDING {
+        return E_INVALIDARG;
+    }
+    if wait && let Some(call) = current {
         let done = lock(&call.done);
         drop(call.finished.wait_while(done, |d| !*d));
     }
@@ -713,8 +719,10 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
     }
     let hr = status(block);
     // Any nonnegative completion carries a result, not just S_OK: S_FALSE
-    // is a success code too and a provider may return data with it.
-    if hr >= 0 {
+    // is a success code too and a provider may return data with it. The
+    // console (RVA 0xc07c8) writes the size whenever the call's state is
+    // there, whatever its status.
+    if hr >= 0 || call(block).is_some() {
         // SAFETY: checked non-null.
         unsafe { out.write(words(block).1.load(Ordering::Acquire)) };
     }
@@ -840,7 +848,10 @@ pub fn pending_with(
     identity: *const c_void,
     work: impl FnOnce() -> Result<Vec<u8>, HRESULT> + Send + 'static,
 ) -> HRESULT {
-    type Data = Mutex<(Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>, Vec<u8>)>;
+    type Data = Mutex<(
+        Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>,
+        Vec<u8>,
+    )>;
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
         // SAFETY: the runtime passes valid provider data; the context is the
         // boxed state until cleanup frees it.
@@ -851,7 +862,11 @@ pub fn pending_with(
             OP_CLEANUP => drop(unsafe { Box::from_raw(state) }),
             OP_BEGIN => {
                 // SAFETY: as above; cleanup waits for completion.
-                let work = unsafe { &*state }.lock().unwrap_or_else(|e| e.into_inner()).0.take();
+                let work = unsafe { &*state }
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0
+                    .take();
                 let (block, state) = (data.block as usize, state as usize);
                 std::thread::spawn(move || {
                     let result = work.map_or(Err(E_ABORT), |work| work());
@@ -880,7 +895,13 @@ pub fn pending_with(
     }
     let state: Box<Data> = Box::new(Mutex::new((Some(Box::new(work)), Vec::new())));
     let context = Box::into_raw(state);
-    let hr = XAsyncBegin(block, context.cast(), identity, std::ptr::null(), Some(provider));
+    let hr = XAsyncBegin(
+        block,
+        context.cast(),
+        identity,
+        std::ptr::null(),
+        Some(provider),
+    );
     if hr < 0 {
         // SAFETY: refused before the call existed; still ours.
         drop(unsafe { Box::from_raw(context) });
@@ -1407,7 +1428,13 @@ mod tests {
         };
         let identity = 0x77 as *const c_void;
         assert_eq!(
-            XAsyncBegin(&mut block, std::ptr::null_mut(), identity, std::ptr::null(), Some(provider)),
+            XAsyncBegin(
+                &mut block,
+                std::ptr::null_mut(),
+                identity,
+                std::ptr::null(),
+                Some(provider)
+            ),
             S_OK
         );
         assert!(XTaskQueueDispatch(q, WORK, 0));
@@ -1418,11 +1445,20 @@ mod tests {
         let mut value = 0u64;
         let mut used = 0;
         assert_eq!(
-            XAsyncGetResult(&mut block, identity, 8, (&mut value as *mut u64).cast(), &mut used),
+            XAsyncGetResult(
+                &mut block,
+                identity,
+                8,
+                (&mut value as *mut u64).cast(),
+                &mut used
+            ),
             S_OK
         );
         assert_eq!((value, used), (0x1234, 8));
-        assert!(call(&raw mut block).is_none(), "the call ends with its result");
+        assert!(
+            call(&raw mut block).is_none(),
+            "the call ends with its result"
+        );
         XTaskQueueCloseHandle(q);
     }
 
@@ -1660,5 +1696,21 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(*lock(&EVENTS), ["canceled", "terminated"]);
         XTaskQueueCloseHandle(q);
+    }
+
+    /// The console's edges (RVAs 0xc089c, 0xc07c8): waiting on a pending
+    /// block with no call is E_INVALIDARG; without waiting it is pending.
+    #[test]
+    fn waiting_on_a_pending_block_without_a_call_is_invalid() {
+        // SAFETY: a block is plain data; zero is a new block.
+        let mut block: AsyncBlock = unsafe { std::mem::zeroed() };
+        words(&mut block)
+            .0
+            .store(E_PENDING as u32 as usize, Ordering::Release);
+        assert_eq!(XAsyncGetStatus(&mut block, true), E_INVALIDARG);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_PENDING);
+        let mut size = 7;
+        assert_eq!(XAsyncGetResultSize(&mut block, &mut size), E_PENDING);
+        assert_eq!(size, 7, "no call: nothing written");
     }
 }
