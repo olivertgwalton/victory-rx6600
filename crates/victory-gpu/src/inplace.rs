@@ -142,6 +142,11 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     Ok(Placed { buffer, heap, gpu, bias: start - at })
 }
 
+fn hostptr_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_HOSTPTR").is_some_and(|v| v == "1"))
+}
+
 fn whole_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_WHOLE").is_none_or(|v| v != "0"))
@@ -177,11 +182,78 @@ fn region_heap(device: &ID3D12Device, at: usize) -> Option<(ID3D12Heap, usize)> 
     heap.map(|h| (h, base))
 }
 
+/// The runtime's sections behind title memory (`VICTORY_XMEM_SECTIONS`):
+/// for an address, the section's handle, the offset in it and the bytes to
+/// its end.
+static SECTION_AT: std::sync::OnceLock<fn(usize) -> Option<(usize, u64, u64)>> = std::sync::OnceLock::new();
+
+/// Set once, by the runtime's xmem.
+pub fn set_section_at(f: fn(usize) -> Option<(usize, u64, u64)>) {
+    let _ = SECTION_AT.set(f);
+}
+
+/// Heaps opened on chunks of the runtime's sections as dma-bufs: by
+/// (section, chunk), with their pin. `None`: refused.
+#[allow(clippy::type_complexity)]
+static SECTION_HEAPS: std::sync::Mutex<Option<std::collections::HashMap<(usize, u64), Option<(ID3D12Heap, std::sync::Arc<crate::dmabuf::Pin>)>>>> =
+    std::sync::Mutex::new(None);
+
+/// The chunk sections are opened in: few heaps (each costs a little at
+/// every submission that names it), small enough to pin what is used.
+const CHUNK: u64 = 256 << 20;
+
+/// Title memory `[start, start + len)` in a section of the runtime's, placed
+/// in a dma-buf heap of its chunk; `None` if it is not, or the host refuses.
+fn place_in_section(device: &ID3D12Device, start: u64, len: u64) -> Option<Placed> {
+    let (handle, offset, left) = SECTION_AT.get()?(start as usize)?;
+    let at = offset & !(K64 as u64 - 1);
+    let bytes = (offset + len.max(1)).next_multiple_of(K64 as u64) - at;
+    let chunk = at / CHUNK * CHUNK;
+    let section_end = offset + left;
+    if at + bytes > chunk + CHUNK || at + bytes > section_end {
+        return None;
+    }
+    let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = heaps.get_or_insert_with(Default::default).entry((handle, chunk)).or_insert_with(|| {
+        let n = CHUNK.min(section_end - chunk);
+        match crate::dmabuf::open_heap_pinned(device, &[(handle, chunk, n)]) {
+            Ok((heap, pin)) => {
+                tracing::info!(section = format_args!("{handle:#x}"), chunk = format_args!("{chunk:#x}"), mb = n >> 20, "title memory in place: a chunk of a GPU heap opened as a dma-buf");
+                Some((heap, std::sync::Arc::new(pin)))
+            }
+            Err(e) => {
+                tracing::warn!(section = format_args!("{handle:#x}"), chunk = format_args!("{chunk:#x}"), error = %e, "title memory in place: a chunk not opened as a dma-buf");
+                None
+            }
+        }
+    });
+    let (heap, _pin) = entry.as_ref()?;
+    let buffer = place_with(device, heap, at - chunk, bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS).ok()?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (offset - at);
+    Some(Placed { buffer, heap: heap.clone(), gpu, bias: offset - at })
+}
+
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
+        return None;
+    }
+    // In a section of the runtime's: as a dma-buf, if it can be.
+    if crate::dmabuf::on()
+        && let Some(host) = crate::host::host()
+        && let Some(placed) = place_in_section(&host.device, start, len)
+    {
+        let at = if window { 0 } else { 2 };
+        STATS[at].fetch_add(1, Ordering::Relaxed);
+        STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+        return Some(placed);
+    }
+    // Heaps of host pointers cost every submission by their size: only when
+    // asked (`VICTORY_INPLACE_HOSTPTR=1`).
+    if !hostptr_on() {
         return None;
     }
     // View memory: known from the runtime without asking Windows.

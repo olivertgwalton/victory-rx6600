@@ -142,6 +142,10 @@ pub extern "system" fn XMemVirtualAlloc(
         }
     };
     let (base, size) = (request.base as usize as *mut c_void, request.size as usize);
+    if !base.is_null() && sections_on() && section_at(base as usize).is_some() {
+        set_last_error(0);
+        return base;
+    }
     let (lowest, highest, alignment) = request
         .params
         .iter()
@@ -215,7 +219,24 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
-    let mut at = allocate(&mut parameter);
+    // GPU memory reserved and committed at once may be a committed section
+    // instead (`VICTORY_XMEM_SECTIONS=1`): its pages can then go to the card
+    // as a dma-buf and be read in place, with no copy in the PC's memory.
+    let sectioned = constrained
+        && sections_on()
+        && asked_kind & (MEM_COMMIT | MEM_RESERVE) == (MEM_COMMIT | MEM_RESERVE)
+        && asked_kind & MEM_RESERVE_PLACEHOLDER == 0
+        && flags & spec::XMEM_GPU != 0
+        && size >= SECTION_MIN;
+    let mut at = if sectioned {
+        // SAFETY: the parameter points at `requirements`, which outlives the call.
+        unsafe { section_backed(size, protect, &mut parameter) }
+    } else {
+        std::ptr::null_mut()
+    };
+    if at.is_null() {
+        at = allocate(&mut parameter);
+    }
     if at.is_null() && constrained && lowest == 1 << 31 {
         // deviation: the host may hold parts of [2 GiB, 4 GiB) itself; any
         // 32-bit address will do then.
@@ -266,6 +287,77 @@ pub extern "system" fn XMemVirtualAlloc(
     }
     note_protection(asked, asked_kind, flags, at as usize, size);
     at
+}
+
+/// Whether GPU memory reserved and committed at once is a section
+/// (`VICTORY_XMEM_SECTIONS=1`, off by default).
+fn sections_on() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_XMEM_SECTIONS").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// The smallest allocation made a section: the title's GPU heaps are
+/// hundreds of MB; small ones stay private memory.
+const SECTION_MIN: usize = 16 * MIB;
+
+/// Section-backed allocations by base: the section's handle and bytes.
+static SECTIONED: Mutex<BTreeMap<usize, (usize, usize)>> = Mutex::new(BTreeMap::new());
+
+fn sectioned() -> MutexGuard<'static, BTreeMap<usize, (usize, usize)>> {
+    SECTIONED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A committed pagefile section of `size` bytes mapped read-write where
+/// `parameter`'s address requirements allow; null if the host refuses.
+///
+/// # Safety
+/// `parameter` is an address-requirements parameter whose pointer is live.
+unsafe fn section_backed(size: usize, protect: u32, parameter: &mut MEM_EXTENDED_PARAMETER) -> *mut c_void {
+    if protect != PAGE_READWRITE {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: plain section creation.
+    let handle = unsafe {
+        CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_COMMIT, (size as u64 >> 32) as u32, size as u32, std::ptr::null())
+    };
+    if handle.is_null() {
+        return std::ptr::null_mut();
+    }
+    // A placeholder where the address requirements allow (Wine's
+    // MapViewOfFile3 takes none), then the section in its place.
+    // SAFETY: plain reservation; the parameter is the caller's.
+    let hole = unsafe {
+        VirtualAlloc2(GetCurrentProcess(), std::ptr::null(), size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, parameter, 1)
+    };
+    if hole.is_null() {
+        // SAFETY: our handle.
+        unsafe { CloseHandle(handle) };
+        return std::ptr::null_mut();
+    }
+    // SAFETY: the whole of a section we own, over the placeholder just made.
+    let view = unsafe { MapViewOfFile3(handle, GetCurrentProcess(), hole, 0, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0) };
+    if view.Value.is_null() {
+        // SAFETY: our placeholder.
+        unsafe { VirtualFree(hole, 0, MEM_RELEASE) };
+    }
+    if view.Value.is_null() {
+        tracing::warn!(size, error = %std::io::Error::last_os_error(), "GPU memory as a section: refused; private memory instead");
+        // SAFETY: our handle.
+        unsafe { CloseHandle(handle) };
+        return std::ptr::null_mut();
+    }
+    sectioned().insert(view.Value as usize, (handle as usize, size));
+    tracing::info!(at = format_args!("{:#x}", view.Value as usize), mb = size >> 20, "GPU memory as a section");
+    view.Value
+}
+
+/// The section showing title memory at `at`, if it is a section-backed
+/// allocation: its handle, the offset of `at` in it and the bytes from
+/// there to its end (for the GPU side's in-place windows).
+fn section_at(at: usize) -> Option<(usize, u64, u64)> {
+    let s = sectioned();
+    let (&base, &(handle, size)) = s.range(..=at).next_back()?;
+    (at < base + size).then(|| (handle, (at - base) as u64, (base + size - at) as u64))
 }
 
 /// A request `xmem.dll` turns down, said for the 1st, 2nd, 4th.. time of
@@ -2634,6 +2726,27 @@ pub fn title_virtual_free_for_bench(address: *mut c_void) {
 /// first: the address may be other memory's the moment it is free.
 extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    // A section-backed allocation: released by unmapping it; a decommit
+    // inside it leaves the pages (a section cannot drop part of itself).
+    if sections_on() && let Some((handle, _, _)) = section_at(address as usize) {
+        if kind & MEM_RELEASE == 0 {
+            return 1;
+        }
+        let Some((handle, len)) = sectioned().remove(&(address as usize)) else {
+            set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        };
+        victory_gpu::title_memory_freed(address as usize, len);
+        forget_region(address as usize);
+        COMMITTED.fetch_sub(len as i64, Ordering::Relaxed);
+        // SAFETY: our view and our handle.
+        unsafe {
+            UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS { Value: address }, 0);
+            CloseHandle(handle as HANDLE);
+        }
+        let _ = handle;
+        return 1;
+    }
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::title_memory_freed(address as usize, size);
@@ -2677,6 +2790,7 @@ fn memory_class(at: usize) -> u8 {
 pub(crate) fn module() -> HleModule {
     victory_gpu::memclass::set_classifier(memory_class);
     victory_gpu::census::set_title_bytes(title_bytes);
+    victory_gpu::inplace::set_section_at(section_at);
     HleModule {
         name: "xmem",
         dlls: &["xmem.dll", "kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],

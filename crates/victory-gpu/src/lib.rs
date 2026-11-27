@@ -69,7 +69,7 @@ mod pixels;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
-mod inplace;
+pub mod inplace;
 #[cfg(windows)]
 mod port;
 #[cfg(windows)]
