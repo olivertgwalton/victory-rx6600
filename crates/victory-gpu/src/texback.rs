@@ -104,6 +104,31 @@ pub(crate) fn remapped(at: usize, len: usize) {
     invalidate(|ticket| at < ticket.end && ticket.at < end);
 }
 
+/// A texture of a kind copied back whose console layout the layer cannot
+/// address (`Layout::addressable`: MSAA, and XOR modes the console's
+/// library refuses): its texels could be copied off the card but not put
+/// back where the title's CPU code looks, so no copy is made. Logged once
+/// per kind and mode. Before the XOR modes had addresses this was the
+/// ocean's 256x256 R32_FLOAT height map in `SW_64KB_R_X` (RX 6600 XT run
+/// of the opening under Proton, 2026-11-26), so the CPU's samples of the sea
+/// read what the title last wrote there itself.
+fn untileable(desc: &victory_formats::texture::Desc) {
+    static SAID: Mutex<Vec<(u32, u32, u32, u32)>> = Mutex::new(Vec::new());
+    let key = (desc.width, desc.height, desc.element_bytes, desc.swizzle.0);
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if !said.contains(&key) {
+        said.push(key);
+        tracing::warn!(
+            width = desc.width,
+            height = desc.height,
+            element_bytes = desc.element_bytes,
+            swizzle = desc.swizzle.0,
+            samples = desc.samples,
+            "a texture shaders write and the title reads on the CPU is in a console layout the layer cannot address: not copied back"
+        );
+    }
+}
+
 pub(crate) struct Target {
     pub(crate) copy: Arc<crate::resource::HostTexture>,
     layout: victory_formats::texture::Layout,
@@ -117,6 +142,10 @@ impl Target {
         // Unranged: the texture's range is only what `title_texture` finds under this read.
         let _mapping = crate::watch::title_memory_reading();
         let (layout, at, size) = crate::resource::title_texture(resource)?;
+        if !layout.addressable() {
+            untileable(&layout.desc);
+            return None;
+        }
         let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
         let ticket = track(resource as usize, at, end);
         Some(Self { copy, layout, ticket })

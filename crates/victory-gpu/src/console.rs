@@ -36,9 +36,11 @@ impl Console {
 
 static SERIES_S: AtomicBool = AtomicBool::new(false);
 
-/// Set before the title starts.
+/// Set before the title starts. Also picks the pipe configuration console
+/// texture layouts in the XOR modes follow.
 pub fn set(console: Console) {
     SERIES_S.store(console == Console::SeriesS, Ordering::Relaxed);
+    victory_formats::texture::set_series_s(console == Console::SeriesS);
 }
 
 pub fn current() -> Console {

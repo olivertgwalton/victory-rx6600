@@ -14,7 +14,9 @@
 //! `GetMipTailDim`, `GetMaxNumMipsInTail`, `HwlComputeSurfaceInfoLinear`,
 //! `ComputeSurfaceAddrFromCoordMacroTiled`), and the 256-byte micro tile
 //! patterns in `MICRO` from `gfx10SwizzlePattern.h` (the RB+ tables, as on
-//! RDNA2). addrlib carries this notice:
+//! RDNA2). The pipe and bank XOR modes (`_T`, `_X`) take their per-bit
+//! terms from the console's own library (`crate::texture_xor`). addrlib
+//! carries this notice:
 //!
 //! Copyright (C) 2007-2026 Advanced Micro Devices, Inc. All rights reserved.
 //! SPDX-License-Identifier: MIT
@@ -31,6 +33,9 @@
 //! EXPRESS OR IMPLIED.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::texture_xor::XOR_TERMS;
 
 /// A swizzle mode, by its hardware number (addrlib's `ADDR_SW_*` order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -79,7 +84,7 @@ impl Swizzle {
     }
 
     /// Pipe and bank XOR modes (`_T`, `_X`): their addresses depend on the
-    /// GPU's pipe configuration.
+    /// GPU's pipe configuration (see [`set_series_s`]).
     pub fn xor(self) -> bool {
         self.0 >= 16
     }
@@ -182,6 +187,41 @@ pub struct Layout {
 }
 
 type SwizzlePattern = [Vec<u32>; 3];
+
+static SERIES_S: AtomicBool = AtomicBool::new(false);
+
+/// The console whose pipe configuration the XOR modes follow: Series S, or
+/// Series X (the default). Their addresses differ in the pipe bits (the
+/// console library's `XGSetHardwareVersion(4)`, which by the GDK's numbering
+/// is Series S, against any other value). Set before the title makes
+/// textures; layouts made earlier keep the configuration they were made
+/// with.
+pub fn set_series_s(series_s: bool) {
+    SERIES_S.store(series_s, Ordering::Relaxed);
+}
+
+/// The XOR modes' patterns: for each axis, the XOR of the terms of a
+/// coordinate's bits, as long as the highest bit that has a term. `None`
+/// for combinations the console's library refuses.
+fn xor_pattern(series_s: bool, swizzle: Swizzle, three_d: bool, element_log2: u32) -> Option<&'static SwizzlePattern> {
+    // Indexed by configuration, mode (16..=27), dimension, element size.
+    static PATTERNS: [[[[OnceLock<Option<SwizzlePattern>>; 5]; 2]; 12]; 2] =
+        [const { [const { [const { [const { OnceLock::new() }; 5] }; 2] }; 12] }; 2];
+    let mode = swizzle.0.checked_sub(16).filter(|&m| m < 12)?;
+    PATTERNS[usize::from(series_s)][mode as usize][usize::from(three_d)][element_log2 as usize]
+        .get_or_init(|| {
+            let (.., x, y, z) = XOR_TERMS.iter().find(|t| {
+                t.0 == series_s && u32::from(t.1) == swizzle.0 && t.2 == three_d && u32::from(t.3) == element_log2
+            })?;
+            Some([&x[..], &y[..], &z[..]].map(|terms| {
+                let bits = terms.iter().rposition(|&t| t != 0).map_or(0, |i| i + 1);
+                (0..1u32 << bits)
+                    .map(|c| (0..bits).filter(|&i| c >> i & 1 != 0).fold(0, |v, i| v ^ u32::from(terms[i])))
+                    .collect()
+            }))
+        })
+        .as_ref()
+}
 static EMPTY_PATTERN: SwizzlePattern = [const { Vec::new() }; 3];
 
 /// Micro tile (256 bytes) patterns by log2 of the element size: for each
@@ -280,6 +320,11 @@ const BLOCK_1K_3D: [[u32; 3]; 5] = [[16, 8, 8], [8, 8, 8], [8, 8, 4], [8, 4, 4],
 
 impl Layout {
     pub fn new(desc: &Desc) -> Result<Layout, Error> {
+        Layout::with_pipes(desc, SERIES_S.load(Ordering::Relaxed))
+    }
+
+    /// [`Layout::new`] for the pipe configuration of Series S or X.
+    pub fn with_pipes(desc: &Desc, series_s: bool) -> Result<Layout, Error> {
         let d = *desc;
         let block_log2 = d.swizzle.block_log2().ok_or(Error::Invalid)?;
         let valid = (1..=MAX_EXTENT).contains(&d.width)
@@ -302,7 +347,7 @@ impl Layout {
         if block_log2 == 0 {
             Ok(Layout::linear(d))
         } else {
-            Ok(Layout::tiled(d, block_log2))
+            Ok(Layout::tiled(d, block_log2, series_s))
         }
     }
 
@@ -344,7 +389,7 @@ impl Layout {
         }
     }
 
-    fn tiled(d: Desc, block_log2: u32) -> Layout {
+    fn tiled(d: Desc, block_log2: u32, series_s: bool) -> Layout {
         let element_log2 = d.element_bytes.trailing_zeros();
         let bpe = u64::from(d.element_bytes);
         let block_bytes = 1u64 << block_log2;
@@ -501,16 +546,17 @@ impl Layout {
         let slab = if thick { u64::from(block[2]) } else { 1 };
         let slice_size = slice_size * slab;
         let slices = slices / block[2];
-        let addressable = !d.swizzle.xor() && d.samples == 1;
-        let pattern = if addressable {
+        let pattern = if d.samples != 1 {
+            &EMPTY_PATTERN
+        } else if d.swizzle.xor() {
+            xor_pattern(series_s, d.swizzle, three_d, element_log2).unwrap_or(&EMPTY_PATTERN)
+        } else {
             let kind = if thick {
                 2
             } else {
                 usize::from(d.swizzle.display())
             };
             shared_pattern(kind, element_log2, block_log2)
-        } else {
-            &EMPTY_PATTERN
         };
         Layout {
             desc: d,
@@ -527,12 +573,11 @@ impl Layout {
     }
 
     /// Whether [`Layout::offset`] and the copies work for this layout:
-    /// linear and the modes without pipe or bank XOR, single-sampled.
+    /// linear and every mode the console's library takes, single-sampled.
     ///
-    /// shortcut: no addressing for the XOR modes (`_X`, `_T`) and MSAA;
-    /// they need the GPU's pipe and bank configuration (Series X and S
-    /// differ). Titles use them for render targets and depth, which the
-    /// host renders; add them when a title copies into or out of one.
+    /// shortcut: no addressing for MSAA; titles use it for render targets
+    /// and depth, which the host renders. Add it when a title copies into or
+    /// out of one.
     pub fn addressable(&self) -> bool {
         self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty()
     }
@@ -564,13 +609,27 @@ impl Layout {
                 Error::Invalid
             });
         }
-        let (slice, z) = self.split(z);
+        let (slice, _) = self.split(z);
         let base = u64::from(slice) * self.slice_size + m.offset;
         if self.desc.swizzle == Swizzle::LINEAR {
             let row = u64::from(y) * u64::from(m.pitch) + u64::from(x);
             return Ok(base + row * u64::from(self.desc.element_bytes));
         }
-        Ok(base + self.row(m, y, z) + self.column(m, x))
+        Ok(base + self.element(m, x, y, z))
+    }
+
+    /// An element's offset from its mip's start in the slice: whole blocks,
+    /// then the XOR of each axis's pattern (`z` the depth, or the array
+    /// slice for the XOR modes' terms). Without XOR the patterns take
+    /// separate bits, so this is their sum, as [`Layout::row`] plus
+    /// [`Layout::column`] give it.
+    fn element(&self, m: &Mip, x: u32, y: u32, z: u32) -> u64 {
+        let [bw, bh, _] = self.block;
+        let (x, y) = m.tail.map_or((x, y), |t| (x + t.x, y + t.y));
+        let blocks = u64::from(y / bh) * u64::from(m.pitch / bw) + u64::from(x / bw);
+        let p = &self.pattern;
+        let at = |axis: usize, c: u32| p[axis][c as usize & (p[axis].len() - 1)];
+        (blocks << self.alignment.trailing_zeros()) + u64::from(at(0, x) ^ at(1, y) ^ at(2, z))
     }
 
     /// The part of an address that depends on the row (and depth in a
@@ -706,6 +765,22 @@ impl Layout {
         let tiled_need = if DETILE { self.bytes_from(mip) } else { self.size };
         if tiled_len < tiled_need as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
+        }
+        if self.desc.swizzle.xor() {
+            // The axes' terms mix, so no run of a row repeats on the next:
+            // element by element.
+            for z in 0..depth {
+                let (s, _) = self.split(first + z);
+                let base = u64::from(s) * self.slice_size + m.offset;
+                for y in 0..m.height {
+                    let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                    for x in 0..m.width {
+                        let tiled = (base + self.element(m, x, y, first + z)) as usize;
+                        copy_run::<DETILE>(src, dst, tiled, linear_row + x as usize * n, n);
+                    }
+                }
+            }
+            return Ok(());
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
@@ -1079,6 +1154,45 @@ mod tests {
         }
     }
 
+    /// Element offsets of the XOR modes against the console's own library
+    /// (`texture_xor_points.txt`, from `tools/xg-terms`): 2D, arrays and 3D,
+    /// with mips and tails, Series X and S.
+    #[test]
+    fn xor_offsets_match_the_console_library() {
+        let mut layout = None;
+        let (mut cases, mut points) = (0, 0);
+        for line in include_str!("texture_xor_points.txt").lines() {
+            let f: Vec<u64> = match line.strip_prefix("case ") {
+                _ if line.starts_with('#') => continue,
+                Some(rest) => {
+                    let f: Vec<u32> = rest.split(' ').map(|v| v.parse().unwrap()).collect();
+                    let d = Desc {
+                        dimension: if f[1] == 4 { Dimension::Tex3d } else { Dimension::Tex2d },
+                        width: f[4],
+                        height: f[5],
+                        depth: f[6],
+                        mips: f[7],
+                        element_bytes: f[3],
+                        block: 1,
+                        samples: 1,
+                        swizzle: Swizzle(f[2]),
+                    };
+                    let l = Layout::with_pipes(&d, f[0] == 1).unwrap();
+                    assert!(l.addressable(), "{line}");
+                    layout = Some((l, line));
+                    cases += 1;
+                    continue;
+                }
+                None => line.split(' ').map(|v| v.parse().unwrap()).collect(),
+            };
+            let (l, case) = layout.as_ref().unwrap();
+            let (x, y, z, mip) = (f[0] as u32, f[1] as u32, f[2] as u32, f[3] as u32);
+            assert_eq!(l.offset(mip, x, y, z), Ok(f[4]), "{case}: {x} {y} {z} mip {mip}");
+            points += 1;
+        }
+        assert!(cases > 40 && points > 9000, "{cases} {points}");
+    }
+
     #[test]
     fn tiled_chunks_match_element_offsets_with_odd_row_pitches() {
         for swizzle in [
@@ -1088,6 +1202,10 @@ mod tests {
             Swizzle::SW_4KB_D,
             Swizzle::SW_64KB_S,
             Swizzle::SW_64KB_D,
+            Swizzle::SW_64KB_S_T,
+            Swizzle::SW_4KB_D_X,
+            Swizzle::SW_64KB_S_X,
+            Swizzle::SW_64KB_R_X,
         ] {
             for n in [1, 2, 4, 8, 16] {
                 let l = Layout::new(&Desc {
@@ -1379,7 +1497,8 @@ mod tests {
         assert_eq!(t.planes[0].layout.size, 1920 * 1152 * 4);
         assert_eq!(t.planes[1].offset, t.planes[0].layout.size);
         assert_eq!(t.planes[1].layout.size, 2048 * 1280);
-        assert!(!t.planes[0].layout.addressable());
+        // Both planes are XOR modes, which have addresses now.
+        assert!(t.planes.iter().all(|p| p.layout.addressable()));
     }
 
     #[test]
