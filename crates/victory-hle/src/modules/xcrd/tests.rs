@@ -1534,3 +1534,44 @@ fn storage_notifications() {
         }
     }
 }
+
+#[test]
+fn xds_volume_mappings() {
+    let s = session();
+    trace_all(&s);
+    let (rg, lg) = both!("XCrdXdsGetVolumeMapping": extern "system" fn(*const Adapter, *mut u8, *mut u32, *mut u8, *mut u32) -> HRESULT);
+    let (rs, ls) = both!("XCrdXdsSetVolumeMapping": extern "system" fn(*const Adapter, *const u16, *const u16) -> HRESULT);
+    let a = adapter();
+    // Answers: primary name of `p` bytes and an overlay record of `o` (0:
+    // none), or a status.
+    for (p, o, status) in [(8u32, 6u32, 0i32), (8, 0, 0), (0x40, 6, 0), (8, 0x40, 0), (0, 0, 0), (8, 6, 0x8000_0005_u32 as i32), (8, 6, 0xc000_0001_u32 as i32)] {
+        for (plen, olen, with_overlay) in [(0x20u32, 0x20u32, true), (0x20, 0x20, false), (0x20, 2, true), (4, 0x20, true), (0, 0x20, true), (0x20, 0, true)] {
+            same(&format!("get {p} {o} {status:#x} {plen} {olen} {with_overlay}"), run(&s, |s| s.reply(move |_, b| {
+                b[0..4].copy_from_slice(&(if o != 0 { 0x18u32 } else if status != 0 { 0x99 } else { 0 }).to_le_bytes());
+                b[8..12].copy_from_slice(&p.to_le_bytes());
+                for (i, x) in b.iter_mut().enumerate().skip(0xc).take(0xc) { *x = i as u8; }
+                if o != 0 && b.len() >= 0x18 + 0xc + (o as usize) {
+                    b[0x18 + 8..0x18 + 12].copy_from_slice(&o.to_le_bytes());
+                    for (i, x) in b.iter_mut().enumerate().skip(0x24).take(o as usize) { *x = (i as u8) ^ 0x80; }
+                }
+                status
+            }), |side| {
+                let (mut pb, mut ob) = ([0xccu8; 0x40], [0xccu8; 0x40]);
+                let (mut pl, mut ol) = (plen, olen);
+                let f = if side { rg } else { lg };
+                let hr = f(&a, pb.as_mut_ptr(), &mut pl, if with_overlay { ob.as_mut_ptr() } else { std::ptr::null_mut() }, &mut ol);
+                (hr, pl, ol, pb, ob)
+            }));
+        }
+    }
+    for (primary, overlay) in [("C:\\data", Some("D:\\overlay\\")), ("C:\\data\\", None), ("\\\\?\\Volume{1}", Some("x"))] {
+        for status in [0, 0xc000_0001_u32 as i32] {
+            same(&format!("set {primary} {overlay:?} {status:#x}"), run(&s, |s| s.reply(move |_, _| status), |side| {
+                let p = wz(primary);
+                let o = overlay.map(wz);
+                let f = if side { rs } else { ls };
+                f(&a, p.as_ptr(), o.as_ref().map_or(std::ptr::null(), |o| o.as_ptr()))
+            }));
+        }
+    }
+}

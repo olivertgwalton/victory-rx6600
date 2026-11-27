@@ -22,6 +22,7 @@ pub mod notify;
 pub mod regions;
 pub mod storage;
 pub mod xas;
+pub mod xds;
 pub mod srb;
 pub mod sys;
 #[cfg(test)]
@@ -520,6 +521,7 @@ pub(crate) fn exports() -> Vec<HleExport> {
     all.extend(disks::exports());
     all.extend(xas::exports());
     all.extend(notify::exports());
+    all.extend(xds::exports());
     all.extend([
         hle_export!(XCrdSetTraceFlags),
         hle_export!(XCrdBuildPath),
