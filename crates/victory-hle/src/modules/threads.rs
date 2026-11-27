@@ -538,6 +538,52 @@ pub extern "system" fn GetThreadIdealProcessorEx(thread: *mut c_void, ideal: *mu
     1
 }
 
+/// What ntdll's `TpAllocWork` (+0x14d60), `TpAllocWait` (+0x6d230) and
+/// `TpAllocTimer` (+0x6d710) refuse before making the object: no callback,
+/// or a callback environment whose flags (`+0x38`: long function,
+/// persistent) have other bits. Wine made a timer with no callback.
+fn pool_refuses(callback: *mut c_void, environment: *const u8) -> bool {
+    // SAFETY: the title's environment, a TP_CALLBACK_ENVIRON_V3 if not null.
+    callback.is_null()
+        || (!environment.is_null()
+            && unsafe { environment.add(0x38).cast::<u32>().read_unaligned() } & !3 != 0)
+}
+
+macro_rules! pool_constructor {
+    ($(#[$doc:meta])* $name:ident, $host:literal) => {
+        $(#[$doc])*
+        pub extern "system" fn $name(
+            callback: *mut c_void,
+            context: *mut c_void,
+            environment: *const u8,
+        ) -> *mut c_void {
+            if pool_refuses(callback, environment) {
+                set_last_error(ERROR_INVALID_PARAMETER);
+                return std::ptr::null_mut();
+            }
+            host!("kernel32.dll", $host: extern "system" fn(
+                *mut c_void, *mut c_void, *const u8,
+            ) -> *mut c_void)(callback, context, environment)
+        }
+    };
+}
+
+pool_constructor!(
+    /// `CreateThreadpoolWork` (+0xd4a40 → `TpAllocWork`): see [`pool_refuses`].
+    CreateThreadpoolWork,
+    "CreateThreadpoolWork"
+);
+pool_constructor!(
+    /// `CreateThreadpoolWait` (+0xeed00 → `TpAllocWait`): see [`pool_refuses`].
+    CreateThreadpoolWait,
+    "CreateThreadpoolWait"
+);
+pool_constructor!(
+    /// `CreateThreadpoolTimer` (+0x69ae0 → `TpAllocTimer`): see [`pool_refuses`].
+    CreateThreadpoolTimer,
+    "CreateThreadpoolTimer"
+);
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "threads",
@@ -545,6 +591,7 @@ pub(crate) fn module() -> HleModule {
             "kernel32.dll",
             "kernelbase.dll",
             "api-ms-win-core-processthreads-*",
+            "api-ms-win-core-threadpool-*",
         ],
         exports: vec![
             hle_export!(InitializeProcThreadAttributeList),
@@ -553,6 +600,9 @@ pub(crate) fn module() -> HleModule {
             hle_export!(CreateRemoteThreadEx),
             hle_export!(SetThreadIdealProcessorEx),
             hle_export!(GetThreadIdealProcessorEx),
+            hle_export!(CreateThreadpoolWork),
+            hle_export!(CreateThreadpoolWait),
+            hle_export!(CreateThreadpoolTimer),
         ],
     }
 }
@@ -880,5 +930,29 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    extern "system" fn work(_: *mut c_void, _: *mut c_void, _: *mut c_void) {}
+
+    /// ntdll TpAllocWork/Wait/Timer: no callback, or environment flags
+    /// beyond long-function/persistent, fail with ERROR_INVALID_PARAMETER.
+    #[test]
+    fn pool_objects_need_a_callback_and_known_flags() {
+        let null = std::ptr::null_mut();
+        let close_work = host!("kernel32.dll", "CloseThreadpoolWork": extern "system" fn(*mut c_void));
+        type Make = extern "system" fn(*mut c_void, *mut c_void, *const u8) -> *mut c_void;
+        let makers: [Make; 3] = [CreateThreadpoolWork, CreateThreadpoolWait, CreateThreadpoolTimer];
+        for make in makers {
+            assert!(make(null, null, std::ptr::null()).is_null());
+            assert_eq!(last_error(), ERROR_INVALID_PARAMETER);
+            let mut environment = [0u8; 0x48];
+            environment[0] = 3; // version
+            environment[0x38] = 4;
+            assert!(make(work as *mut c_void, null, environment.as_ptr()).is_null());
+            assert_eq!(last_error(), ERROR_INVALID_PARAMETER);
+        }
+        let item = CreateThreadpoolWork(work as *mut c_void, null, std::ptr::null());
+        assert!(!item.is_null());
+        close_work(item);
     }
 }

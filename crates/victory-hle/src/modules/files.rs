@@ -482,6 +482,57 @@ pub extern "system" fn FindFirstFileExW(
     )
 }
 
+/// `CopyFile2` (KernelBase +0xf9890): the title's paths, rewritten, and
+/// the console's checks on the extended parameters first (Wine copies
+/// regardless): a size of 0x20 or 0x70 (whose six reserved quadwords at
+/// +0x40 are zero), no flag bit 30, and no "restartable"/"no offload"
+/// (0x4002) with "request compressed traffic" (bit 27): `E_INVALIDARG`.
+pub extern "system" fn CopyFile2(from: *const u16, to: *const u16, params: *const u8) -> i32 {
+    const E_INVALIDARG: i32 = 0x8007_0057_u32 as i32;
+    if !params.is_null() {
+        // SAFETY: the title passes COPYFILE2_EXTENDED_PARAMETERS(_V2) of the size it gives.
+        let ok = unsafe {
+            let size = params.cast::<u32>().read_unaligned();
+            let flags = params.add(4).cast::<u32>().read_unaligned();
+            let reserved_clear = size != 0x70
+                || (0..6).all(|i| params.add(0x40 + 8 * i).cast::<u64>().read_unaligned() == 0);
+            (size == 0x20 || size == 0x70)
+                && reserved_clear
+                && flags & 1 << 30 == 0
+                && !(flags & 0x4002 != 0 && flags & 1 << 27 != 0)
+        };
+        if !ok {
+            return E_INVALIDARG;
+        }
+    }
+    let (from, to) = (wide(from), wide(to));
+    host!("kernel32.dll", "CopyFile2": extern "system" fn(*const u16, *const u16, *const u8) -> i32)(
+        from.ptr(),
+        to.ptr(),
+        params,
+    )
+}
+
+/// The title's paths, rewritten (the link and its target).
+pub extern "system" fn CreateHardLinkW(link: *const u16, target: *const u16, security: *mut c_void) -> i32 {
+    let (link, target) = (wide(link), wide(target));
+    host!("kernel32.dll", "CreateHardLinkW": extern "system" fn(*const u16, *const u16, *mut c_void) -> i32)(
+        link.ptr(),
+        target.ptr(),
+        security,
+    )
+}
+
+/// See [`CreateHardLinkW`].
+pub extern "system" fn CreateSymbolicLinkW(link: *const u16, target: *const u16, flags: u32) -> u8 {
+    let (link, target) = (wide(link), wide(target));
+    host!("kernel32.dll", "CreateSymbolicLinkW": extern "system" fn(*const u16, *const u16, u32) -> u8)(
+        link.ptr(),
+        target.ptr(),
+        flags,
+    )
+}
+
 pub extern "system" fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32 {
     let (from, to) = (wide(from), wide(to));
     host!("kernel32.dll", "MoveFileExW": extern "system" fn(*const u16, *const u16, u32) -> i32)(
@@ -749,6 +800,9 @@ pub(crate) fn module() -> HleModule {
             hle_export!(FindFirstFileW),
             hle_export!(FindFirstFileExW),
             hle_export!(MoveFileExW),
+            hle_export!(CopyFile2),
+            hle_export!(CreateHardLinkW),
+            hle_export!(CreateSymbolicLinkW),
             hle_export!(SetCurrentDirectoryA),
             hle_export!(_wfopen),
             hle_export!(_wfopen_s),
@@ -780,6 +834,33 @@ mod tests {
 
     /// KernelBase +0x70d70: bad levels, search ops and flags fail first
     /// (Wine accepted flag 0x10), "limit to devices" as not supported.
+    /// KernelBase +0xf9890: bad extended parameters fail before anything
+    /// is copied (Wine copied with a 39-byte struct).
+    #[test]
+    fn file_copies_check_their_parameters_first() {
+        let w = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("a.bin");
+        std::fs::write(&from, b"abc").unwrap();
+        let to = dir.path().join("b.bin");
+        let (f, t) = (w(&from.to_string_lossy()), w(&to.to_string_lossy()));
+        let mut v1 = [0u8; 0x20];
+        for (len, size, flags, reserved) in [(0x20, 39u32, 0u32, false), (0x20, 0x20, 1 << 30, false), (0x20, 0x20, 0x2 | 1 << 27, false), (0x70, 0x70, 0, true)] {
+            let mut params = vec![0u8; len];
+            params[..4].copy_from_slice(&size.to_le_bytes());
+            params[4..8].copy_from_slice(&flags.to_le_bytes());
+            if reserved {
+                params[0x48] = 1;
+            }
+            assert_eq!(CopyFile2(f.as_ptr(), t.as_ptr(), params.as_ptr()), 0x8007_0057_u32 as i32);
+            assert!(!to.exists());
+        }
+        v1[..4].copy_from_slice(&0x20u32.to_le_bytes());
+        v1[4..8].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(CopyFile2(f.as_ptr(), t.as_ptr(), v1.as_ptr()), 0);
+        assert_eq!(std::fs::read(&to).unwrap(), b"abc");
+    }
+
     #[test]
     fn directory_searches_check_their_arguments_first() {
         let path: Vec<u16> = "C:\\*".encode_utf16().chain(Some(0)).collect();

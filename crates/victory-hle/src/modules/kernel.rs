@@ -540,6 +540,29 @@ pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> 
     unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
 }
 
+/// `WerRegisterFile` (KernelBase +0x10c300 → +0xab870): files a crash
+/// report should carry. Wine answers `E_NOTIMPL`; the console checks the
+/// arguments and keeps the file in the process's report block. There is
+/// no report to make here, so the files are only kept (and logged).
+pub extern "system" fn WerRegisterFile(file: *const u16, kind: u32, flags: u32) -> i32 {
+    const E_INVALIDARG: i32 = 0x8007_0057_u32 as i32;
+    // HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE).
+    const TOO_LONG: i32 = 0x8007_00ce_u32 as i32;
+    // User document (1) or other (2); flags: anonymous data, delete when done.
+    if file.is_null() || flags & !3 != 0 || !(1..=2).contains(&kind) {
+        return E_INVALIDARG;
+    }
+    let path = wide(file);
+    // The entry is a 0x20-byte header and the path with its NUL, 0x228 at most.
+    if (path.encode_utf16().count() + 1) * 2 + 0x20 > 0x228 {
+        return TOO_LONG;
+    }
+    tracing::info!(path, kind, flags, "the title registers a file for its crash reports");
+    static FILES: std::sync::Mutex<Vec<(String, u32, u32)>> = std::sync::Mutex::new(Vec::new());
+    FILES.lock().unwrap_or_else(|e| e.into_inner()).push((path, kind, flags));
+    0
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -551,6 +574,7 @@ pub(crate) fn module() -> HleModule {
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-core-processenvironment-*",
+            "api-ms-win-core-windowserrorreporting-*",
             "api-ms-win-crt-runtime-*",
         ],
         exports: vec![
@@ -558,6 +582,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(__p___argv),
             hle_export!(GetCommandLineA),
             hle_export!(GetCommandLineW),
+            hle_export!(WerRegisterFile),
             hle_export!(GetModuleHandleW),
             hle_export!(GetModuleHandleA),
             hle_export!(GetModuleFileNameW),
@@ -1024,5 +1049,20 @@ mod tests {
     #[cfg(windows)]
     fn wide_string(p: *const u16) -> String {
         wide(p)
+    }
+
+    /// KernelBase +0xab870: the console's argument checks, then S_OK
+    /// (Wine: E_NOTIMPL for every call).
+    #[test]
+    fn crash_report_files_are_checked_and_kept() {
+        let name = w(r"T:\\crash\\log.txt");
+        assert_eq!(WerRegisterFile(std::ptr::null(), 1, 0), 0x8007_0057_u32 as i32);
+        assert_eq!(WerRegisterFile(name.as_ptr(), 3, 0), 0x8007_0057_u32 as i32);
+        assert_eq!(WerRegisterFile(name.as_ptr(), 1, 4), 0x8007_0057_u32 as i32);
+        let long = w(&"a".repeat(260));
+        assert_eq!(WerRegisterFile(long.as_ptr(), 2, 0), 0x8007_00ce_u32 as i32);
+        let longest = w(&"a".repeat(259));
+        assert_eq!(WerRegisterFile(longest.as_ptr(), 2, 0), 0);
+        assert_eq!(WerRegisterFile(name.as_ptr(), 1, 3), 0);
     }
 }
