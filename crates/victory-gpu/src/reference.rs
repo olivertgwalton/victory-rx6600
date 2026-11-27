@@ -462,8 +462,8 @@ const OWN_AT_CONSTANT: &[(&str, usize, &str)] = &[
 #[cfg(test)]
 #[rustfmt::skip]
 const NOT_WRITTEN: &[(&str, usize)] = &[
-    // device: 38
-    ("device", 0xf0), ("device", 0x150), ("device", 0x160), ("device", 0x168), ("device", 0x170), ("device", 0x178), ("device", 0x188), ("device", 0x1d8), ("device", 0x1e0), ("device", 0x1f8), ("device", 0x220), ("device", 0x240), ("device", 0x268), ("device", 0x290), ("device", 0x2a0), ("device", 0x2e0), ("device", 0x2e8), ("device", 0x2f0), ("device", 0x2f8), ("device", 0x328), ("device", 0x330), ("device", 0x368), ("device", 0x370), ("device", 0x378), ("device", 0x380), ("device", 0x388), ("device", 0x390), ("device", 0x398), ("device", 0x3a0), ("device", 0x3b0), ("device", 0x3c0), ("device", 0x3d8), ("device", 0x400), ("device", 0x408), ("device", 0x430), ("device", 0x440), ("device", 0x448), ("device", 0x450),
+    // device: 32
+    ("device", 0xf0), ("device", 0x150), ("device", 0x168), ("device", 0x170), ("device", 0x178), ("device", 0x188), ("device", 0x1d8), ("device", 0x1e0), ("device", 0x1f8), ("device", 0x220), ("device", 0x240), ("device", 0x268), ("device", 0x290), ("device", 0x2a0), ("device", 0x2e8), ("device", 0x2f0), ("device", 0x2f8), ("device", 0x328), ("device", 0x330), ("device", 0x378), ("device", 0x388), ("device", 0x390), ("device", 0x398), ("device", 0x3a0), ("device", 0x3b0), ("device", 0x3c0), ("device", 0x3d8), ("device", 0x408), ("device", 0x430), ("device", 0x440), ("device", 0x448), ("device", 0x450),
     // queue: 6
     ("queue", 0x40), ("queue", 0x48), ("queue", 0xc8), ("queue", 0xe8), ("queue", 0xf0), ("queue", 0x128),
     // list: 38

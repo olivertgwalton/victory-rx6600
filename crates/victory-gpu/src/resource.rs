@@ -4754,3 +4754,192 @@ float4 lit() : SV_Target { return 1.0; }
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
     }
 }
+
+/// Device methods 0x2e0 `CreateCommittedResource1` and 0x368
+/// `CreateCommittedResource2` (D3D12's Device4/Device8 overloads; GameOS
+/// `xgs12_10.dll` +0x57190, +0x59950, named by its debug build): as
+/// [`create_committed`], with a protected session (none on the console's
+/// titles) and, for the second, a `D3D12_RESOURCE_DESC1` (the plain
+/// description and the sampler-feedback mip region after it).
+#[allow(clippy::too_many_arguments)] // the method's own arguments
+pub(crate) extern "system" fn create_committed1(
+    this: This,
+    heap: *const HeapProperties,
+    heap_flags: u32,
+    desc: *const ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+    _protected: This,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    create_committed(this, heap, heap_flags, desc, state, clear, iid, out)
+}
+
+/// Device method 0x370 `CreatePlacedResource1(heap, offset, desc1, state,
+/// clear, iid, out)` (+0x59b10): as [`create_placed`].
+pub(crate) extern "system" fn create_placed1(
+    this: This,
+    heap: This,
+    offset: u64,
+    desc: *const ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    create_placed(this, heap, offset, desc, state, clear, iid, out)
+}
+
+/// Device method 0x400 `CreatePlacedResource2(heap, offset, desc1, layout,
+/// clear, castable count, castable formats, iid, out)` (+0xa57f0): as
+/// [`create_placed`] in the common state, as [`create_committed3`] does.
+#[allow(clippy::too_many_arguments)] // the method's own arguments
+pub(crate) extern "system" fn create_placed2(
+    this: This,
+    heap: This,
+    offset: u64,
+    desc: *const ResourceDesc,
+    _layout: u32,
+    clear: *const c_void,
+    _castable_count: u32,
+    _castable: *const u32,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    const COMMON: u32 = 0;
+    create_placed(this, heap, offset, desc, COMMON, clear, iid, out)
+}
+
+/// Device method 0x380 `GetCopyableFootprints1` (+0x6caa0): as
+/// [`copyable_footprints`], of a `D3D12_RESOURCE_DESC1`.
+#[allow(clippy::too_many_arguments)] // the method's own arguments
+pub(crate) extern "system" fn copyable_footprints1(
+    this: This,
+    desc: *const ResourceDesc,
+    first: u32,
+    count: u32,
+    base: u64,
+    layouts: *mut PlacedFootprint,
+    rows: *mut u32,
+    row_sizes: *mut u64,
+    total: *mut u64,
+) {
+    copyable_footprints(this, desc, first, count, base, layouts, rows, row_sizes, total)
+}
+
+/// Device method 0x160 `CreatePlacedResourceX(address, desc, state, clear,
+/// iid, out)` (+0x57660): [`create_at_address`] (0x428, its `X1`) with a
+/// state for a layout, which that ignores alike.
+pub(crate) extern "system" fn create_at_address_x(
+    this: This,
+    address: u64,
+    desc: *const ResourceDesc,
+    _state: u32,
+    clear: *const c_void,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    create_at_address(this, address, desc, 0, clear, iid, out)
+}
+
+/// The creation overloads (device 0x160, 0x2e0, 0x368, 0x370, 0x380, 0x400;
+/// GameOS `xgs12_10.dll`, named by its debug build) through the device's
+/// table, against the methods they are overloads of, given the same
+/// description.
+#[cfg(test)]
+mod overloads {
+    use super::*;
+    use crate::object::slot;
+
+    const PROPERTIES: HeapProperties = HeapProperties { kind: 1, cpu_pages: 0, pool: 0, creation_nodes: 0, visible_nodes: 0 };
+    fn buffer(width: u64) -> ResourceDesc {
+        ResourceDesc { dimension: BUFFER, alignment: 0, width, height: 1, depth_or_array_size: 1, mip_levels: 1, format: 0, sample_count: 1, sample_quality: 0, layout: 1, flags: 0 }
+    }
+    /// A `D3D12_RESOURCE_DESC1`: the description, then the mip region.
+    #[repr(C)]
+    struct Desc1(ResourceDesc, [u32; 3]);
+    fn heap(size: u64) -> This {
+        let desc = HeapDesc { size, properties: PROPERTIES, alignment: 0, flags: 0 };
+        let mut heap = std::ptr::null();
+        assert_eq!(create_heap(std::ptr::null(), &desc, &HEAP_IIDS[0], &mut heap), S_OK);
+        heap
+    }
+    fn release(r: This) {
+        slot::<extern "system" fn(This) -> u32>(r, 0x10)(r);
+    }
+    type Committed1 = extern "system" fn(This, *const HeapProperties, u32, *const ResourceDesc, u32, *const c_void, This, *const Iid, *mut This) -> HRESULT;
+
+    #[test]
+    fn committed_overloads_make_what_create_committed_makes() {
+        let d = crate::device::device();
+        let null: This = std::ptr::null();
+        let mut base = null;
+        assert_eq!(create_committed(d, &PROPERTIES, 0, &buffer(4096), 0, null.cast(), &RESOURCE_IIDS[0], &mut base), S_OK);
+        let desc1 = Desc1(buffer(4096), [0; 3]);
+        for o in [0x2e0, 0x368] {
+            let mut r = null;
+            assert_eq!(slot::<Committed1>(d, o)(d, &PROPERTIES, 0, &desc1.0, 0, null.cast(), null, &RESOURCE_IIDS[0], &mut r), S_OK, "{o:#x}");
+            assert_eq!(buffer_bytes(r).map(|b| b.1), buffer_bytes(base).map(|b| b.1), "{o:#x}");
+            release(r);
+        }
+        release(base);
+    }
+
+    #[test]
+    fn placed_overloads_place_where_create_placed_places() {
+        let d = crate::device::device();
+        let null: This = std::ptr::null();
+        let h = heap(1 << 20);
+        let desc1 = Desc1(buffer(4096), [0; 3]);
+        let mut base = null;
+        assert_eq!(create_placed(d, h, 65536, &desc1.0, 0, null.cast(), &RESOURCE_IIDS[0], &mut base), S_OK);
+        let mut one = null;
+        let f = slot::<extern "system" fn(This, This, u64, *const ResourceDesc, u32, *const c_void, *const Iid, *mut This) -> HRESULT>(d, 0x370);
+        assert_eq!(f(d, h, 65536, &desc1.0, 0, null.cast(), &RESOURCE_IIDS[0], &mut one), S_OK);
+        let mut two = null;
+        let f = slot::<extern "system" fn(This, This, u64, *const ResourceDesc, u32, *const c_void, u32, *const u32, *const Iid, *mut This) -> HRESULT>(d, 0x400);
+        assert_eq!(f(d, h, 65536, &desc1.0, 0, null.cast(), 0, null.cast(), &RESOURCE_IIDS[0], &mut two), S_OK);
+        let at = |r: This| buffer_bytes(r).map(|b| b.0 as usize);
+        assert_eq!((at(one), at(two)), (at(base), at(base)));
+        for r in [one, two, base, h] {
+            release(r);
+        }
+    }
+
+    #[test]
+    fn footprints1_are_the_footprints_of_its_description() {
+        let d = crate::device::device();
+        let tex = ResourceDesc { dimension: 3, alignment: 0, width: 100, height: 60, depth_or_array_size: 1, mip_levels: 3, format: 28, sample_count: 1, sample_quality: 0, layout: 0, flags: 0 };
+        let desc1 = Desc1(tex, [0; 3]);
+        let run = |f: extern "system" fn(This, *const ResourceDesc, u32, u32, u64, *mut PlacedFootprint, *mut u32, *mut u64, *mut u64)| {
+            let mut l: [PlacedFootprint; 3] = unsafe { std::mem::zeroed() };
+            let (mut rows, mut sizes, mut total) = ([0u32; 3], [0u64; 3], 0u64);
+            f(d, &desc1.0, 0, 3, 0, l.as_mut_ptr(), rows.as_mut_ptr(), sizes.as_mut_ptr(), &mut total);
+            (l.map(|p| (p.offset, p.row_pitch, p.width, p.height)), rows, sizes, total)
+        };
+        assert_eq!(run(slot(d, 0x380)), run(copyable_footprints));
+    }
+
+    #[test]
+    fn placed_x_is_its_x1_with_a_state() {
+        let d = crate::device::device();
+        let null: This = std::ptr::null();
+        let h = heap(1 << 20);
+        // SAFETY: a heap we just made.
+        let address = unsafe { (*h.cast::<Heap>()).memory.ptr.as_ptr() } as u64;
+        let mut x = null;
+        let f = slot::<extern "system" fn(This, u64, *const ResourceDesc, u32, *const c_void, *const Iid, *mut This) -> HRESULT>(d, 0x160);
+        let hr_x = f(d, address, &buffer(4096), 0, null.cast(), &RESOURCE_IIDS[0], &mut x);
+        let mut x1 = null;
+        let g = slot::<extern "system" fn(This, u64, *const ResourceDesc, u32, *const c_void, *const Iid, *mut This) -> HRESULT>(d, 0x428);
+        let hr_x1 = g(d, address, &buffer(4096), 0, null.cast(), &RESOURCE_IIDS[0], &mut x1);
+        assert_eq!(hr_x, hr_x1);
+        if hr_x == S_OK {
+            assert_eq!(buffer_bytes(x).map(|b| b.0 as usize), buffer_bytes(x1).map(|b| b.0 as usize));
+            release(x);
+            release(x1);
+        }
+        release(h);
+    }
+}
