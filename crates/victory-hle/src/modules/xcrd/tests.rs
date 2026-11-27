@@ -1035,3 +1035,143 @@ fn headers_against_the_library() {
     same("offset null", run(&s, |_| {}, |r| if r { ro(h.as_ptr(), std::ptr::null_mut()) } else { lo(h.as_ptr(), std::ptr::null_mut()) }));
     same("validate null info", run(&s, |_| {}, |r| if r { rv(h.as_ptr(), 0x1000, 0, std::ptr::null()) } else { lv(h.as_ptr(), 0x1000, 0, std::ptr::null()) }));
 }
+
+/// Prints, for an information export's fixed classes, which answer bytes
+/// land where in the caller's structure (as copy runs `dst <- src, len`),
+/// by answering with bodies whose bytes name their own offsets.
+fn learn(name: &str, classes: &[(u32, usize)], call: &dyn Fn(usize, u32, *mut u8, u32) -> HRESULT) {
+    let s = session();
+    let _ = reference::reference(name).expect("reference");
+    for &(class, size) in classes {
+        // Room past the minimum, to see writes beyond it.
+        let room = size + 0x200;
+        let mut seen: Vec<[Option<u8>; 2]> = vec![[None; 2]; room];
+        for half in 0..2 {
+            let mut outs = Vec::new();
+            for fill in [0xccu8, 0x33] {
+                s.reply(accepting(move |_, body| {
+                    for (i, b) in body.iter_mut().enumerate() {
+                        if i >= 0x10 {
+                            *b = if half == 0 { i as u8 } else { (i >> 8) as u8 };
+                        }
+                    }
+                }));
+                let mut out = vec![fill; room];
+                let hr = call(0, class, out.as_mut_ptr(), size as u32);
+                assert!(hr >= 0, "{name} class {class}: {hr:#x}");
+                outs.push(out);
+                s.take();
+            }
+            for o in 0..room {
+                let (x, y) = (outs[0][o], outs[1][o]);
+                seen[o][half] = if x != 0xcc { Some(x) } else if y != 0x33 { Some(y) } else { None };
+            }
+        }
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+        for (o, v) in seen.iter().enumerate() {
+            if let [Some(lo), Some(hi)] = v {
+                let src = usize::from(*lo) | usize::from(*hi) << 8;
+                match runs.last_mut() {
+                    Some((d, sr, n)) if *d + *n == o && *sr + *n == src => *n += 1,
+                    _ => runs.push((o, src, 1)),
+                }
+            }
+        }
+        let text: Vec<String> = runs.iter().map(|(d, s, n)| format!("({d:#x}, {s:#x}, {n:#x})")).collect();
+        eprintln!("MAP {name} {class:#x} {size:#x}: [{}]", text.join(", "));
+    }
+}
+
+#[test]
+#[ignore = "prints the reference's field maps"]
+fn learn_xvd_information() {
+    let Some(r) = reference::reference("XCrdQueryXvdInformation") else { return };
+    let f: extern "system" fn(*const Adapter, *const u16, u32, *mut u8, u32) -> HRESULT = unsafe { std::mem::transmute(r) };
+    let a = adapter();
+    let p = wz("[XUC:]\\x");
+    let classes = [(0, 0x80), (2, 8), (3, 0x80), (4, 8), (5, 0x18), (6, 1), (7, 0x168), (8, 0x158), (9, 1), (0xa, 0x40), (0xb, 0x150), (0xc, 1), (0xd, 0x1f8), (0xe, 0x1f8), (0xf, 0x1f8), (0x10, 0x1f8), (0x11, 1), (0x12, 8), (0x14, 0x40)];
+    learn("XCrdQueryXvdInformation", &classes, &|_, c, o, n| f(&a, p.as_ptr(), c, o, n));
+}
+
+/// Prints, for a setter's classes, which bytes of the caller's structure
+/// land where in the body sent (`body <- info, len`), and the body's other
+/// non-zero bytes before `upto`.
+fn learn_set(name: &str, classes: &[(u32, usize)], upto: usize, call: &dyn Fn(u32, *const u8, u32) -> HRESULT) {
+    let s = session();
+    for &(class, size) in classes {
+        let mut bodies = Vec::new();
+        for half in 0..2 {
+            let info: Vec<u8> = (0..0x400usize).map(|i| if half == 0 { i as u8 } else { (i >> 8) as u8 ^ 0x80 }).collect();
+            s.reply(accepting(|_, _| {}));
+            let hr = call(class, info.as_ptr(), size as u32);
+            let r = s.take();
+            let body = r.calls.first().map(|c| c.input[0x1c..].to_vec()).unwrap_or_default();
+            eprintln!("  {name} class {class:#x}: hr {hr:#x}, body {:#x} bytes", body.len());
+            bodies.push(body);
+        }
+        let (a, b) = (&bodies[0], &bodies[1]);
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+        let mut consts = Vec::new();
+        for o in 0..a.len().min(b.len()).min(upto) {
+            if a[o] != b[o] {
+                let src = usize::from(a[o]) | usize::from(b[o] ^ 0x80) << 8;
+                match runs.last_mut() {
+                    Some((d, sr, n)) if *d + *n == o && *sr + *n == src => *n += 1,
+                    _ => runs.push((o, src, 1)),
+                }
+            } else if a[o] != 0 {
+                consts.push((o, a[o]));
+            }
+        }
+        let text: Vec<String> = runs.iter().map(|(d, s, n)| format!("({d:#x}, {s:#x}, {n:#x})")).collect();
+        eprintln!("SET {name} {class:#x}: [{}] consts {consts:x?}", text.join(", "));
+    }
+}
+
+#[test]
+#[ignore = "prints the reference's field maps"]
+fn learn_set_xvd_information() {
+    let Some(r) = reference::reference("XCrdSetXvdInformation") else { return };
+    let f: extern "system" fn(*const Adapter, *const u16, u32, *const u8, u32) -> HRESULT = unsafe { std::mem::transmute(r) };
+    let a = adapter();
+    let p = wz("[XUC:]\\x");
+    let classes = [(0, 8), (1, 0x10), (2, 0x10), (3, 0), (5, 4), (6, 4), (7, 4), (0xa, 8), (0xb, 8)];
+    learn_set("XCrdSetXvdInformation", &classes, 0x110, &|c, i, n| f(&a, p.as_ptr(), c, i, n));
+}
+
+const XVD_CLASSES: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0xffff_ffff, 0x8000_0000];
+const INFO_SIZES: &[u64] = &[0x800, 0, 1, 8, 0x10, 0x54, 0x7f, 0x1f8, 0x20a];
+
+#[test]
+fn fuzz_xvd_information() {
+    for class in XVD_CLASSES {
+        let c: &'static [u64] = Box::leak(Box::new([*class]));
+        // The answer's string (class 0x13) ends inside it.
+        // Class 1's count (+0x10) is kept small elsewhere: the library copies
+        // that many entries whatever the buffer.
+        fuzz_keeping("XCrdQueryXvdInformation", &[Adp, Path, Int(c), OutOpt(0x800), Int(INFO_SIZES)], W32, &[0x10..0x12, 0x100..0x102]);
+        fuzz("XCrdSetXvdInformation", &[Adp, Path, Int(c), InOpt(0x800), Int(INFO_SIZES)], W32);
+    }
+    fuzz("XCloudQueryFeatureBits", &[Adp, Out(8)], W32);
+    fuzz("XCloudSetFeatureBits", &[Adp, In(8)], W32);
+}
+
+#[test]
+fn xvd_information_entry_counts() {
+    let s = session();
+    let (r, l) = both!("XCrdQueryXvdInformation": extern "system" fn(*const Adapter, *const u16, i32, *mut u8, u32) -> HRESULT);
+    let a = adapter();
+    let p = wz("[XUC:]\\x");
+    for n in [0u16, 1, 2, 0x3f, 0x40] {
+        same(&format!("{n} entries"), run(&s, |s| s.reply(accepting(move |_, body| {
+            for (i, b) in body.iter_mut().enumerate().skip(0x12) {
+                *b = (i as u8).wrapping_mul(13);
+            }
+            body[0x10..0x12].copy_from_slice(&n.to_le_bytes());
+        })), |side| {
+            let mut out = vec![0xccu8; 0x800];
+            ((if side { r(&a, p.as_ptr(), 1, out.as_mut_ptr(), 0x402) } else { l(&a, p.as_ptr(), 1, out.as_mut_ptr(), 0x402) }), out)
+        }));
+    }
+}
+
