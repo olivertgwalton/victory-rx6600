@@ -41,6 +41,141 @@ struct Driver {
     open: Open,
     reply: Reply,
     fs: Fs,
+    pipe: Pipe,
+}
+
+/// Answers the pipe's peer gives a message written to it: bytes for the
+/// library to read.
+pub type Peer = Box<dyn FnMut(&[u8]) -> Vec<u8> + Send>;
+
+/// The fake transfer pipe and the service on its other end. Reads that
+/// find nothing wait (overlapped) until a write makes the peer answer.
+#[derive(Default)]
+pub struct Pipe {
+    pub create_error: Option<u32>,
+    /// 0 already connected, 1 connects later, 2 says done at once, 3 fails.
+    pub connect: u32,
+    /// The write of a message of this type fails.
+    pub fail_write: Option<u32>,
+    pub peer: Option<Peer>,
+    incoming: std::collections::VecDeque<u8>,
+    pending: Option<(usize, usize, u32)>,
+    done: std::collections::HashMap<usize, u32>,
+    cancelled: std::collections::HashSet<usize>,
+}
+
+/// The pipe's handle.
+pub const PIPE: usize = FAKE + 0xc00;
+
+impl Pipe {
+    /// Hands waiting data to a pending read, completing it.
+    fn feed(&mut self) {
+        if self.incoming.is_empty() {
+            return;
+        }
+        if let Some((overlapped, buffer, len)) = self.pending.take() {
+            let n = self.take_into(buffer, len);
+            self.done.insert(overlapped, n);
+            // SAFETY: the reader's OVERLAPPED: its event at 0x18.
+            unsafe { windows_sys::Win32::System::Threading::SetEvent(((overlapped + 0x18) as *const Handle).read()) };
+        }
+    }
+
+    fn take_into(&mut self, buffer: usize, len: u32) -> u32 {
+        let n = (len as usize).min(self.incoming.len());
+        for i in 0..n {
+            // SAFETY: the reader's buffer of `len` bytes.
+            unsafe { ((buffer + i) as *mut u8).write(self.incoming.pop_front().unwrap()) };
+        }
+        n as u32
+    }
+}
+
+unsafe extern "system" fn fake_create_pipe(name: *const u16, open: u32, mode: u32, instances: u32, out: u32, inn: u32, timeout: u32, security: *const c_void) -> Handle {
+    // SAFETY: a NUL-terminated name.
+    let name = unsafe { super::wide_str(name) };
+    let mut d = driver();
+    d.record.fs.push(format!("create pipe {name} {open:#x} {mode} {instances} {out} {inn} {timeout} {}", security.is_null()));
+    if let Some(e) = d.pipe.create_error {
+        set_last_error(e);
+        return -1isize as Handle;
+    }
+    PIPE as Handle
+}
+
+unsafe extern "system" fn fake_connect_pipe(pipe: Handle, overlapped: *mut c_void) -> i32 {
+    let mut d = driver();
+    d.record.fs.push(format!("connect pipe {:#x}", pipe as usize));
+    match d.pipe.connect {
+        0 => set_last_error(0x217),
+        1 => {
+            set_last_error(0x3e5);
+            // SAFETY: the OVERLAPPED's event.
+            unsafe { windows_sys::Win32::System::Threading::SetEvent(overlapped.cast::<u8>().add(0x18).cast::<Handle>().read()) };
+        }
+        2 => return 1,
+        _ => set_last_error(5),
+    }
+    0
+}
+
+unsafe extern "system" fn fake_disconnect_pipe(pipe: Handle) -> i32 {
+    driver().record.fs.push(format!("disconnect pipe {:#x}", pipe as usize));
+    1
+}
+
+/// A message, described: its type and its first fields.
+fn describe(bytes: &[u8]) -> String {
+    let words: Vec<String> = bytes.chunks(4).take(8).map(|c| {
+        let mut w = [0u8; 4];
+        w[..c.len()].copy_from_slice(c);
+        format!("{:x}", u32::from_le_bytes(w))
+    }).collect();
+    format!("{} bytes [{}]", bytes.len(), words.join(" "))
+}
+
+unsafe extern "system" fn fake_write(file: Handle, buffer: *const c_void, length: u32, written: *mut u32, overlapped: *mut c_void) -> i32 {
+    // SAFETY: the writer's buffer.
+    let bytes = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), length as usize) }.to_vec();
+    let mut d = driver();
+    d.record.fs.push(format!("write {:#x} {} {}", file as usize, describe(&bytes), written.is_null()));
+    if file as usize != PIPE {
+        set_last_error(6);
+        return 0;
+    }
+    let kind = u32::from_le_bytes(bytes[..4.min(bytes.len())].try_into().unwrap_or([0; 4]));
+    if d.pipe.fail_write == Some(kind) {
+        set_last_error(0xe8);
+        return 0;
+    }
+    let answer = d.pipe.peer.as_mut().map(|p| p(&bytes)).unwrap_or_default();
+    d.pipe.incoming.extend(answer);
+    d.pipe.done.insert(overlapped as usize, length);
+    d.pipe.feed();
+    1
+}
+
+unsafe extern "system" fn fake_overlapped_result(file: Handle, overlapped: *mut c_void, bytes: *mut u32, wait: i32) -> i32 {
+    let mut d = driver();
+    d.record.fs.push(format!("overlapped result {:#x} wait {wait}", file as usize));
+    if let Some(n) = d.pipe.done.remove(&(overlapped as usize)) {
+        // SAFETY: the caller's.
+        unsafe { *bytes = n };
+        return 1;
+    }
+    let e = if d.pipe.cancelled.remove(&(overlapped as usize)) { 0x3e3 } else { 0x3e4 };
+    set_last_error(e);
+    0
+}
+
+unsafe extern "system" fn fake_cancel_io(file: Handle, overlapped: *mut c_void) -> i32 {
+    let mut d = driver();
+    d.record.fs.push(format!("cancel {:#x}", file as usize));
+    if d.pipe.pending.is_some_and(|(o, _, _)| o == overlapped as usize) {
+        d.pipe.pending = None;
+        d.pipe.cancelled.insert(overlapped as usize);
+    }
+    1
 }
 
 /// A directory entry the fake file system lists.
@@ -163,6 +298,17 @@ unsafe extern "system" fn fake_seek(file: Handle, distance: i64, position: *mut 
 
 unsafe extern "system" fn fake_read(file: Handle, buffer: *mut c_void, length: u32, read: *mut u32, overlapped: *mut c_void) -> i32 {
     let mut d = driver();
+    if file as usize == PIPE {
+        d.record.fs.push(format!("read pipe {length:#x}"));
+        if !d.pipe.incoming.is_empty() {
+            let n = d.pipe.take_into(buffer as usize, length);
+            d.pipe.done.insert(overlapped as usize, n);
+            return 1;
+        }
+        d.pipe.pending = Some((overlapped as usize, buffer as usize, length));
+        set_last_error(0x3e5);
+        return 0;
+    }
     let line = format!("read {:#x} {length:#x} at {:#x} {}", file as usize, d.fs.position, overlapped.is_null());
     d.record.fs.push(line);
     if let Some(e) = d.fs.read_error {
@@ -193,6 +339,7 @@ fn driver() -> MutexGuard<'static, Driver> {
                 open: Box::new(|_| Err(2)),
                 reply: Box::new(|_, _| 0xc000_0010_u32 as i32),
                 fs: Fs::default(),
+                pipe: Pipe::default(),
             })
         })
         .lock()
@@ -394,6 +541,12 @@ const FAKE_SYS: Sys = Sys {
     find_close: fake_find_close,
     set_file_pointer_ex: fake_seek,
     read_file: fake_read,
+    create_named_pipe_w: fake_create_pipe,
+    connect_named_pipe: fake_connect_pipe,
+    disconnect_named_pipe: fake_disconnect_pipe,
+    write_file: fake_write,
+    get_overlapped_result: fake_overlapped_result,
+    cancel_io_ex: fake_cancel_io,
     ..sys::HOST
 };
 
@@ -434,7 +587,13 @@ fn load() -> Option<Library> {
 /// `base` is a loaded PE module.
 unsafe fn patch_imports(base: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let fakes: [(&str, usize); 18] = [
+    let fakes: [(&str, usize); 24] = [
+        ("CreateNamedPipeW", fake_create_pipe as *const () as usize),
+        ("ConnectNamedPipe", fake_connect_pipe as *const () as usize),
+        ("DisconnectNamedPipe", fake_disconnect_pipe as *const () as usize),
+        ("WriteFile", fake_write as *const () as usize),
+        ("GetOverlappedResult", fake_overlapped_result as *const () as usize),
+        ("CancelIoEx", fake_cancel_io as *const () as usize),
         ("GetDriveTypeW", fake_drive_type as *const () as usize),
         ("FindFirstFileW", fake_find_first as *const () as usize),
         ("FindNextFileW", fake_find_next as *const () as usize),
@@ -522,6 +681,7 @@ pub fn session() -> Session {
         d.open = Box::new(|_| Err(2));
         d.reply = Box::new(|_, _| 0xc000_0010_u32 as i32);
         d.fs = Fs::default();
+        d.pipe = Pipe::default();
     }
     STEP.store(0, std::sync::atomic::Ordering::Relaxed);
     TICK.store(1_000_000, std::sync::atomic::Ordering::Relaxed);
@@ -544,6 +704,13 @@ impl Session {
         let mut d = driver();
         d.fs = Fs { next: 0, position: 0, ..d.fs.clone() };
         edit(&mut d.fs);
+    }
+
+    /// How the pipe and its peer behave (its traffic cleared).
+    pub fn pipe(&self, edit: impl FnOnce(&mut Pipe)) {
+        let mut d = driver();
+        d.pipe = Pipe::default();
+        edit(&mut d.pipe);
     }
 
     /// The clock restarts, advancing `step` ms each time it is read.

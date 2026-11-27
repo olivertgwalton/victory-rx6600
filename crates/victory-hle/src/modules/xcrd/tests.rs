@@ -2348,3 +2348,236 @@ fn blob_tests_reach_their_paths() {
     assert_eq!((info[4], u32::from_le_bytes(info[0x10..0x14].try_into().unwrap())), (1, 6));
     assert!(s.take().fs.iter().any(|l| l.starts_with("read ") && l.contains(" 0xe00 at 0x200")));
 }
+
+// Transfers over the fake pipe. Two threads write to the record, so it is
+// compared sorted.
+
+fn same_unordered<T: std::fmt::Debug + PartialEq>(what: &str, ((r, mut rr), (l, mut lr)): ((T, Record), (T, Record))) {
+    for rec in [&mut rr, &mut lr] {
+        rec.messages.sort();
+        rec.fs.sort();
+    }
+    assert_eq!(rr, lr, "{what}: what the driver saw");
+    assert_eq!(r, l, "{what}: result");
+}
+
+/// Peer modes: 0 all well; 1 start refused; 2 start answered wrongly; 3
+/// reads fail; 4 reads answer another transfer; 5 reads give nothing; 6
+/// data short (the read waits for the teardown); 7 stop answered by a
+/// late read first; 8 stop refused; 9 stop answered wrongly; 10 the read
+/// request's write fails.
+fn xfer_peer(mode: u32) -> reference::Peer {
+    let msg = |kind: u32, fields: &[(usize, u32)]| {
+        let mut m = vec![0u8; 0x210];
+        m[..4].copy_from_slice(&kind.to_le_bytes());
+        for &(at, v) in fields {
+            m[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        m
+    };
+    Box::new(move |w: &[u8]| {
+        let f = |at: usize| u32::from_le_bytes(w[at..at + 4].try_into().unwrap());
+        match f(0) {
+            1 => match mode {
+                1 => msg(2, &[(8, 0xc000_0022)]),
+                2 => msg(7, &[]),
+                _ => msg(2, &[(8, 0), (0xc, 0x77)]),
+            },
+            3 => {
+                let (slot, size) = (f(0xc), f(0x10));
+                let offset = u64::from_le_bytes(w[0x18..0x20].try_into().unwrap());
+                let bytes = if mode == 5 { 0 } else { size.min(0x300) };
+                let id = if mode == 4 { 0x99 } else { f(8) };
+                let status = if mode == 3 { 0xc000_009c } else { 0 };
+                let mut out = msg(4, &[(8, status), (0xc, id), (0x10, slot), (0x14, bytes)]);
+                let supplied = if mode == 6 { bytes / 2 } else { bytes };
+                if mode != 3 {
+                    out.extend((0..supplied).map(|i| (offset as u32).wrapping_add(i) as u8));
+                }
+                out
+            }
+            5 => {
+                let mut out = Vec::new();
+                if mode == 7 {
+                    out.extend(msg(4, &[(0xc, f(8))]));
+                }
+                out.extend(match mode {
+                    8 => msg(6, &[(8, 0xc000_0001)]),
+                    9 => msg(9, &[]),
+                    _ => msg(6, &[]),
+                });
+                out
+            }
+            _ => Vec::new(),
+        }
+    })
+}
+
+type XferInit = extern "system" fn(*const Adapter, *mut *mut c_void) -> HRESULT;
+type XferStart = extern "system" fn(*mut c_void, *const u16) -> HRESULT;
+type XferRead = extern "system" fn(*mut c_void, u64, u32, *mut u8, *mut super::xfer::Overlapped) -> HRESULT;
+type XferResult = extern "system" fn(*mut c_void, *const super::xfer::Overlapped, *mut u32) -> HRESULT;
+type XferStop = extern "system" fn(*mut c_void) -> HRESULT;
+type XferUninit = extern "system" fn(*const Adapter, *mut *mut c_void) -> HRESULT;
+
+struct XferApi {
+    init: XferInit,
+    start: XferStart,
+    read: XferRead,
+    result: XferResult,
+    stop: XferStop,
+    uninit: XferUninit,
+}
+
+fn new_event() -> Handle {
+    // SAFETY: a plain manual-reset event.
+    unsafe { windows_sys::Win32::System::Threading::CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) }
+}
+
+/// A whole session: initialize, start, three reads, stop, start again,
+/// one read, uninitialize; what each step said.
+fn xfer_session(api: &XferApi, mode: u32) -> Vec<String> {
+    let a = adapter();
+    let mut log = Vec::new();
+    let mut x = std::ptr::null_mut();
+    let hr = (api.init)(&a, &mut x);
+    log.push(format!("init {hr:#x} {}", x.is_null()));
+    if hr < 0 {
+        return log;
+    }
+    let path = wz("[XUC:]\\content.xvc");
+    log.push(format!("read before start {:#x}", {
+        let mut buf = [0u8; 4];
+        let mut o = super::xfer::Overlapped { internal: 0, internal_high: 0, offset: 0, event: new_event() };
+        (api.read)(x, 0, 4, buf.as_mut_ptr(), &mut o)
+    }));
+    for round in 0..2 {
+        let hr = (api.start)(x, path.as_ptr());
+        log.push(format!("start {hr:#x}"));
+        log.push(format!("start again {:#x}", (api.start)(x, path.as_ptr())));
+        if hr >= 0 {
+            let mut pending = Vec::new();
+            for (offset, size) in [(0x1000u64, 0x200u32), (0x2_0000_0001, 0x400), (7, 1)].into_iter().take(if round == 0 { 3 } else { 1 }) {
+                let mut buf = vec![0xccu8; size as usize];
+                let mut o = Box::new(super::xfer::Overlapped { internal: 0, internal_high: 0, offset: 0, event: new_event() });
+                let hr = (api.read)(x, offset, size, buf.as_mut_ptr(), &mut *o);
+                log.push(format!("read {offset:#x} {size:#x} {hr:#x}"));
+                if hr == 0x8007_03e5_u32 as i32 {
+                    if mode == 6 {
+                        pending.push((buf, o));
+                        continue;
+                    }
+                    let mut n = 0xcc;
+                    let r = (api.result)(x, &*o, &mut n);
+                    log.push(format!("result {r:#x} {n:#x} {:?}", &buf[..buf.len().min(8)]));
+                }
+            }
+            let hr = (api.stop)(x);
+            log.push(format!("stop {hr:#x}"));
+            for (buf, o) in pending {
+                let mut n = 0xcc;
+                let r = (api.result)(x, &*o, &mut n);
+                log.push(format!("late result {r:#x} {n:#x} {:?}", &buf[..buf.len().min(8)]));
+            }
+        }
+    }
+    let hr = (api.uninit)(&a, &mut x);
+    log.push(format!("uninit {hr:#x} {}", x.is_null()));
+    log
+}
+
+fn xfer_machine(s: &Session, mode: u32, connect: u32, pipe_error: Option<u32>, session_fails: bool) {
+    s.pipe(|p| {
+        p.connect = connect;
+        p.create_error = pipe_error;
+        p.fail_write = (mode == 10).then_some(3);
+        p.peer = Some(xfer_peer(mode));
+    });
+    s.reply(move |_, b| {
+        b[0x14..0x18].copy_from_slice(&(if session_fails { 0xc05e_0004u32 } else { 0 }).to_le_bytes());
+        if b.len() >= 0x1c + 4 && u32::from_le_bytes(b[0x10..0x14].try_into().unwrap()) == 0x7800_00c0 && b[0x1c + 4] == 1 {
+            b[0x1c..0x20].copy_from_slice(&0x55u32.to_le_bytes());
+        }
+        0
+    });
+}
+
+#[test]
+fn xvd_transfers() {
+    let s = session();
+    trace_all(&s);
+    let api = |side: bool| -> Option<XferApi> {
+        let (init, init_l) = both_or_none::<XferInit>("XCrdXvdXferInitialize")?;
+        let (start, start_l) = both_or_none::<XferStart>("XCrdXvdXferStart")?;
+        let (read, read_l) = both_or_none::<XferRead>("XCrdXvdXferRead")?;
+        let (result, result_l) = both_or_none::<XferResult>("XCrdXvdXferGetResult")?;
+        let (stop, stop_l) = both_or_none::<XferStop>("XCrdXvdXferStop")?;
+        let (uninit, uninit_l) = both_or_none::<XferUninit>("XCrdXvdXferUninitialize")?;
+        Some(if side { XferApi { init, start, read, result, stop, uninit } } else { XferApi { init: init_l, start: start_l, read: read_l, result: result_l, stop: stop_l, uninit: uninit_l } })
+    };
+    let (Some(r), Some(l)) = (api(true), api(false)) else {
+        eprintln!("xvd_transfers: no reference");
+        return;
+    };
+    for mode in 0..11 {
+        same_unordered(&format!("mode {mode}"), run(&s, |s| xfer_machine(s, mode, 0, None, false), |side| xfer_session(if side { &r } else { &l }, mode)));
+    }
+    for (connect, pipe_error, session_fails) in [(1, None, false), (2, None, false), (3, None, false), (0, Some(5), false), (0, None, true)] {
+        same_unordered(&format!("connect {connect} {pipe_error:?} {session_fails}"), run(&s, |s| xfer_machine(s, 0, connect, pipe_error, session_fails), |side| xfer_session(if side { &r } else { &l }, 0)));
+    }
+    let a = adapter();
+    same("bad arguments", run(&s, |_| {}, |side| {
+        let api = if side { &r } else { &l };
+        let mut x = std::ptr::null_mut();
+        let mut buf = [0u8; 4];
+        let mut o = super::xfer::Overlapped { internal: 0, internal_high: 0, offset: 0, event: std::ptr::null_mut() };
+        let fake = 0x10 as *mut c_void;
+        vec![
+            (api.init)(std::ptr::null(), &mut x),
+            (api.init)(&a, std::ptr::null_mut()),
+            (api.start)(std::ptr::null_mut(), wz("x").as_ptr()),
+            (api.start)(fake, std::ptr::null()),
+            (api.read)(std::ptr::null_mut(), 0, 4, buf.as_mut_ptr(), &mut o),
+            (api.read)(fake, 0, 4, std::ptr::null_mut(), &mut o),
+            (api.read)(fake, 0, 4, buf.as_mut_ptr(), std::ptr::null_mut()),
+            (api.stop)(std::ptr::null_mut()),
+            (api.uninit)(std::ptr::null(), &mut x),
+            (api.uninit)(&a, std::ptr::null_mut()),
+            (api.uninit)(&a, &mut x),
+        ]
+    }));
+}
+
+/// The transfer tests move data and reach the teardown paths.
+#[test]
+fn xfer_tests_reach_their_paths() {
+    use super::xfer::*;
+    let s = session();
+    trace_all(&s);
+    // SAFETY: the layer's exports, as their types.
+    let l = unsafe {
+        XferApi {
+            init: std::mem::transmute(XCrdXvdXferInitialize as *const ()),
+            start: std::mem::transmute(XCrdXvdXferStart as *const ()),
+            read: std::mem::transmute(XCrdXvdXferRead as *const ()),
+            result: std::mem::transmute(XCrdXvdXferGetResult as *const ()),
+            stop: std::mem::transmute(XCrdXvdXferStop as *const ()),
+            uninit: std::mem::transmute(XCrdXvdXferUninitialize as *const ()),
+        }
+    };
+    let mut logs = Vec::new();
+    for mode in [0, 4, 6, 7] {
+        xfer_machine(&s, mode, 0, None, false);
+        let log = xfer_session(&l, mode);
+        let rec = s.take();
+        if std::env::var_os("VICTORY_XFER_SHOW").is_some() {
+            eprintln!("mode {mode}: {log:#?}\n{:#?}", rec.messages);
+        }
+        logs.push(log);
+    }
+    assert!(logs[0].contains(&"result 0x0 0x200 [0, 1, 2, 3, 4, 5, 6, 7]".to_string()), "{:?}", logs[0]);
+    assert!(logs[0].contains(&"result 0x0 0x300 [1, 2, 3, 4, 5, 6, 7, 8]".to_string()), "{:?}", logs[0]);
+    assert_eq!(logs[0].last().unwrap(), "uninit 0x0 true");
+    assert!(logs[1].iter().any(|l| l.starts_with("result 0x80070016")), "{:?}", logs[1]);
+    assert!(logs[2].iter().any(|l| l.starts_with("late result 0x800703e3")), "{:?}", logs[2]);
+}

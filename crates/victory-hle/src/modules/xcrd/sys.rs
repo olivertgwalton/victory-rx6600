@@ -56,6 +56,13 @@ pub struct Sys {
     pub find_close: unsafe extern "system" fn(Handle) -> i32,
     pub set_file_pointer_ex: unsafe extern "system" fn(Handle, i64, *mut i64, u32) -> i32,
     pub read_file: unsafe extern "system" fn(Handle, *mut c_void, u32, *mut u32, *mut c_void) -> i32,
+    /// The transfer pipe.
+    pub create_named_pipe_w: unsafe extern "system" fn(*const u16, u32, u32, u32, u32, u32, u32, *const c_void) -> Handle,
+    pub connect_named_pipe: unsafe extern "system" fn(Handle, *mut c_void) -> i32,
+    pub disconnect_named_pipe: unsafe extern "system" fn(Handle) -> i32,
+    pub write_file: unsafe extern "system" fn(Handle, *const c_void, u32, *mut u32, *mut c_void) -> i32,
+    pub get_overlapped_result: unsafe extern "system" fn(Handle, *mut c_void, *mut u32, i32) -> i32,
+    pub cancel_io_ex: unsafe extern "system" fn(Handle, *mut c_void) -> i32,
 }
 
 unsafe extern "system" fn create_file_w(
@@ -177,6 +184,30 @@ unsafe extern "system" fn read_file(file: Handle, buffer: *mut c_void, length: u
     host!("kernel32.dll", "ReadFile": extern "system" fn(Handle, *mut c_void, u32, *mut u32, *mut c_void) -> i32)(file, buffer, length, read, overlapped)
 }
 
+unsafe extern "system" fn create_named_pipe_w(name: *const u16, open: u32, mode: u32, instances: u32, out: u32, inn: u32, timeout: u32, security: *const c_void) -> Handle {
+    host!("kernel32.dll", "CreateNamedPipeW": extern "system" fn(*const u16, u32, u32, u32, u32, u32, u32, *const c_void) -> Handle)(name, open, mode, instances, out, inn, timeout, security)
+}
+
+unsafe extern "system" fn connect_named_pipe(pipe: Handle, overlapped: *mut c_void) -> i32 {
+    host!("kernel32.dll", "ConnectNamedPipe": extern "system" fn(Handle, *mut c_void) -> i32)(pipe, overlapped)
+}
+
+unsafe extern "system" fn disconnect_named_pipe(pipe: Handle) -> i32 {
+    host!("kernel32.dll", "DisconnectNamedPipe": extern "system" fn(Handle) -> i32)(pipe)
+}
+
+unsafe extern "system" fn write_file(file: Handle, buffer: *const c_void, length: u32, written: *mut u32, overlapped: *mut c_void) -> i32 {
+    host!("kernel32.dll", "WriteFile": extern "system" fn(Handle, *const c_void, u32, *mut u32, *mut c_void) -> i32)(file, buffer, length, written, overlapped)
+}
+
+unsafe extern "system" fn get_overlapped_result(file: Handle, overlapped: *mut c_void, bytes: *mut u32, wait: i32) -> i32 {
+    host!("kernel32.dll", "GetOverlappedResult": extern "system" fn(Handle, *mut c_void, *mut u32, i32) -> i32)(file, overlapped, bytes, wait)
+}
+
+unsafe extern "system" fn cancel_io_ex(file: Handle, overlapped: *mut c_void) -> i32 {
+    host!("kernel32.dll", "CancelIoEx": extern "system" fn(Handle, *mut c_void) -> i32)(file, overlapped)
+}
+
 pub const HOST: Sys = Sys {
     create_file_w,
     nt_device_io_control_file,
@@ -197,6 +228,12 @@ pub const HOST: Sys = Sys {
     find_close,
     set_file_pointer_ex,
     read_file,
+    create_named_pipe_w,
+    connect_named_pipe,
+    disconnect_named_pipe,
+    write_file,
+    get_overlapped_result,
+    cancel_io_ex,
 };
 
 static SYS: RwLock<Sys> = RwLock::new(HOST);
