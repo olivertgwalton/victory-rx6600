@@ -1445,3 +1445,49 @@ fn device_paths() {
     }));
     same("null device", run(&s, |_| {}, |side| { let mut o = std::ptr::null_mut(); if side { rq(&mut o, std::ptr::null()) } else { lq(&mut o, std::ptr::null()) } }));
 }
+
+type XasEx = extern "system" fn(*mut *mut u16, *const Adapter, *const u16, *const u16, *const u16, *const u16, *const u16, *const u16, u32, u64, *const u16, u16) -> HRESULT;
+type Xas = extern "system" fn(*mut *mut u16, *const Adapter, *const u16, *const u16, *const u16, *const u16, *const u16, *const u16, u32, u64, u64) -> HRESULT;
+
+#[test]
+fn xas_paths() {
+    let s = session();
+    trace_all(&s);
+    let (rx, lx) = both!("XCrdXasBuildPathEx": XasEx);
+    let (rp, lp) = both!("XCrdXasBuildPath": Xas);
+    let a = adapter();
+    let text = |t: &str| wz(t);
+    let (ip, host, acct, cont, name) = (text("10.0.0.1"), text("example.blob"), text("acct"), text("cont"), text("dir/file.xvc"));
+    let sas_list = [text("?sv=1&sig=a%2Fb%%c%"), text(""), text("%%%")];
+    let vcsa = text("vcsa-name");
+    let opt = |on: bool, v: &Vec<u16>| if on { v.as_ptr() } else { std::ptr::null() };
+    for flags in [0u64, 1, 2, 3, 4, 5, 6, 7, 8] {
+        for kind in [0u32, 1, 2] {
+            for mask in [0u32, 0b1_1111, 0b1_1110, 0b1_1101, 0b1_1011, 0b1_0111, 0b0_1111, 0b10_1111] {
+                for (si, sas) in sas_list.iter().enumerate() {
+                    for (with_vcsa, port) in [(false, 0u16), (true, 0), (true, 443), (false, 443)] {
+                        let args = (opt(mask & 1 != 0, &ip), opt(mask & 2 != 0, &host), opt(mask & 4 != 0, &acct), opt(mask & 8 != 0, &cont), opt(mask & 16 != 0, &name), opt(mask & 32 == 0, sas));
+                        same(&format!("{flags} {kind} {mask:b} {si} {with_vcsa} {port}"), run(&s, |_| {}, |side| {
+                            let mut out = std::ptr::null_mut();
+                            let f = if side { rx } else { lx };
+                            let hr = f(&mut out, &a, args.0, args.1, args.2, args.3, args.4, args.5, kind, flags, opt(with_vcsa, &vcsa), port);
+                            let r = (!out.is_null()).then(|| unsafe { wide_str(out) });
+                            heap_free(out.cast());
+                            let mut out2 = std::ptr::null_mut();
+                            let g = if side { rp } else { lp };
+                            let hr2 = g(&mut out2, &a, args.0, args.1, args.2, args.3, args.4, args.5, kind, flags, port as u64);
+                            let r2 = (!out2.is_null()).then(|| unsafe { wide_str(out2) });
+                            heap_free(out2.cast());
+                            (hr, r, hr2, r2)
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    same("no adapter", run(&s, |_| {}, |side| {
+        let mut out = std::ptr::null_mut();
+        let f = if side { rx } else { lx };
+        f(&mut out, std::ptr::null(), ip.as_ptr(), host.as_ptr(), acct.as_ptr(), cont.as_ptr(), name.as_ptr(), sas_list[0].as_ptr(), 1, 0, std::ptr::null(), 0)
+    }));
+}
