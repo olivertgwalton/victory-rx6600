@@ -161,6 +161,9 @@ fn log(frame: u64) {
     let line = format_line(&values, &PEAK);
     let (budget, nonlocal_budget) = card.map_or((UNKNOWN, UNKNOWN), |c| (c[0], c[2]));
     tracing::warn!(target: "victory_gpu::census", "texture pool frame {frame}: {}", crate::pool::texture_holes());
+    tracing::warn!(target: "victory_gpu::census", "texture pool frame {frame}: {}", crate::resource::pool_miss_line());
+    tracing::warn!(target: "victory_gpu::census", "texture pool frame {frame}: by size: {}", crate::pool::texture_misses_line());
+    tracing::warn!(target: "victory_gpu::census", "texture pool frame {frame}: made in free ranges with no room {}, found none {} (VICTORY_POOL_GAPS)", crate::draw::GAPS[0].load(std::sync::atomic::Ordering::Relaxed), crate::draw::GAPS[1].load(std::sync::atomic::Ordering::Relaxed));
     tracing::warn!(
         target: "victory_gpu::census",
         "memory census frame {frame}: {line} dxgi_local_budget={} dxgi_nonlocal_budget={} unaccounted_local={} \

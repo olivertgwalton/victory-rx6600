@@ -887,8 +887,9 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
-    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(
+    let size_class = [1u64 << 20, 4 << 20, 16 << 20, BLOCK / 2].iter().position(|&l| info.SizeInBytes <= l).unwrap_or(4);
+    let biggest_hole = || lock(&TEXTURES).blocks.iter().flatten().flat_map(|b| b.free.0.values().copied()).max().unwrap_or(0);
+    let taken = lock(&TEXTURES).take_ripe(
         info.SizeInBytes,
         info.Alignment.max(1),
         now(),
@@ -918,7 +919,15 @@ pub(crate) unsafe fn texture(
             }
             heap
         },
-    )?;
+    );
+    let Some((piece, heap, again)) = taken else {
+        TEXTURE_MISSES[size_class][0].fetch_add(1, Ordering::Relaxed);
+        if info.SizeInBytes <= biggest_hole() {
+            TEXTURE_MISSES[size_class][1].fetch_add(1, Ordering::Relaxed);
+        }
+        return None;
+    };
+    TEXTURE_MISSES[size_class][2].fetch_add(1, Ordering::Relaxed);
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
@@ -1359,4 +1368,15 @@ mod tests {
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
     }
+}
+
+/// Textures the pool was asked for, by size (up to 1, 4, 16, 32 MiB, more):
+/// not placed, not placed although a free range that big was there (its
+/// alignment, or blocks not ripe), placed.
+pub(crate) static TEXTURE_MISSES: [[AtomicU64; 3]; 5] = [const { [const { AtomicU64::new(0) }; 3] }; 5];
+
+pub(crate) fn texture_misses_line() -> String {
+    let v = |i: usize, j: usize| TEXTURE_MISSES[i][j].load(Ordering::Relaxed);
+    let names = ["<=1M", "<=4M", "<=16M", "<=32M", "more"];
+    (0..5).map(|i| format!("{} placed {} missed {} (with a big enough free range {})", names[i], v(i, 2), v(i, 0), v(i, 1))).collect::<Vec<_>>().join("; ")
 }

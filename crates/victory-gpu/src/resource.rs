@@ -1693,7 +1693,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => host_texture(&r.desc.levels_from(base), r.host.state, clear),
         };
         let Some(texture) = texture else {
-            r.host.refused.store(true, Relaxed);
+            // (Not refused: it waits for room, `pool_gaps_only`.)
+            if !POOL_MISSED.with(std::cell::Cell::get) {
+                r.host.refused.store(true, Relaxed);
+            }
             return None;
         };
         let twin = twin_texture(&r.desc, &texture);
@@ -2549,6 +2552,42 @@ pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, false).map(|made| made.0)
 }
 
+std::thread_local! {
+    /// [`pool_gaps_only`]: host textures are made only where the pool has a
+    /// free range for them.
+    static POOL_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A host texture was not made in that mode: it waits, it is not refused.
+    static POOL_MISSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with host textures made only in free ranges of the texture pool
+/// (`crate::pool`), never with memory of their own: for the texture pass
+/// while the card has no room (`draw.rs`, [`pool_gaps`]). True with the
+/// result if a host texture could not be made so; it was not refused, and
+/// is asked for again later.
+#[cfg(windows)]
+pub(crate) fn pool_gaps_only<R>(f: impl FnOnce() -> R) -> (R, bool) {
+    POOL_ONLY.with(|c| c.set(true));
+    POOL_MISSED.with(|c| c.set(false));
+    let out = f();
+    POOL_ONLY.with(|c| c.set(false));
+    (out, POOL_MISSED.with(|c| c.replace(false)))
+}
+
+/// Whether the texture pass makes textures in the pool's free ranges while
+/// the card has no room (`VICTORY_POOL_GAPS=0`: it does not, as before).
+///
+/// Run fix1: 51,840 slots waited for want of room while 2.3 GB of the
+/// pool's blocks were free (textures the sweep let go of). Lifting the
+/// room kept for targets and buffers instead (run tex1) made textures of
+/// their own memory: the card went to 9,986 MB of a 7,742 MB budget, 9.4
+/// fps; the misses came when the pool had no free range big enough (tex3).
+#[cfg(windows)]
+pub(crate) fn pool_gaps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_GAPS").is_none_or(|v| v != "0"))
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
@@ -2645,6 +2684,20 @@ fn host_texture_as(
         });
         return Some(t);
     }
+    // (For the census: why a texture is not cut from a block.)
+    if !reserved && desc.dimension != BUFFER {
+        let why = if !fills(desc) {
+            0
+        } else if d.sample_count > 1 || clear_value.is_some() {
+            1
+        } else if !texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor()) {
+            2
+        } else {
+            3
+        };
+        POOL_MISS[why][0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        POOL_MISS[why][1].fetch_add(u64::from(d.width) * u64::from(d.height), std::sync::atomic::Ordering::Relaxed);
+    }
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
     // in no texel).
@@ -2664,7 +2717,13 @@ fn host_texture_as(
         crate::host::name(&t, || {
             format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
         });
+        POOL_MISS[4][0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Some(t);
+    }
+    if POOL_ONLY.with(std::cell::Cell::get) {
+        // Not in a free range of the pool: no memory of its own now.
+        POOL_MISSED.with(|c| c.set(true));
+        return None;
     }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
@@ -4942,4 +5001,20 @@ mod overloads {
         }
         release(h);
     }
+}
+
+/// For the census, textures made since the start, as `[count, width x
+/// height summed]`: not filled by the title (a target, written by shaders), a
+/// sample count or clear value, an XOR-swizzled layout, eligible for a block;
+/// and of the eligible, those a block took.
+pub(crate) static POOL_MISS: [[std::sync::atomic::AtomicU64; 2]; 5] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 5];
+
+/// The census line of [`POOL_MISS`].
+pub(crate) fn pool_miss_line() -> String {
+    let v = |i: usize, j: usize| POOL_MISS[i][j].load(std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "textures made, why not in a block (count, Mpixels): not title-filled {} {}, samples or clear {} {}, xor swizzle {} {}, eligible {} {} of which in a block {}",
+        v(0, 0), v(0, 1) >> 20, v(1, 0), v(1, 1) >> 20, v(2, 0), v(2, 1) >> 20, v(3, 0), v(3, 1) >> 20, v(4, 0)
+    )
 }

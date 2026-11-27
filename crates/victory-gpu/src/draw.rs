@@ -790,6 +790,14 @@ pub(crate) static HEAP_TEXTURES_REUPLOADED_FULL: AtomicU64 = AtomicU64::new(0);
 /// only wants bringing up to date, and the ones whose memory went (letting
 /// their host copies go is what makes room). What is uploaded while the
 /// card has room is the same either way.
+/// Free bytes in the texture pool below which [`resource::pool_gaps`] does
+/// not look (a pass would find no range anyway).
+const GAPS_LEAST: u64 = 64 << 20;
+
+/// Slots of textures made in the pool's free ranges while the card had no
+/// room, and those that found none, since the last frame-rate line.
+pub(crate) static GAPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 fn full_card_pass() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_FULL_CARD_PASS").is_none_or(|v| v != "0"))
@@ -3066,10 +3074,13 @@ impl State {
             // had its colour only in the launches that entered the world
             // under the line. `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as
             // before.
+            // With no room, a texture may still be made where the pool has a
+            // free range for it (`resource::pool_gaps`): no memory of its own.
+            let gaps_only = !room && crate::resource::pool_gaps() && crate::pool::texture_room() >= GAPS_LEAST;
             if !room {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
-                if !has_its_texture {
+                if !has_its_texture && !gaps_only {
                     refused += 1;
                     if full_card_pass() {
                         // Held back for the frames of about four seconds
@@ -3115,7 +3126,7 @@ impl State {
                 && !sync_bake
                 && crate::descriptor::host::show_after()
                 && heap.handle(index).is_some_and(|handle| !host.texture_slot_made_from(index, handle));
-            let (view, bake_key) = if sync_bake {
+            let ((view, bake_key), missed_view) = crate::resource::pool_gaps_only(|| if sync_bake {
                 match heap.handle(index).and_then(|handle| host.prepare_bake_slot(index, handle)) {
                     Some((view, key)) => (Some(view), Some(key)),
                     None => (None, None),
@@ -3125,7 +3136,7 @@ impl State {
                     if shows_other || late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
                 });
                 (view, None)
-            };
+            });
             let at_once = || {
                 if (late || bake_key.is_some()) && let Some(handle) = heap.handle(index) {
                     let _ = host.mirror(index, handle, true);
@@ -3144,7 +3155,23 @@ impl State {
                     continue;
                 }
             };
-            let texture = crate::resource::host_resource(resource);
+            let (texture, missed) = if gaps_only {
+                crate::resource::pool_gaps_only(|| crate::resource::host_resource(resource))
+            } else {
+                (crate::resource::host_resource(resource), false)
+            };
+            if gaps_only {
+                GAPS[usize::from(missed || (missed_view && texture.is_none()))].fetch_add(1, Ordering::Relaxed);
+            }
+            if gaps_only && texture.is_none() && (missed || missed_view) {
+                // No free range for it: it waits, as for room.
+                refused += 1;
+                host.texture_slot_held(index, write, frame + most);
+                if refused > 1024 {
+                    break;
+                }
+                continue;
+            }
             if crate::residency::upload_refused() {
                 served = false;
                 break;
