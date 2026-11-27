@@ -1605,7 +1605,7 @@ impl GraphicsState {
         // offset's clamp, scale and offset +12..+14, DB_DEPTH_CONTROL +15,
         // DB_STENCIL_CONTROL +16, DB_STENCILREFMASK and its back twin +17,
         // +18, CB_BLEND0..7_CONTROL +21..+28 and CB_TARGET_MASK +29.
-        let anchor = (0..words.len().saturating_sub(30)).find(|&i| words[i] & 0xffff_ff8e == 0x00cc_0000 && words[i + 9] & 0xffc0_0000 == 0);
+        let anchor = super::variant::context_anchor(&words);
         let tested = depth.0 != 0;
         let Some(c) = anchor else {
             // Unknown image: draw without depth or blending rather than not at all.

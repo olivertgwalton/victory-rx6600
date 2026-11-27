@@ -753,6 +753,77 @@ pub(crate) fn hand_out_compute(container: &[u8], iid: *const Iid, out: *mut This
     )
 }
 
+/// Device method 0x1b8, `(base, count, records, iid, out)`: a variant of
+/// `base` with `count` state records written over its register image
+/// ([`variant`]). The console's driver makes it whatever the interface id
+/// (it never reads it), with one reference, and returns `E_OUTOFMEMORY` only
+/// when it cannot allocate. The title keeps variants by the state it asked
+/// for (title+0x2479f40) and draws with them.
+/// shortcut: only variants of pipelines made by device method 0x1c8, and
+/// of record kinds 0, 1, 2 and 5 (those the title makes), are written; the
+/// others fail as before. Kind 2's format-dependent registers (the
+/// driver's +0x479b0, +0x4b350, +0x4b110) are not.
+pub(crate) extern "system" fn create_variant(
+    _: This,
+    base: This,
+    count: u32,
+    records: *const u8,
+    _iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: the title's out pointer.
+    unsafe { *out = std::ptr::null() };
+    if base.is_null() || (count > 0 && records.is_null()) {
+        return E_INVALIDARG;
+    }
+    let records = if count == 0 {
+        &[][..]
+    } else {
+        // SAFETY: the title passes `count` records.
+        unsafe { std::slice::from_raw_parts(records, count as usize * variant::RECORD) }
+    };
+    let kinds: Vec<u32> =
+        records.chunks_exact(variant::RECORD).map(|r| u32::from_le_bytes(r[..4].try_into().unwrap())).collect();
+    #[cfg(windows)]
+    {
+        let p = pipeline(base);
+        if let Some(n) = &p.native {
+            let mut regs = n.regs.clone();
+            match variant::apply(&mut regs, records) {
+                Ok(()) => {
+                    static MADE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    let made = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if made <= 4 || made.is_power_of_two() {
+                        tracing::info!(made, ?kinds, "pipeline variant (device method 0x1b8): made");
+                    }
+                    let native = Box::new(NativeGraphics {
+                        regs,
+                        layout: n.layout.clone(),
+                        variants: std::sync::Mutex::new(Vec::new()),
+                    });
+                    return hand_out_with(p.shaders.clone(), None, Some(native), &PIPELINE_IIDS[0], out);
+                }
+                Err(kind) => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(kind, ?kinds, "pipeline variant (device method 0x1b8): a record kind not written; the title goes without it")
+                    });
+                }
+            }
+        } else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(?kinds, "pipeline variant (device method 0x1b8) of a pipeline not made by method 0x1c8; the title goes without it")
+            });
+        }
+    }
+    let _ = kinds;
+    object::E_NOTIMPL
+}
+
 /// Device method 0x1f0: the plain compute description plus console
 /// extensions `(desc, extension count, extensions, iid, out)`.
 /// shortcut: the extensions (console shader settings) are ignored, as is
@@ -880,6 +951,7 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+pub(crate) mod variant;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

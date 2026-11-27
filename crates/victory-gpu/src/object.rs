@@ -341,6 +341,13 @@ pub(crate) extern "system" fn ignore() -> HRESULT {
     S_OK
 }
 
+/// What the console's driver answers for a method its retail build leaves
+/// out (its `E_NOTIMPL` stub, GameOS `xgs12_10.dll` +0x40e0), without the
+/// log of a slot we have not written.
+pub(crate) extern "system" fn not_implemented() -> HRESULT {
+    E_NOTIMPL
+}
+
 macro_rules! missing {
     ($kind:ident; $($slot:literal)*) => { [$(missing::<$kind, $slot> as *const ()),*] };
 }

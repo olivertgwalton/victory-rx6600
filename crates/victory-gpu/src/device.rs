@@ -547,11 +547,13 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
+    f[55] = pipeline::create_variant as *const (); // 0x1b8 pipeline variant
     f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
     f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
-    f[69] = object::ignore as *const (); // 0x228 debug error filter
+    // 0x228 (debug error filter): the retail driver's E_NOTIMPL stub.
+    f[69] = object::not_implemented as *const (); // 0x228
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
     f[73] = list::create_list_x as *const (); // 0x248

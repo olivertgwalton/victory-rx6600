@@ -852,7 +852,9 @@ extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
     unsafe { out.write(TIMESTAMP_FREQUENCY) };
     S_OK
 }
-const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
+/// The console's: its driver's queue method 0x90 answers 99.75 MHz
+/// (GameOS `xgs12_10.dll` +0x19470).
+const TIMESTAMP_FREQUENCY: u64 = 99_750_000;
 
 /// What a list's bottom-of-pipe write stores when the list has run.
 #[derive(Debug, Clone, Copy)]
@@ -873,7 +875,7 @@ impl Written {
             Written::GpuTimestamp => {
                 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
                 let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                let now = (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64;
+                let now = (elapsed.as_nanos() * u128::from(TIMESTAMP_FREQUENCY) / 1_000_000_000) as u64;
                 #[cfg(all(windows, feature = "diagnostics"))]
                 crate::host::spans::stamped(at as usize, now);
                 as_loaded(now, at as usize, gpu_load())
@@ -1322,7 +1324,31 @@ const fn queue_table(newer: bool) -> [*const (); 36] {
         f[if newer { newer_slot(slot) } else { slot }] = method;
         i += 1;
     }
+    if newer {
+        f[23] = suspend as *const (); // 0xb8
+        f[24] = resume as *const (); // 0xc0
+    }
     f
+}
+
+/// Queue method 0xb8, `SuspendX(flags)`. The console's driver (GameOS
+/// `xgs12_10.dll` +0x68170) waits for each of its rings to go idle, saves
+/// the queue's state and tells the kernel, returning `S_OK` (`E_FAIL` only
+/// when the device was never configured). Here: what the title has given
+/// its queues goes to the card, and what waits on reached fences runs.
+extern "system" fn suspend(_: This, _flags: u32) -> HRESULT {
+    #[cfg(windows)]
+    {
+        before_sync();
+        release_held(false);
+    }
+    S_OK
+}
+
+/// Queue method 0xc0, `ResumeX()`: the driver (+0x67d00) asks the kernel to
+/// resume the rings and returns `S_OK`; nothing here was stopped.
+extern "system" fn resume(_: This) -> HRESULT {
+    S_OK
 }
 
 static FUNCTIONS: Table<36> = Table(queue_table(false));
