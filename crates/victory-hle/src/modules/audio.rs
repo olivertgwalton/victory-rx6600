@@ -56,8 +56,17 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 // the last block a title took is freed and no interface is connected, the
 // device closes, and `ApuCreateHeap` may size it again.
 //
-// The heaps' device addresses are ours to choose: heap 1 starts at 64 KiB,
-// each next one at the following 64 KiB boundary.
+// The heaps' device addresses are the kernel's on the console, ours here:
+// each starts 0x400 past a 64 KiB boundary (heap 1 at 0x1_0400, each next one
+// 0x400 past the 64 KiB boundary after the one before). Padding is counted
+// from a block's device address, so where a heap starts decides whether a
+// title's exact sizing fits. The title asks for a non-cached heap of 0x226e00
+// (0x228e00 with the device's 8 KiB), takes 350 XMA contexts from it (0x5900
+// with their padding), then 0x222e00 at 0x800 (rounded up to 0x223000): with
+// heap 2 on a 2 KiB boundary that needs 0x200 more than there is, ApuAlloc
+// fails, and the title clears 0x1700 bytes at null (run apu1). It runs on the
+// console, so there the heap does not start on a 2 KiB boundary; with 0x400
+// past one, the padding before the 0x222e00 block is 0x300 and it fits.
 
 const ALREADY_OPEN: HRESULT = 0x8ACA_0001_u32 as i32;
 const NO_HEAP: HRESULT = 0x8ACA_0002_u32 as i32;
@@ -68,7 +77,9 @@ const STILL_CONNECTED: HRESULT = 0x8AC8_0010_u32 as i32;
 const CACHED_DEFAULT: u32 = 0x400_0000;
 const NON_CACHED_DEFAULT: u32 = 0x11_4000;
 /// The heaps' first device address.
-const APU_BASE: u64 = 0x1_0000;
+const APU_BASE: u64 = 0x1_0400;
+/// How far past a 64 KiB boundary every heap starts.
+const APU_SKEW: u64 = 0x400;
 /// Blocks the device takes from heap 1 when it opens.
 const DEVICE_BLOCKS: u32 = 3;
 
@@ -366,7 +377,7 @@ impl Device {
                     return Err(E_OUTOFMEMORY);
                 }
                 heaps.push(Arena::new(apu as u32, size as u32).ok_or(E_OUTOFMEMORY)?);
-                apu = (apu + size).next_multiple_of(0x1_0000);
+                apu = (apu + size).next_multiple_of(0x1_0000) + APU_SKEW;
             }
             let mut heaps: [Arena; 3] = heaps.try_into().map_err(|_| E_FAIL)?;
             // The device's own blocks.
@@ -454,6 +465,15 @@ pub extern "system" fn ApuAlloc(
     }
     let arena = &mut heaps[heap as usize - 1];
     let Some(offset) = arena.take(size, align) else {
+        tracing::warn!(
+            size = format_args!("{size:#x}"),
+            align = format_args!("{align:#x}"),
+            heap,
+            heap_size = format_args!("{:#x}", arena.size),
+            state = ?arena.state,
+            blocks = ?arena.blocks.iter().map(|b| (b.start, b.size, b.used)).collect::<Vec<_>>(),
+            "ApuAlloc: no room in the heap"
+        );
         return E_OUTOFMEMORY;
     };
     if size >= 32 << 20 {
@@ -1545,8 +1565,9 @@ mod tests {
         let (c, _) = alloc(0x100, 4, 2);
         assert!(apu_a.is_multiple_of(0x1000) && apu_b.is_multiple_of(0x100));
         let s = state(2);
-        // 0x1000 + its pad, 0x300 and 0x100 + 256 each.
-        assert_eq!((s.used, s.overhead, s.blocks), (0x1400, 0x1000 + 0x200, 3));
+        // 0x1000 + its pad (to the next 0x1000 past a start 0x400 past 64
+        // KiB: 0xc00), 0x300 and 0x100 + 256 each.
+        assert_eq!((s.used, s.overhead, s.blocks), (0x1400, 0xc00 + 0x200, 3));
         // Freeing `b` leaves a 0x400 hole; the best fit for 0x200 is that
         // hole, not the big rest of the heap.
         ApuFree(b);
@@ -1570,6 +1591,24 @@ mod tests {
         let (p, _) = alloc(16, 16, 1);
         ApuFree(p);
         assert_eq!(ApuHeapGetState(&mut HeapState::default(), 1), NO_HEAP);
+    }
+
+    /// The title's own sizing fits (run apu1: it crashed when it did not):
+    /// a non-cached heap of 0x226e00, 350 XMA contexts, then 0x222e00 at
+    /// 0x800 from heap 2.
+    #[test]
+    fn the_titles_exact_heap_fits() {
+        let _serial = fresh();
+        assert_eq!(ApuCreateHeap(0x1c70_0000, 0x22_6e00), S_OK);
+        let mut request: ShapeContexts = unsafe { std::mem::zeroed() };
+        // SAFETY: a packed field of our own value.
+        unsafe { std::ptr::addr_of_mut!(request.counts).write_unaligned([0, 0, 0, 0, 350, 0]) };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let (mut p, mut apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut p, &mut apu, 0x22_2e00, 0x800, 2), S_OK);
+        assert!(!p.is_null() && apu.is_multiple_of(0x800));
+        ApuFree(p);
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
     }
 
     /// The binary-search map gives the console walk's answer at every
