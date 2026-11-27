@@ -855,6 +855,158 @@ pub extern "system" fn XCrdCreateXvdPointer(
     })())
 }
 
+/// The specifier table of `XCrdStreamingStart` and `XCrdTrimXvc`: entries of
+/// `{offset, bytes, offset, bytes}` at `table`, the strings from `strings`
+/// on; the running size at `size_field` grows with each string.
+fn specifier_table(p: &mut Payload, table: usize, mut strings: usize, size_field: usize, pairs: &[(&[u16], &[u16])]) -> Result<(), HRESULT> {
+    for (i, (a, b)) in pairs.iter().enumerate() {
+        let entry = table + i * 16;
+        for (k, s) in [a, b].into_iter().enumerate() {
+            let status = copy_string(p.body(), strings, s.len() * 2 + 2, s);
+            let grown = p.read_u32(size_field) + (s.len() * 2 + 2) as u32;
+            p.u32(size_field, grown);
+            p.u32(entry + 8 * k, strings as u32);
+            p.u32(entry + 8 * k + 4, (s.len() * 2) as u32);
+            strings += s.len() * 2 + 2;
+            if status < 0 {
+                return Err(status);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 0x1800092f0: starts streaming content from a source to a destination
+/// (flag 0x1000: as flat files, with a content path); specifier pairs
+/// select regions. The instance id comes back (+0x18), and two values
+/// (+0x38, +0x40) whatever the driver said.
+pub extern "system" fn XCrdStreamingStart(
+    id: *mut u64,
+    adapter: *const Adapter,
+    source: *const u16,
+    name: *const u16,
+    dest: *const u16,
+    content: *const u16,
+    extra: *const u16,
+    count: u32,
+    specs: *const [*const u16; 2],
+    flags: u32,
+    guid: *const [u8; 16],
+    out64: *mut u64,
+    out32: *mut u32,
+) -> HRESULT {
+    // SAFETY: the caller's optional outs, checked non-null.
+    unsafe {
+        if !out64.is_null() {
+            *out64 = 0;
+        }
+        if !out32.is_null() {
+            *out32 = 0;
+        }
+    }
+    result((|| {
+        check(!adapter.is_null(), "Invalid Adapter Handle\n")?;
+        check(!source.is_null(), "Src Path must be specified\n")?;
+        check(!dest.is_null(), "Dst Path must be specified\n")?;
+        let flat = flags & 0x1000 != 0;
+        check(flat || content.is_null(), "Dst Content Path must not be specified\n")?;
+        check(flags & 0xe800 == 0 || flat, "Invalid combination of flat file flags\n")?;
+        check(flags & 0xfffe_0000 == 0, "Invalid flags\n")?;
+        if count == 0 {
+            check(specs.is_null(), "Specifiers must be NULL if zero specifiers are passed\n")?;
+        } else {
+            check(!specs.is_null(), "Specifiers must not be NULL\n")?;
+        }
+        let (src, dst) = (text(source), text(dest));
+        let opt = |s: *const u16| if s.is_null() { None } else { Some(text(s)) };
+        let (name, content, extra) = (opt(name), opt(content), opt(extra));
+        // SAFETY: `count` pairs of strings.
+        let pairs: Vec<(&[u16], &[u16])> = (0..count as usize).map(|i| unsafe { let s = *specs.add(i); (text(s[0]), text(s[1])) }).collect();
+        let mut size = ((src.len() + dst.len()) as u32).wrapping_add(count.wrapping_mul(8)).wrapping_mul(2).wrapping_add(0x6c);
+        for (a, b) in &pairs {
+            size = size.wrapping_add(((a.len() + b.len()) * 2 + 4) as u32);
+        }
+        for s in [&name, &content, &extra].into_iter().flatten() {
+            size = size.wrapping_add((s.len() * 2 + 2) as u32);
+        }
+        check(size as usize <= super::srb::MAX_BODY, "Payload too large for XVIO\n")?;
+        let mut p = Payload::new(0x7800_0030, size as usize);
+        if !guid.is_null() {
+            // SAFETY: checked non-null.
+            p.put(0x54, unsafe { &*guid });
+        }
+        const MAP: [(u32, u64); 14] = [
+            (1, 0x10), (2, 0x40), (4, 0x80), (8, 0x100), (0x10, 0x200), (0x100, 0x4000), (0x200, 0x8000), (0x400, 0x1_0000),
+            (0x1000, 0x4_0000), (0x800, 0x400), (0x2000, 0x800), (0x4000, 0x1000), (0x8000, 0x2_0000), (0x1_0000, 0x8_0000),
+        ];
+        p.u64(0x10, MAP.iter().filter(|(f, _)| flags & f != 0).fold(0, |m, (_, v)| m | v));
+        p.u32(0, 0x68);
+        p.u32(4, (src.len() * 2) as u32);
+        let dst_at = src.len() * 2 + 0x6a;
+        p.u32(8, dst_at as u32);
+        p.u32(0xc, (dst.len() * 2) as u32);
+        let mut cursor = dst_at + 2 + dst.len() * 2;
+        let mut place_opt = |p: &mut Payload, s: &Option<&[u16]>, off: usize| -> Option<usize> {
+            let s = (*s)?;
+            p.u32(off + 4, (s.len() * 2) as u32);
+            if s.is_empty() {
+                return None;
+            }
+            p.u32(off, cursor as u32);
+            let at = cursor;
+            cursor += s.len() * 2 + 2;
+            Some(at)
+        };
+        let name_at = place_opt(&mut p, &name, 0x20);
+        let content_at = place_opt(&mut p, &content, 0x4c);
+        let extra_at = place_opt(&mut p, &extra, 0x44);
+        if count != 0 {
+            p.u32(0x34, count);
+            p.u32(0x2c, cursor as u32);
+            p.u32(0x30, count.wrapping_mul(16));
+        }
+        let status = copy_string(p.body(), 0x68, src.len() * 2 + 2, src);
+        if status < 0 {
+            return Ok(status);
+        }
+        let status = copy_string(p.body(), dst_at, dst.len() * 2 + 2, dst);
+        if status < 0 {
+            return Ok(status);
+        }
+        for (at, s) in [(name_at, &name), (content_at, &content), (extra_at, &extra)] {
+            if let (Some(at), Some(s)) = (at, s) {
+                let status = copy_string(p.body(), at, s.len() * 2 + 2, s);
+                if status < 0 {
+                    return Ok(status);
+                }
+            }
+        }
+        if count != 0 {
+            let table = p.read_u32(0x2c) as usize;
+            let strings = table + p.read_u32(0x30) as usize;
+            if let Err(status) = specifier_table(&mut p, table, strings, 0x30, &pairs) {
+                return Ok(status);
+            }
+        }
+        let hr = send(handle_of(adapter), &mut p);
+        let b = &p.bytes[super::srb::HEADER..];
+        let q = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        // SAFETY: the caller's id (not checked) and optional outs.
+        unsafe {
+            if hr >= 0 {
+                *id = q(0x18);
+            }
+            if !out64.is_null() {
+                *out64 = q(0x38);
+            }
+            if !out32.is_null() {
+                *out32 = q(0x40) as u32;
+            }
+        }
+        Ok(hr)
+    })())
+}
+
 pub(crate) fn exports() -> Vec<crate::HleExport> {
     use crate::hle_export;
     vec![
@@ -877,6 +1029,7 @@ pub(crate) fn exports() -> Vec<crate::HleExport> {
         hle_export!(XCrdTrimXvc),
         hle_export!(XCrdCreateXVD),
         hle_export!(XCrdCreateXvdPointer),
+        hle_export!(XCrdStreamingStart),
         hle_export!(XCrdSetFlatContentPath),
         hle_export!(XCrdStorageQueryBlobAttributes),
         hle_export!(XCrdStreamingAdjustStreamingFlags),

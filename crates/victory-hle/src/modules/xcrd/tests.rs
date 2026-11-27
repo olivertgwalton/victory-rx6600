@@ -1575,3 +1575,34 @@ fn xds_volume_mappings() {
         }
     }
 }
+
+type Start = extern "system" fn(*mut u64, *const Adapter, *const u16, *const u16, *const u16, *const u16, *const u16, u32, *const [*const u16; 2], u32, *const [u8; 16], *mut u64, *mut u32) -> HRESULT;
+
+#[test]
+fn streaming_start() {
+    let s = session();
+    trace_all(&s);
+    let (r, l) = both!("XCrdStreamingStart": Start);
+    let a = adapter();
+    let w = |t: &str| wz(t);
+    let (src, dst, name, content, extra, empty) = (w("[XUC:]\\src"), w("[XTE:]\\dst"), w("name"), w("C:\\content"), w("extra"), w(""));
+    let words: Vec<Vec<u16>> = ["", "lang", "chunk-7"].iter().map(|x| wz(x)).collect();
+    let specs: Vec<[*const u16; 2]> = (0..3).map(|i| [words[i % 3].as_ptr(), words[(i + 1) % 3].as_ptr()]).collect();
+    let guid = [5u8; 16];
+    let mut flag_cases: Vec<u32> = (0..18).map(|b| 1u32 << b).collect();
+    flag_cases.extend([0, 0x1000 | 0x800, 0x1000 | 0xe800 | 0x1f, 0x1_ffff, 0x2_0000, 0x800]);
+    for flags in flag_cases {
+        for (opt, count) in [(0u32, 0u32), (0b111, 2), (0b101, 3), (0b010, 1), (0b1000, 0), (0b1_0000, 1)] {
+            for (what, driver) in drivers(&[]) {
+                same(&format!("{flags:#x} {opt:b} {count} {what}"), run(&s, |s| driver(s), |side| {
+                    let pick = |bit: u32, v: &Vec<u16>| if opt & bit != 0 { v.as_ptr() } else if opt & 0b1000 != 0 { empty.as_ptr() } else { std::ptr::null() };
+                    let sp = if count != 0 && opt & 0b1_0000 == 0 { specs.as_ptr() } else if opt & 0b1_0000 != 0 && count == 0 { specs.as_ptr() } else { std::ptr::null() };
+                    let (mut id, mut o64, mut o32) = (0xccccu64, 0xccccu64, 0xccccu32);
+                    let f = if side { r } else { l };
+                    let hr = f(&mut id, &a, src.as_ptr(), pick(1, &name), dst.as_ptr(), pick(2, &content), pick(4, &extra), count, sp, flags, if opt & 1 != 0 { &guid } else { std::ptr::null() }, &mut o64, &mut o32);
+                    (hr, id, o64, o32)
+                }));
+            }
+        }
+    }
+}
