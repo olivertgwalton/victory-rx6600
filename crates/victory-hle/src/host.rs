@@ -65,13 +65,17 @@ impl HostPolicy {
     }
 
     pub fn allows(&self, dll: &str) -> bool {
-        let dll = dll.to_ascii_lowercase();
         self.allow
             .iter()
-            .any(|pattern| match pattern.strip_suffix('*') {
-                Some(prefix) => dll.starts_with(prefix),
-                None => dll == *pattern,
-            })
+            .any(|pattern| crate::registry::dll_matches(pattern, dll))
+    }
+
+    /// The default policy, made once (asked on every `GetModuleHandle` and
+    /// `LoadLibrary`).
+    pub(crate) fn standard() -> &'static HostPolicy {
+        static STANDARD: std::sync::LazyLock<HostPolicy> =
+            std::sync::LazyLock::new(HostPolicy::default);
+        &STANDARD
     }
 
     pub(crate) fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Option<usize> {

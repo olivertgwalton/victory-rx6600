@@ -1,5 +1,6 @@
 //! The table of everything we implement.
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use crate::modules;
@@ -25,13 +26,19 @@ pub struct HleModule {
 
 impl HleModule {
     pub fn serves(&self, dll: &str) -> bool {
-        let dll = dll.to_ascii_lowercase();
-        self.dlls
-            .iter()
-            .any(|pattern| match pattern.strip_suffix('*') {
-                Some(prefix) => dll.starts_with(prefix),
-                None => dll == *pattern,
-            })
+        self.dlls.iter().any(|pattern| dll_matches(pattern, dll))
+    }
+}
+
+/// `dll` (any case) against a lower-case pattern whose trailing `*` matches
+/// a prefix; no allocation (import binding and `GetProcAddress` ask often).
+pub(crate) fn dll_matches(pattern: &str, dll: &str) -> bool {
+    let (pattern, dll) = (pattern.as_bytes(), dll.as_bytes());
+    match pattern.strip_suffix(b"*") {
+        Some(prefix) => {
+            dll.len() >= prefix.len() && dll[..prefix.len()].eq_ignore_ascii_case(prefix)
+        }
+        None => dll.eq_ignore_ascii_case(pattern),
     }
 }
 
@@ -53,13 +60,25 @@ pub fn registry() -> &'static [HleModule] {
     &REGISTRY
 }
 
+/// Each export name with the modules that have it, in registry order.
+static BY_NAME: LazyLock<HashMap<&'static str, Vec<(&'static HleModule, usize)>>> =
+    LazyLock::new(|| {
+        let mut by_name: HashMap<_, Vec<_>> = HashMap::new();
+        for m in registry() {
+            for e in &m.exports {
+                by_name.entry(e.name).or_default().push((m, e.address));
+            }
+        }
+        by_name
+    });
+
+/// The first module (in registry order) that serves `dll` and has `name`.
 pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
-    registry()
+    BY_NAME
+        .get(name)?
         .iter()
-        .filter(|m| m.serves(dll))
-        .flat_map(|m| m.exports.iter())
-        .find(|e| e.name == name)
-        .map(|e| e.address)
+        .find(|(m, _)| m.serves(dll))
+        .map(|&(_, address)| address)
 }
 
 #[cfg(test)]
@@ -80,6 +99,42 @@ mod tests {
                 module.name
             );
         }
+    }
+
+    /// The index answers as the scan of every module did.
+    #[test]
+    fn lookups_find_the_first_module_that_serves_the_dll() {
+        let scan = |dll: &str, name: &str| {
+            registry()
+                .iter()
+                .filter(|m| m.serves(dll))
+                .flat_map(|m| m.exports.iter())
+                .find(|e| e.name == name)
+                .map(|e| e.address)
+        };
+        let dlls = [
+            "kernel32.dll",
+            "KERNELBASE.dll",
+            "api-ms-win-core-file-l1-1-0.dll",
+            "api-ms-win-core-processthreads-l1-1-1.dll",
+            "xgameruntime.dll",
+            "nothing.dll",
+        ];
+        for m in registry() {
+            for e in &m.exports {
+                for dll in dlls
+                    .iter()
+                    .copied()
+                    .chain(m.dlls.iter().map(|d| d.trim_end_matches('*')))
+                {
+                    assert_eq!(lookup(dll, e.name), scan(dll, e.name), "{dll}!{}", e.name);
+                }
+            }
+        }
+        assert_eq!(lookup("kernel32.dll", "NoSuchExport"), None);
+        assert!(dll_matches("kernel32.dll", "KERNEL32.DLL"));
+        assert!(!dll_matches("kernel32.dll", "kernel32.dl"));
+        assert!(!dll_matches("api-ms-win-core-*", "api-ms-win-cor"));
     }
 
     #[test]

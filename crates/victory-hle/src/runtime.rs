@@ -47,6 +47,12 @@ pub fn image_path(base: usize) -> Option<PathBuf> {
         .map(|(_, p)| p.clone())
 }
 
+/// Whether `base` is one of the title's images (no copy of its path).
+pub fn is_image(base: usize) -> bool {
+    let paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
+    paths.iter().any(|(b, _)| *b == base)
+}
+
 /// The title image whose original file is called `file` (any case).
 pub fn image_named(file: &str) -> Option<usize> {
     let paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());

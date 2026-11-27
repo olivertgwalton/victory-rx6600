@@ -28,12 +28,10 @@ pub extern "system" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
     find_module(&narrow(name), false).unwrap_or_else(|| host::get_module_handle_a(name))
 }
 
-/// A NUL-terminated string from the title.
-fn narrow(text: *const u8) -> String {
-    // SAFETY: the title passes a NUL-terminated string.
-    unsafe { CStr::from_ptr(text.cast()) }
-        .to_string_lossy()
-        .into_owned()
+/// A NUL-terminated string from the title (borrowed when it is UTF-8).
+fn narrow<'a>(text: *const u8) -> std::borrow::Cow<'a, str> {
+    // SAFETY: the title passes a NUL-terminated string, which outlives the call.
+    unsafe { CStr::from_ptr(text.cast()) }.to_string_lossy()
 }
 
 /// See [`narrow`].
@@ -111,13 +109,29 @@ pub extern "system" fn LoadLibraryExA(
     file: *mut c_void,
     flags: u32,
 ) -> *mut c_void {
-    if !name.is_null()
-        && let Some(handle) = find_module(&narrow(name), runs_code(flags))
-    {
+    if let Some(refused) = load_refused(name.is_null(), file, flags) {
+        return refused;
+    }
+    // The console's loader drops trailing blanks (+0x404fb).
+    if let Some(handle) = find_module(narrow(name).trim_end_matches(' '), runs_code(flags)) {
         return handle;
     }
     host::load_library_ex_a(name, file, flags)
 }
+
+/// What the console's `LoadLibraryExW` (KernelBase +0x40470) refuses with
+/// `ERROR_INVALID_PARAMETER` before it looks for anything: no name, a file
+/// handle (reserved), flags above the low sixteen bits, and "as data" with
+/// "as exclusive data" (`0x42`). Wine loads the DLL regardless.
+fn load_refused(no_name: bool, file: *mut c_void, flags: u32) -> Option<*mut c_void> {
+    if no_name || !file.is_null() || flags & 0xffff_0000 != 0 || flags & 0x42 == 0x42 {
+        host::set_last_error(ERROR_INVALID_PARAMETER);
+        return Some(std::ptr::null_mut());
+    }
+    None
+}
+
+const ERROR_INVALID_PARAMETER: u32 = 87;
 
 /// See [`LoadLibraryExA`].
 pub extern "system" fn LoadLibraryExW(
@@ -125,9 +139,10 @@ pub extern "system" fn LoadLibraryExW(
     file: *mut c_void,
     flags: u32,
 ) -> *mut c_void {
-    if !name.is_null()
-        && let Some(handle) = find_module(&wide(name), runs_code(flags))
-    {
+    if let Some(refused) = load_refused(name.is_null(), file, flags) {
+        return refused;
+    }
+    if let Some(handle) = find_module(wide(name).trim_end_matches(' '), runs_code(flags)) {
         return handle;
     }
     host::load_library_ex_w(name, file, flags)
@@ -157,54 +172,144 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
     } else {
         module
     };
+    // Values below 0x10000 are ordinals.
+    let ordinal = (name as usize) < 0x1_0000;
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
-        return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
+        if let Some(ours) = host_override(module, name) {
+            return ours;
+        }
+        let found = host::get_proc_address(module, name);
+        if found.is_null() && ordinal && host::last_error() == ERROR_PROC_NOT_FOUND {
+            host::set_last_error(ERROR_INVALID_ORDINAL);
+        }
+        return found;
     };
-    // Values below 0x10000 are ordinals; we export by name only.
-    if (name as usize) < 0x1_0000 {
+    // We export by name only.
+    if ordinal {
         tracing::warn!(
             module = m.name,
             ordinal = name as usize,
             "GetProcAddress by ordinal"
         );
+        host::set_last_error(ERROR_INVALID_ORDINAL);
         return std::ptr::null_mut();
     }
     // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
-    let name = unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy();
-    match m.exports.iter().find(|e| e.name == name) {
+    let name = unsafe { CStr::from_ptr(name.cast()) }.to_bytes();
+    match m.exports.iter().find(|e| e.name.as_bytes() == name) {
         Some(e) => e.address as *mut c_void,
         None => {
-            tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
+            tracing::warn!(module = m.name, name = %String::from_utf8_lossy(name), "GetProcAddress: not implemented");
+            host::set_last_error(ERROR_PROC_NOT_FOUND);
             std::ptr::null_mut()
         }
     }
+}
+
+/// The console loader's answers for a missing export (ntdll +0x3eb4d:
+/// `STATUS_ORDINAL_NOT_FOUND`, plus one by name): `ERROR_PROC_NOT_FOUND` by
+/// name, `ERROR_INVALID_ORDINAL` by ordinal (Wine answers 127 for both).
+const ERROR_PROC_NOT_FOUND: u32 = 127;
+const ERROR_INVALID_ORDINAL: u32 = 182;
+
+/// The title's command line, as the console gives it to the title: its
+/// program and arguments (the same list as [`__p___argv`]), quoted so that
+/// `CommandLineToArgvW` and the C runtime split it back into that list.
+/// The host's would be ours (`victory run <exe> -- ...`). KernelBase
+/// +0x102e60 `GetCommandLineA` returns one string made at start-up.
+fn command_line(program: &str, args: &[String]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .map(quote)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One argument as the C runtime reads it back: bare unless it is empty or
+/// has blanks or quotes; inside quotes, a quote is escaped and so are the
+/// backslashes right before a quote.
+fn quote(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_owned();
+    }
+    let mut out = String::from('"');
+    let mut slashes = 0;
+    for c in arg.chars() {
+        match c {
+            '\\' => slashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat_n('\\', 2 * slashes + 1));
+                slashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n('\\', slashes));
+                slashes = 0;
+            }
+        }
+        if c != '\\' {
+            out.push(c);
+        }
+    }
+    out.extend(std::iter::repeat_n('\\', 2 * slashes));
+    out.push('"');
+    out
+}
+
+fn title_command_line() -> &'static (std::ffi::CString, Vec<u16>) {
+    static LINE: std::sync::OnceLock<(std::ffi::CString, Vec<u16>)> = std::sync::OnceLock::new();
+    LINE.get_or_init(|| {
+        let program = std::env::args_os().next().unwrap_or_default();
+        let line = command_line(&program.to_string_lossy(), runtime::title_args());
+        let wide = line.encode_utf16().chain(Some(0)).collect();
+        // A NUL inside an argument cannot reach the title; cut there.
+        let narrow = std::ffi::CString::new(line.split('\0').next().unwrap_or_default()).unwrap_or_default();
+        (narrow, wide)
+    })
+}
+
+/// See [`command_line`]; the same pointer every time, as on the console.
+pub extern "system" fn GetCommandLineA() -> *const c_char {
+    title_command_line().0.as_ptr()
+}
+
+/// See [`GetCommandLineA`].
+pub extern "system" fn GetCommandLineW() -> *const u16 {
+    title_command_line().1.as_ptr()
 }
 
 /// What a host module's `name` (or ordinal) is bound to at import binding
 /// when we override it: a title that looks a function up by name must not
 /// get past our overrides (the network guard, path rewriting).
 fn host_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
-    if module.is_null() || runtime::image_path(module as usize).is_some() {
+    if module.is_null() || runtime::is_image(module as usize) {
         return None;
     }
     let symbol = if (name as usize) < 0x1_0000 {
-        format!("#{}", name as usize)
+        std::borrow::Cow::Owned(format!("#{}", name as usize))
     } else {
         narrow(name)
     };
     let mut path = [0u16; 260];
     let len = host::get_module_file_name_w(module, path.as_mut_ptr(), path.len() as u32) as usize;
-    let path = String::from_utf16_lossy(&path[..len.min(path.len())]);
-    let file = path.rsplit('\\').next()?;
-    crate::registry::lookup(file, &symbol).map(|address| address as *mut c_void)
+    let path = &path[..len.min(path.len())];
+    let file = &path[path.iter().rposition(|&c| c == u16::from(b'\\')).map_or(0, |i| i + 1)..];
+    // DLL names are ASCII: read in place, no allocation.
+    let mut ascii = [0u8; 260];
+    let file = if file.iter().all(|&c| c < 0x80) {
+        for (to, &from) in ascii.iter_mut().zip(file) {
+            *to = from as u8;
+        }
+        std::borrow::Cow::Borrowed(std::str::from_utf8(&ascii[..file.len()]).ok()?)
+    } else {
+        std::borrow::Cow::Owned(String::from_utf16_lossy(file))
+    };
+    crate::registry::lookup(&file, &symbol).map(|address| address as *mut c_void)
 }
 
 /// Our pseudo modules and the title's images stay loaded: `LoadLibrary`
 /// took no reference on them, so the host's count must not drop.
 pub extern "system" fn FreeLibrary(module: *mut c_void) -> i32 {
-    if registry().iter().any(|m| handle(m) == module)
-        || runtime::image_path(module as usize).is_some()
-    {
+    if registry().iter().any(|m| handle(m) == module) || runtime::is_image(module as usize) {
         return 1;
     }
     host::free_library(module)
@@ -303,14 +408,15 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
     // As the Windows loader does, a name without extension means a DLL.
     let file = if file.contains('.') {
-        file.to_owned()
+        std::borrow::Cow::Borrowed(file)
     } else {
-        format!("{file}.dll")
+        std::borrow::Cow::Owned(format!("{file}.dll"))
     };
+    let file = &*file;
     // Loads go through the title DLL loader first: it waits for a DLL that
     // another thread is still initialising, as the Windows loader lock does.
     if load {
-        match runtime::load_title_dll(&file) {
+        match runtime::load_title_dll(file) {
             Ok(Some(base)) => return Some(base as *mut c_void),
             Ok(None) => {}
             // Not the host: it would load the unpatched DLL from the title's folder.
@@ -321,12 +427,12 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
             }
         }
     }
-    if let Some(base) = runtime::image_named(&file) {
+    if let Some(base) = runtime::image_named(file) {
         return Some(base as *mut c_void);
     }
     // DLLs the host has too are real host modules, whatever `--strict` says.
-    let host_dll = HostPolicy::default().allows(&file);
-    if !host_dll && let Some(m) = registry().iter().find(|m| m.serves(&file)) {
+    let host_dll = HostPolicy::standard().allows(file);
+    if !host_dll && let Some(m) = registry().iter().find(|m| m.serves(file)) {
         if load {
             tracing::info!(dll = file, "loaded as a pseudo module");
         }
@@ -337,7 +443,7 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     }
     // Any other host DLL (wininet, urlmon, ...) is beyond what we guard, and
     // the console does not have it.
-    refuse(&file);
+    refuse(file);
     host::set_last_error(ERROR_MOD_NOT_FOUND);
     Some(std::ptr::null_mut())
 }
@@ -434,6 +540,29 @@ pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> 
     unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
 }
 
+/// `WerRegisterFile` (KernelBase +0x10c300 → +0xab870): files a crash
+/// report should carry. Wine answers `E_NOTIMPL`; the console checks the
+/// arguments and keeps the file in the process's report block. There is
+/// no report to make here, so the files are only kept (and logged).
+pub extern "system" fn WerRegisterFile(file: *const u16, kind: u32, flags: u32) -> i32 {
+    const E_INVALIDARG: i32 = 0x8007_0057_u32 as i32;
+    // HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE).
+    const TOO_LONG: i32 = 0x8007_00ce_u32 as i32;
+    // User document (1) or other (2); flags: anonymous data, delete when done.
+    if file.is_null() || flags & !3 != 0 || !(1..=2).contains(&kind) {
+        return E_INVALIDARG;
+    }
+    let path = wide(file);
+    // The entry is a 0x20-byte header and the path with its NUL, 0x228 at most.
+    if (path.encode_utf16().count() + 1) * 2 + 0x20 > 0x228 {
+        return TOO_LONG;
+    }
+    tracing::info!(path, kind, flags, "the title registers a file for its crash reports");
+    static FILES: std::sync::Mutex<Vec<(String, u32, u32)>> = std::sync::Mutex::new(Vec::new());
+    FILES.lock().unwrap_or_else(|e| e.into_inner()).push((path, kind, flags));
+    0
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -444,11 +573,16 @@ pub(crate) fn module() -> HleModule {
             "api-ms-win-core-processthreads-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
+            "api-ms-win-core-processenvironment-*",
+            "api-ms-win-core-windowserrorreporting-*",
             "api-ms-win-crt-runtime-*",
         ],
         exports: vec![
             hle_export!(__p___argc),
             hle_export!(__p___argv),
+            hle_export!(GetCommandLineA),
+            hle_export!(GetCommandLineW),
+            hle_export!(WerRegisterFile),
             hle_export!(GetModuleHandleW),
             hle_export!(GetModuleHandleA),
             hle_export!(GetModuleFileNameW),
@@ -524,6 +658,11 @@ mod host {
     pub(super) fn set_last_error(code: u32) {
         // SAFETY: see above.
         unsafe { SetLastError(code) }
+    }
+
+    pub(super) fn last_error() -> u32 {
+        // SAFETY: plain call.
+        unsafe { windows_sys::Win32::Foundation::GetLastError() }
     }
 
     pub(super) fn load_library_ex_a(name: *const u8, file: *mut c_void, flags: u32) -> *mut c_void {
@@ -639,6 +778,10 @@ mod host {
     }
 
     pub(super) fn set_last_error(_: u32) {}
+
+    pub(super) fn last_error() -> u32 {
+        0
+    }
 
     pub(super) fn load_library_ex_w(_: *const u16, _: *mut c_void, _: u32) -> *mut c_void {
         std::ptr::null_mut()
@@ -827,5 +970,99 @@ mod tests {
             let last = unsafe { windows_sys::Win32::Foundation::GetLastError() };
             assert_eq!(last, ERROR_INSUFFICIENT_BUFFER);
         }
+    }
+
+    /// KernelBase +0x40470: refused before any lookup, title DLLs and our
+    /// pseudo modules included (Wine loads the DLL in each case).
+    #[cfg(windows)]
+    #[test]
+    fn library_loads_are_checked_first() {
+        let name = w("kernel32.dll");
+        let null = std::ptr::null_mut();
+        for (file, flags) in [(std::ptr::dangling_mut::<c_void>(), 0), (null, 0x1_0000), (null, 0x42), (null, 0x8000_0000)] {
+            host::set_last_error(0);
+            assert!(LoadLibraryExW(name.as_ptr(), file, flags).is_null(), "{flags:#x}");
+            assert_eq!(host::last_error(), ERROR_INVALID_PARAMETER);
+            assert!(LoadLibraryExA(c"xgameruntime.dll".as_ptr().cast(), file, flags).is_null());
+            assert_eq!(host::last_error(), ERROR_INVALID_PARAMETER);
+        }
+        host::set_last_error(0);
+        assert!(LoadLibraryW(std::ptr::null()).is_null());
+        assert_eq!(host::last_error(), ERROR_INVALID_PARAMETER);
+        // As data (0x2), or exclusively so (0x40), is fine alone.
+        assert!(!LoadLibraryExW(name.as_ptr(), null, 0x2).is_null());
+        assert!(!LoadLibraryExW(name.as_ptr(), null, 0x40).is_null());
+        assert!(!LoadLibraryExW(name.as_ptr(), null, 0x8).is_null());
+    }
+
+    /// ntdll +0x3eb4d: a missing export by ordinal is
+    /// `ERROR_INVALID_ORDINAL`, by name `ERROR_PROC_NOT_FOUND`, on host DLLs
+    /// and our pseudo modules alike (Wine: 127 both, and nothing for ours).
+    #[cfg(windows)]
+    #[test]
+    fn missing_exports_say_why() {
+        let kernel32 = GetModuleHandleW(w("kernel32.dll").as_ptr());
+        let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
+        for module in [kernel32, runtime] {
+            host::set_last_error(0);
+            assert!(GetProcAddress(module, c"NoSuchExport".as_ptr().cast()).is_null());
+            assert_eq!(host::last_error(), ERROR_PROC_NOT_FOUND);
+            host::set_last_error(0);
+            assert!(GetProcAddress(module, 60000 as *const u8).is_null());
+            assert_eq!(host::last_error(), ERROR_INVALID_ORDINAL);
+        }
+    }
+
+    /// KernelBase +0x102e60: the title's own command line, which splits
+    /// back into what `__p___argv` gives (the C runtime's rules).
+    #[test]
+    fn the_title_command_line_is_its_own() {
+        let args: Vec<String> = ["-skipToIIS", "two words", "", r#"say "hi""#, r"dir\", r"a\\b"].map(String::from).into();
+        let line = command_line(r"C:\Program Files\victory.exe", &args);
+        assert_eq!(
+            line,
+            r#""C:\Program Files\victory.exe" -skipToIIS "two words" "" "say \"hi\"" dir\ a\\b"#
+        );
+        #[cfg(windows)]
+        {
+            let wide: Vec<u16> = line.encode_utf16().chain(Some(0)).collect();
+            let mut n = 0;
+            // SAFETY: a NUL-terminated line; the result is freed below.
+            #[link(name = "shell32")]
+            unsafe extern "system" {
+                fn CommandLineToArgvW(line: *const u16, n: *mut i32) -> *mut *mut u16;
+            }
+            // SAFETY: as above.
+            let split = unsafe { CommandLineToArgvW(wide.as_ptr(), &mut n) };
+            assert!(!split.is_null());
+            // SAFETY: `n` strings, each NUL-terminated.
+            let back: Vec<String> = (0..n as usize).map(|i| wide_string(unsafe { *split.add(i) })).collect();
+            // SAFETY: allocated by `CommandLineToArgvW`.
+            unsafe { windows_sys::Win32::Foundation::LocalFree(split.cast()) };
+            assert_eq!(back[1..], args[..]);
+        }
+        // Every call, the same string.
+        assert_eq!(GetCommandLineA(), GetCommandLineA());
+        assert_eq!(GetCommandLineW(), GetCommandLineW());
+    }
+
+    #[cfg(windows)]
+    fn wide_string(p: *const u16) -> String {
+        wide(p)
+    }
+
+    /// KernelBase +0xab870: the console's argument checks, then S_OK
+    /// (Wine: E_NOTIMPL for every call).
+    #[test]
+    fn crash_report_files_are_checked_and_kept() {
+        let name = w(r"T:\\crash\\log.txt");
+        assert_eq!(WerRegisterFile(std::ptr::null(), 1, 0), 0x8007_0057_u32 as i32);
+        assert_eq!(WerRegisterFile(name.as_ptr(), 3, 0), 0x8007_0057_u32 as i32);
+        assert_eq!(WerRegisterFile(name.as_ptr(), 1, 4), 0x8007_0057_u32 as i32);
+        let long = w(&"a".repeat(260));
+        assert_eq!(WerRegisterFile(long.as_ptr(), 2, 0), 0x8007_00ce_u32 as i32);
+        let longest = w(&"a".repeat(259));
+        assert_eq!(WerRegisterFile(longest.as_ptr(), 2, 0), 0);
+        assert_eq!(WerRegisterFile(name.as_ptr(), 1, 3), 0);
     }
 }

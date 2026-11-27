@@ -24,8 +24,9 @@ use crate::{HleModule, hle_export};
 /// (`constrained`): both take a flag and the title's context.
 type Routine = extern "system" fn(flag: u8, context: *mut c_void);
 
-/// Registration id, routine and context.
-type Registration = (usize, Routine, usize);
+/// Registration id, routine and context. The console keeps a null routine
+/// too (and would call it); it is skipped here.
+type Registration = (usize, Option<Routine>, usize);
 
 /// Each suspend routine.
 static ROUTINES: Mutex<Vec<Registration>> = Mutex::new(Vec::new());
@@ -46,25 +47,60 @@ const SUSPEND_DEADLINE: Duration = Duration::from_secs(1);
 
 const ERROR_INVALID_PARAMETER: u32 = 87;
 
-/// Adds `routine` to `list` and writes its registration id.
+/// Adds `routine` to `list` and writes its registration id, as
+/// minappmodelx +0x6888 does: the id slot is zeroed first, the routine is
+/// not checked, ids count up from 1 across both lists. (A null slot: the
+/// console faults writing it; this answers `ERROR_INVALID_PARAMETER`.)
 fn register(
     mut list: MutexGuard<'static, Vec<Registration>>,
     routine: Option<Routine>,
     context: *mut c_void,
     registration: *mut usize,
 ) -> u32 {
-    let Some(routine) = routine else {
-        return ERROR_INVALID_PARAMETER;
-    };
     if registration.is_null() {
         return ERROR_INVALID_PARAMETER;
     }
+    // SAFETY: checked non-null; the title passes room for its registration.
+    unsafe { registration.write(0) };
     static NEXT: AtomicUsize = AtomicUsize::new(1);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     list.push((id, routine, context as usize));
-    // SAFETY: checked non-null; the title passes room for its registration.
+    // SAFETY: as above.
     unsafe { registration.write(id) };
     0
+}
+
+/// The registration whose routine runs now, and the thread running it.
+static RUNNING: Mutex<Option<(usize, u32)>> = Mutex::new(None);
+static RUNNING_DONE: std::sync::Condvar = std::sync::Condvar::new();
+
+fn current_thread_id() -> u32 {
+    // SAFETY: plain call.
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
+}
+
+/// Removes a registration as minappmodelx +0x6c5c does: once this returns
+/// its routine is not running, unless it is the caller (a routine may
+/// unregister itself).
+fn unregister(mut list: MutexGuard<'static, Vec<Registration>>, registration: usize) {
+    list.retain(|&(id, ..)| id != registration);
+    drop(list);
+    let me = current_thread_id();
+    let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+    while matches!(*running, Some((id, thread)) if id == registration && thread != me) {
+        running = RUNNING_DONE.wait(running).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// Runs one registration's routine, marked as running for [`unregister`].
+fn run(&(id, routine, context): &Registration, flag: u8) {
+    let Some(routine) = routine else {
+        return;
+    };
+    *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = Some((id, current_thread_id()));
+    routine(flag, context as *mut c_void);
+    *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    RUNNING_DONE.notify_all();
 }
 
 pub extern "system" fn RegisterAppStateChangeNotification(
@@ -76,7 +112,7 @@ pub extern "system" fn RegisterAppStateChangeNotification(
 }
 
 pub extern "system" fn UnregisterAppStateChangeNotification(registration: usize) {
-    routines().retain(|&(id, ..)| id != registration);
+    unregister(routines(), registration);
 }
 
 /// The host's own version never calls the routine (a desktop app is never
@@ -90,7 +126,7 @@ pub extern "system" fn RegisterAppConstrainedChangeNotification(
 }
 
 pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: usize) {
-    constrained().retain(|&(id, ..)| id != registration);
+    unregister(constrained(), registration);
 }
 
 /// The window procedure a title window had before ours.
@@ -365,8 +401,8 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
 /// Grand Theft Auto VI's suspend routine waits for a state that only its
 /// constrained routine brings about; called alone it never returns.
 fn constrain_then_suspend(constrain: &[Registration], suspend: &[Registration]) {
-    for &(_, routine, context) in constrain.iter().chain(suspend) {
-        routine(1, context as *mut c_void);
+    for registration in constrain.iter().chain(suspend) {
+        run(registration, 1);
     }
 }
 
@@ -470,8 +506,9 @@ mod tests {
             0
         );
         UnregisterAppStateChangeNotification(a);
+        // Other tests share the list.
         let left: Vec<_> = routines().iter().map(|r| r.0).collect();
-        assert_eq!(left, [b]);
+        assert!(!left.contains(&a) && left.contains(&b));
     }
 
     #[test]
@@ -485,13 +522,9 @@ mod tests {
             RegisterAppConstrainedChangeNotification(Some(noop), std::ptr::null_mut(), &mut b),
             0
         );
-        assert_eq!(
-            RegisterAppConstrainedChangeNotification(None, std::ptr::null_mut(), &mut a),
-            ERROR_INVALID_PARAMETER
-        );
         UnregisterAppConstrainedChangeNotification(a);
         let left: Vec<_> = constrained().iter().map(|r| r.0).collect();
-        assert_eq!(left, [b]);
+        assert!(!left.contains(&a) && left.contains(&b));
     }
 
     /// What `recording_routine` saw: (context, flag) per call, in order.
@@ -501,10 +534,51 @@ mod tests {
         CALLS.lock().unwrap().push((context as usize, flag));
     }
 
+    /// minappmodelx +0x6888: the slot is zeroed before anything else, a
+    /// null routine is taken, and the ids of both lists count up together.
+    #[test]
+    fn registrations_are_numbered_as_the_console_numbers_them() {
+        let (mut a, mut b) = (usize::MAX, usize::MAX);
+        assert_eq!(RegisterAppStateChangeNotification(None, std::ptr::null_mut(), &mut a), 0);
+        assert_eq!(RegisterAppConstrainedChangeNotification(Some(noop), std::ptr::null_mut(), &mut b), 0);
+        assert!(a != 0 && b > a, "{a} {b}");
+        assert_eq!(
+            RegisterAppStateChangeNotification(Some(noop), std::ptr::null_mut(), std::ptr::null_mut()),
+            ERROR_INVALID_PARAMETER
+        );
+        UnregisterAppStateChangeNotification(a);
+        UnregisterAppConstrainedChangeNotification(b);
+    }
+
+    static ENTERED: AtomicBool = AtomicBool::new(false);
+    static LEFT: AtomicBool = AtomicBool::new(false);
+
+    extern "system" fn slow_routine(_: u8, _: *mut c_void) {
+        ENTERED.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(200));
+        LEFT.store(true, Ordering::SeqCst);
+    }
+
+    /// minappmodelx +0x6c5c: unregistering waits for the routine running
+    /// on another thread (WaitOnAddress on the running thread's id).
+    #[test]
+    fn unregistering_waits_for_a_running_routine() {
+        let mut id = 0;
+        assert_eq!(RegisterAppStateChangeNotification(Some(slow_routine), std::ptr::null_mut(), &mut id), 0);
+        let registration = *routines().iter().find(|r| r.0 == id).unwrap();
+        let caller = std::thread::spawn(move || run(&registration, 1));
+        while !ENTERED.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        UnregisterAppStateChangeNotification(id);
+        assert!(LEFT.load(Ordering::SeqCst), "returned while the routine ran");
+        caller.join().unwrap();
+    }
+
     #[test]
     fn constrained_routines_run_before_suspend_routines() {
-        let r: Routine = recording_routine;
-        constrain_then_suspend(&[(1, r, 10), (2, r, 11)], &[(3, r, 20), (4, r, 21)]);
+        let r = Some(recording_routine as Routine);
+        constrain_then_suspend(&[(1, r, 10), (2, r, 11)], &[(3, None, 15), (3, r, 20), (4, r, 21)]);
         assert_eq!(*CALLS.lock().unwrap(), [(10, 1), (11, 1), (20, 1), (21, 1)]);
     }
 

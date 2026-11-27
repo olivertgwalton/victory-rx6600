@@ -461,6 +461,16 @@ pub extern "system" fn FindFirstFileExW(
     filter: *mut c_void,
     flags: u32,
 ) -> Handle {
+    // KernelBase +0x70d70: an info level or search op past the two there
+    // are, or flags beyond case-sensitive/large-fetch/on-disk (7), fail
+    // before the path is looked at: `ERROR_NOT_SUPPORTED` for "limit to
+    // devices" (2), else `ERROR_INVALID_PARAMETER` (Wine takes any flags).
+    if level >= 2 || search >= 2 || flags & !7 != 0 {
+        let code = if search == 2 { 50 } else { 87 };
+        // SAFETY: plain call.
+        unsafe { windows_sys::Win32::Foundation::SetLastError(code) };
+        return -1isize as Handle;
+    }
     let p = wide(path);
     host!("kernel32.dll", "FindFirstFileExW": extern "system" fn(*const u16, i32, *mut c_void, i32, *mut c_void, u32) -> Handle)(
         p.ptr(),
@@ -468,6 +478,57 @@ pub extern "system" fn FindFirstFileExW(
         data,
         search,
         filter,
+        flags,
+    )
+}
+
+/// `CopyFile2` (KernelBase +0xf9890): the title's paths, rewritten, and
+/// the console's checks on the extended parameters first (Wine copies
+/// regardless): a size of 0x20 or 0x70 (whose six reserved quadwords at
+/// +0x40 are zero), no flag bit 30, and no "restartable"/"no offload"
+/// (0x4002) with "request compressed traffic" (bit 27): `E_INVALIDARG`.
+pub extern "system" fn CopyFile2(from: *const u16, to: *const u16, params: *const u8) -> i32 {
+    const E_INVALIDARG: i32 = 0x8007_0057_u32 as i32;
+    if !params.is_null() {
+        // SAFETY: the title passes COPYFILE2_EXTENDED_PARAMETERS(_V2) of the size it gives.
+        let ok = unsafe {
+            let size = params.cast::<u32>().read_unaligned();
+            let flags = params.add(4).cast::<u32>().read_unaligned();
+            let reserved_clear = size != 0x70
+                || (0..6).all(|i| params.add(0x40 + 8 * i).cast::<u64>().read_unaligned() == 0);
+            (size == 0x20 || size == 0x70)
+                && reserved_clear
+                && flags & 1 << 30 == 0
+                && !(flags & 0x4002 != 0 && flags & 1 << 27 != 0)
+        };
+        if !ok {
+            return E_INVALIDARG;
+        }
+    }
+    let (from, to) = (wide(from), wide(to));
+    host!("kernel32.dll", "CopyFile2": extern "system" fn(*const u16, *const u16, *const u8) -> i32)(
+        from.ptr(),
+        to.ptr(),
+        params,
+    )
+}
+
+/// The title's paths, rewritten (the link and its target).
+pub extern "system" fn CreateHardLinkW(link: *const u16, target: *const u16, security: *mut c_void) -> i32 {
+    let (link, target) = (wide(link), wide(target));
+    host!("kernel32.dll", "CreateHardLinkW": extern "system" fn(*const u16, *const u16, *mut c_void) -> i32)(
+        link.ptr(),
+        target.ptr(),
+        security,
+    )
+}
+
+/// See [`CreateHardLinkW`].
+pub extern "system" fn CreateSymbolicLinkW(link: *const u16, target: *const u16, flags: u32) -> u8 {
+    let (link, target) = (wide(link), wide(target));
+    host!("kernel32.dll", "CreateSymbolicLinkW": extern "system" fn(*const u16, *const u16, u32) -> u8)(
+        link.ptr(),
+        target.ptr(),
         flags,
     )
 }
@@ -739,6 +800,9 @@ pub(crate) fn module() -> HleModule {
             hle_export!(FindFirstFileW),
             hle_export!(FindFirstFileExW),
             hle_export!(MoveFileExW),
+            hle_export!(CopyFile2),
+            hle_export!(CreateHardLinkW),
+            hle_export!(CreateSymbolicLinkW),
             hle_export!(SetCurrentDirectoryA),
             hle_export!(_wfopen),
             hle_export!(_wfopen_s),
@@ -767,6 +831,47 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KernelBase +0x70d70: bad levels, search ops and flags fail first
+    /// (Wine accepted flag 0x10), "limit to devices" as not supported.
+    /// KernelBase +0xf9890: bad extended parameters fail before anything
+    /// is copied (Wine copied with a 39-byte struct).
+    #[test]
+    fn file_copies_check_their_parameters_first() {
+        let w = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("a.bin");
+        std::fs::write(&from, b"abc").unwrap();
+        let to = dir.path().join("b.bin");
+        let (f, t) = (w(&from.to_string_lossy()), w(&to.to_string_lossy()));
+        let mut v1 = [0u8; 0x20];
+        for (len, size, flags, reserved) in [(0x20, 39u32, 0u32, false), (0x20, 0x20, 1 << 30, false), (0x20, 0x20, 0x2 | 1 << 27, false), (0x70, 0x70, 0, true)] {
+            let mut params = vec![0u8; len];
+            params[..4].copy_from_slice(&size.to_le_bytes());
+            params[4..8].copy_from_slice(&flags.to_le_bytes());
+            if reserved {
+                params[0x48] = 1;
+            }
+            assert_eq!(CopyFile2(f.as_ptr(), t.as_ptr(), params.as_ptr()), 0x8007_0057_u32 as i32);
+            assert!(!to.exists());
+        }
+        v1[..4].copy_from_slice(&0x20u32.to_le_bytes());
+        v1[4..8].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(CopyFile2(f.as_ptr(), t.as_ptr(), v1.as_ptr()), 0);
+        assert_eq!(std::fs::read(&to).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn directory_searches_check_their_arguments_first() {
+        let path: Vec<u16> = "C:\\*".encode_utf16().chain(Some(0)).collect();
+        let mut data = [0u8; 600];
+        let last = || unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        let null = std::ptr::null_mut();
+        for (level, search, flags, code) in [(2, 0, 0, 87), (0, 3, 0, 87), (0, 0, 0x10, 87), (0, 2, 0, 50), (2, 2, 0, 50)] {
+            let h = FindFirstFileExW(path.as_ptr(), level, data.as_mut_ptr().cast(), search, null, flags);
+            assert_eq!((h as isize, last()), (-1, code), "{level} {search} {flags:#x}");
+        }
+    }
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().chain([0]).collect()
