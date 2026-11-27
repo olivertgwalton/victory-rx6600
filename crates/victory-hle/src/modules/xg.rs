@@ -535,11 +535,15 @@ pub struct MipOut {
     pub depth_or_array: u32,
     pub samples: u32,
     pub swizzle: u32,
+    /// Padding is spelled out so every byte the title gets is written (the
+    /// library writes zeroes).
+    pub _pad0: u32,
     pub bank_rotation: [u64; 2],
     pub slice_depth: u32,
     pub in_tail: u32,
     /// Where a tail mip starts in elements: x bits 0-10, y 11-21.
     pub tail_position: u32,
+    pub _pad1: u32,
 }
 
 #[repr(C)]
@@ -547,6 +551,7 @@ pub struct MipOut {
 pub struct PlaneOut {
     /// 1 data, 7 depth, 8 stencil (metadata planes are not made).
     pub usage: u32,
+    pub _pad0: u32,
     pub size: u64,
     pub slice_size: u64,
     pub offset: u64,
@@ -554,6 +559,7 @@ pub struct PlaneOut {
     pub element_bytes: u32,
     pub standard_mips: u32,
     pub tail_mips: u32,
+    pub _pad1: u32,
     pub mips: [MipOut; MIPS],
 }
 
@@ -566,6 +572,7 @@ pub struct LayoutOut {
     pub planes: u32,
     pub plane: [PlaneOut; 4],
     pub dimension: u32,
+    pub _pad: u32,
 }
 const _: () = assert!(size_of::<MipOut>() == 0x70);
 const _: () = assert!(size_of::<PlaneOut>() == 0x6c8);
@@ -860,6 +867,7 @@ extern "system" fn copy_from(
 pub struct PackedMips {
     pub standard: u8,
     pub packed: u8,
+    pub _pad: u16,
     pub tiles: u32,
     pub start: u32,
 }
@@ -921,6 +929,7 @@ extern "system" fn tiling(
         }
         if let Some(p) = packed.as_mut() {
             *p = PackedMips {
+                _pad: 0,
                 standard: standard as u8,
                 packed: (c.mips - standard) as u8,
                 tiles: tail_tiles as u32,
@@ -1122,7 +1131,7 @@ pub(crate) fn module() -> HleModule {
 }
 
 #[cfg(test)]
-mod dump;
+mod reference;
 
 #[cfg(test)]
 mod tests {
@@ -1256,6 +1265,7 @@ mod tests {
         let tiling: Tiling = slot(c, 10);
         let (mut tiles, mut shape, mut n) = (0, [0; 3], 4);
         let mut packed = PackedMips {
+            _pad: 0,
             standard: 0,
             packed: 0,
             tiles: 0,

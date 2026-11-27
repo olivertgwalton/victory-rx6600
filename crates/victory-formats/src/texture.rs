@@ -787,17 +787,8 @@ impl Layout {
         if tiled_len < tiled_need as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
-        if self.xor.is_some() {
-            // XOR modes: an address per element.
-            for z in 0..depth {
-                for y in 0..m.height {
-                    let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
-                    for x in 0..m.width {
-                        let at = self.address(mip, x, y, first + z, 0)? as usize;
-                        copy_run::<DETILE>(src, dst, at, linear_row + x as usize * n, n);
-                    }
-                }
-            }
+        if let Some(e) = self.xor {
+            self.walk_xor::<DETILE>(e, m, src, dst, first, row_pitch, depth_pitch);
             return Ok(());
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
@@ -852,6 +843,71 @@ impl Layout {
             }
         }
         Ok(())
+    }
+}
+
+impl Layout {
+    /// The copy for a XOR mode. An element's address is its block's plus
+    /// the XOR of what its column, row (and slice) flip inside the block,
+    /// so each column's part is worked out once and each row XORs its
+    /// own in. Elements go in runs: as many as the low address bits that
+    /// only x sets, in order, and nothing else flips, keep contiguous.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_xor<const DETILE: bool>(
+        &self,
+        e: &xor::Equation,
+        m: &Mip,
+        src: &[u8],
+        dst: &mut [u8],
+        first: u32,
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) {
+        let n = self.desc.element_bytes as usize;
+        let element_log2 = n.trailing_zeros();
+        let [bw, bh, _] = self.block;
+        let log2 = self.alignment.trailing_zeros();
+        let (tx, ty) = m.tail.map_or((0, 0), |t| (t.x, t.y));
+        let flip = |masks: &[u16], v: u32| {
+            masks
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| v >> i & 1 != 0)
+                .fold(0u32, |a, (_, &m)| a ^ u32::from(m))
+        };
+        // Address bits flipped by anything but x.
+        let others = e.y.iter().chain(&e.z).chain(&e.s).fold(0u32, |a, &m| a | u32::from(m));
+        let mut run_log2 = 0;
+        while let Some(&mask) = e.x.get(run_log2) {
+            let bit = element_log2 + run_log2 as u32;
+            if u32::from(mask) != 1 << bit || others & (1 << bit) != 0 || (1u32 << (run_log2 + 1)) > bw {
+                break;
+            }
+            run_log2 += 1;
+        }
+        let run = 1usize << run_log2;
+        // Per column (in runs): its block in the row and its flipped bits.
+        let columns: Vec<(u64, u32)> = (0..m.width)
+            .step_by(run)
+            .map(|x| ((u64::from(x / bw)) << log2, flip(&e.x, x + tx)))
+            .collect();
+        let width = m.width as usize;
+        for z in 0..m.depth {
+            let (s, _) = self.split(first + z);
+            let base = u64::from(s) * self.slice_size + m.offset;
+            let zflip = flip(&e.z, first + z);
+            for y in 0..m.height {
+                let rowc = flip(&e.y, y + ty) ^ zflip;
+                let row = base + ((u64::from(y / bh) * u64::from(m.pitch / bw)) << log2);
+                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                for (i, &(block, inside)) in columns.iter().enumerate() {
+                    let x = i * run;
+                    let at = row + block + u64::from(inside ^ rowc);
+                    let len = run.min(width - x) * n;
+                    copy_run::<DETILE>(src, dst, at as usize, linear_row + x * n, len);
+                }
+            }
+        }
     }
 }
 
