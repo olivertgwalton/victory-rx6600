@@ -9,3 +9,13 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+zlib-rs.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "decode"
+harness = false
