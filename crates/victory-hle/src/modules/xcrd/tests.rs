@@ -1255,3 +1255,55 @@ fn trim_xvc_with_specifiers() {
         }
     }
 }
+
+#[test]
+fn fuzz_sparse_cache() {
+    fuzz("XCrdPopulateSparseCacheBlocks", &[Adp, Path, InOpt(0x40), Int(&[0x10, 0, 0x40]), InOpt(0x40), Int(&[0x20, 0, 0x40]), In(16), OutOpt(4)], W32);
+}
+
+/// The XVD driver: data a pattern; the count (+0x20 for the table, +0xc for
+/// user data) as asked, or "buffer too small".
+#[test]
+fn xvd_reads() {
+    let s = session();
+    trace_all(&s);
+    let (rb, lb) = both!("XCrdReadBatInfoXVD": extern "system" fn(*const Adapter, *const u16, *mut u8, *mut u32, *mut [u8; 0x34]) -> HRESULT);
+    let (ru, lu) = both!("XCrdReadUserDataXVD": extern "system" fn(*const Adapter, *const u16, u64, *mut u8, *mut u32) -> HRESULT);
+    let a = adapter();
+    let path = wz("[XUC:]\\a.xvd");
+    for small in [false, true] {
+        let driver = move |s: &Session| s.reply(move |_, b| {
+            b[0x14..0x18].fill(0);
+            for (i, x) in b[0x1c + 0x10..].iter_mut().enumerate() {
+                if !(0x10..0x14).contains(&i) {
+                    *x = (i as u8).wrapping_mul(31).wrapping_add(5);
+                }
+            }
+            if small {
+                b[0x14..0x18].copy_from_slice(&0xc000_0023u32.to_le_bytes());
+            }
+            0
+        });
+        for len in [0u32, 0x10, 0x1000, 0x1001, 0x3000] {
+            for with_buffer in [true, false] {
+                same(&format!("bat {len:#x} {with_buffer} {small}"), run(&s, driver, |side| {
+                    let mut buf = vec![0xccu8; 0x8000];
+                    let mut info = [0xccu8; 0x34];
+                    let b = if with_buffer { buf.as_mut_ptr() } else { std::ptr::null_mut() };
+                    let mut n = len;
+                    let hr = if side { rb(&a, path.as_ptr(), b, &mut n, &mut info) } else { lb(&a, path.as_ptr(), b, &mut n, &mut info) };
+                    (hr, n, info, buf)
+                }));
+                for offset in [0u64, 0x1000, 0x10] {
+                    same(&format!("user {len:#x} {with_buffer} {offset:#x} {small}"), run(&s, |s| s.reply(blob_driver(if small { 2 } else { 0 })), |side| {
+                        let mut buf = vec![0xccu8; 0x8000];
+                        let b = if with_buffer { buf.as_mut_ptr() } else { std::ptr::null_mut() };
+                        let mut n = len;
+                        let hr = if side { ru(&a, path.as_ptr(), offset, b, &mut n) } else { lu(&a, path.as_ptr(), offset, b, &mut n) };
+                        (hr, n, buf)
+                    }));
+                }
+            }
+        }
+    }
+}

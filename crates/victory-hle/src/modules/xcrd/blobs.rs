@@ -175,6 +175,161 @@ pub extern "system" fn XCrdStorageWriteBlob(adapter: *const Adapter, path: *cons
     XCrdStorageWriteBlobEx(adapter, path, 0, buffer, len, 1)
 }
 
+/// 0x180004250: hands the driver a content's metadata and data bitmaps
+/// and a 16-byte id; the number of blocks it has comes back (+0x10).
+pub extern "system" fn XCrdPopulateSparseCacheBlocks(
+    adapter: *const Adapter,
+    path: *const u16,
+    md: *const u8,
+    md_len: u32,
+    data: *const u8,
+    data_len: u32,
+    id: *const [u8; 16],
+    downloaded: *mut u32,
+) -> HRESULT {
+    result((|| {
+        check(!adapter.is_null(), "Invalid Adapter Handle.\n")?;
+        check(!path.is_null(), "Invalid XcrdPath.\n")?;
+        check(!md.is_null(), "Invalid MdBitmap.\n")?;
+        check(!data.is_null(), "Invalid DataBitmap.\n")?;
+        check(!downloaded.is_null(), "Invalid DownloadedBlocks.\n")?;
+        // SAFETY: a NUL-terminated path.
+        let units = unsafe { wide(path) };
+        if units.is_empty() {
+            return Err(super::E_INVALIDARG);
+        }
+        let size = u64::from(md_len) + 0x32 + units.len() as u64 * 2 + u64::from(data_len);
+        if size > u64::from(u32::MAX) {
+            return Err(0x8007_007a_u32 as i32);
+        }
+        let mut p = Payload::new(0x7800_0184, size as usize);
+        let bytes = units.len() * 2;
+        let md_at = bytes + 0x32;
+        p.u32(0x2c, size as u32);
+        p.u32(0x24, 0x30);
+        p.u32(0x28, bytes as u32);
+        p.u32(0x18, md_at as u32);
+        p.u32(0x14, md_len);
+        p.u32(0x20, md_at as u32 + md_len);
+        p.u32(0x1c, data_len);
+        // SAFETY: the caller's id (not checked) and bitmaps of their lengths.
+        unsafe {
+            p.put(0, &*id);
+            let status = copy_string(p.body(), 0x30, bytes + 2, units);
+            if status < 0 {
+                return Ok(status);
+            }
+            p.put(md_at, std::slice::from_raw_parts(md, md_len as usize));
+            p.put(md_at + md_len as usize, std::slice::from_raw_parts(data, data_len as usize));
+        }
+        let hr = send(handle_of(adapter), &mut p);
+        if hr >= 0 {
+            // SAFETY: checked non-null.
+            unsafe { *downloaded = p.read_u32(0x10) };
+        }
+        Ok(hr)
+    })())
+}
+
+/// 0x180005a70: an XVD's block allocation table, into a buffer rounded up
+/// to pages; its description (0x34 bytes) comes back too, also after a
+/// too-small buffer.
+pub extern "system" fn XCrdReadBatInfoXVD(adapter: *const Adapter, path: *const u16, buffer: *mut u8, len: *mut u32, info: *mut [u8; 0x34]) -> HRESULT {
+    result((|| {
+        // SAFETY: the caller's length (read without a check when there is a
+        // buffer, as the library's).
+        check(buffer.is_null() || unsafe { *len } != 0, "Can't specify buffer with zero length\n")?;
+        check(!adapter.is_null(), "Invalid Adapter Handle.\n")?;
+        check(!path.is_null(), "Invalid Input Path.\n")?;
+        if buffer.is_null() {
+            check(!len.is_null(), "BufferLength must not be NULL if Buffer is NULL\n")?;
+            // SAFETY: checked non-null.
+            check(unsafe { *len } == 0, "BufferLength must not be zero if Buffer is NULL\n")?;
+        }
+        // SAFETY: a NUL-terminated path; the length is non-null by now.
+        let (units, n) = unsafe { (wide(path), *len) };
+        let pages = n.wrapping_add(0xfff) & 0xffff_f000;
+        let mut size = (units.len() * 2 + 0x4a) as u32;
+        if n != 0 {
+            size = size.wrapping_add(pages);
+        }
+        let mut p = Payload::new(0x7800_002c, size as usize);
+        p.u32(0x20, pages);
+        p.u32(0x18, 0x48);
+        p.u32(0x1c, (units.len() * 2) as u32);
+        let status = copy_string(p.body(), 0x48, units.len() * 2 + 2, units);
+        if status < 0 {
+            return Ok(status);
+        }
+        let hr = send(handle_of(adapter), &mut p);
+        if hr < 0 && hr != too_small() {
+            return Ok(hr);
+        }
+        let b = p.bytes[HEADER..].to_vec();
+        let rd = |at: usize, k: usize| b[at..at + k].to_vec();
+        if hr >= 0 && n != 0 {
+            // From the path's last character on (0x180005bf8: (len + 0x24) * 2).
+            let at = units.len() * 2 + 0x48;
+            let k = (u32::from_le_bytes(b[0x20..0x24].try_into().unwrap()) as usize).min(b.len().saturating_sub(at));
+            // SAFETY: the caller's buffer (the driver keeps to its pages).
+            unsafe { std::ptr::copy_nonoverlapping(b[at..].as_ptr(), buffer, k) };
+        }
+        // SAFETY: the caller's description (not checked) and length.
+        unsafe {
+            let o = &mut *info;
+            for (to, from, k) in [(0, 8, 8), (8, 0, 8), (0x10, 0x14, 4), (0x14, 0x10, 4), (0x18, 0x28, 8), (0x24, 0x34, 4), (0x20, 0x30, 4), (0x28, 0x38, 8), (0x30, 0x40, 4)] {
+                o[to..to + k].copy_from_slice(&rd(from, k));
+            }
+            *len = u32::from_le_bytes(b[0x20..0x24].try_into().unwrap());
+        }
+        Ok(hr)
+    })())
+}
+
+/// 0x180005c90: reads an XVD's user data from a page-aligned offset, in
+/// chunks; each chunk's count is what the driver read (a chunk of 0 would
+/// repeat for good, as the library's).
+pub extern "system" fn XCrdReadUserDataXVD(adapter: *const Adapter, path: *const u16, mut offset: u64, mut buffer: *mut u8, len: *mut u32) -> HRESULT {
+    const USER_DATA: u32 = 0x7800_0028;
+    result((|| {
+        // SAFETY: as in XCrdStorageReadBlobEx.
+        check(buffer.is_null() || unsafe { *len } != 0, "Can't specify buffer with zero length\n")?;
+        check(!adapter.is_null(), "Invalid Adapter Handle.\n")?;
+        check(!path.is_null(), "Invalid Input Path.\n")?;
+        check(!buffer.is_null() || !len.is_null(), "BufferLength must not be NULL if Buffer is NULL\n")?;
+        check(offset & 0xfff == 0, "Offset has to be page aligned\n")?;
+        // SAFETY: non-null by now.
+        let mut left = unsafe { *len };
+        if left == 0 {
+            return Ok(transfer(adapter, path, offset, buffer, len, USER_DATA, 0));
+        }
+        // SAFETY: a NUL-terminated path.
+        let path_bytes = (unsafe { wide(path) }.len() * 2 + 2) as u32;
+        let mut total = 0u32;
+        loop {
+            let mut got = chunk(path_bytes, left);
+            let hr = transfer(adapter, path, offset, buffer, &mut got, USER_DATA, 0);
+            if hr < 0 {
+                if hr == too_small() {
+                    // SAFETY: as above.
+                    unsafe { *len = total };
+                }
+                return Ok(hr);
+            }
+            total = total.wrapping_add(got);
+            // SAFETY: within the caller's buffer.
+            buffer = unsafe { buffer.add(got as usize) };
+            offset = offset.wrapping_add(u64::from(got));
+            left = left.wrapping_sub(got);
+            if left == 0 {
+                // SAFETY: as above.
+                unsafe { *len = total };
+                return Ok(hr);
+            }
+        }
+    })())
+}
+
 /// 0x180007d40: an external device's address as the driver's form: the
 /// size (8) and the value's bytes, most significant first.
 pub extern "system" fn XCrdStorageQueryExternalDeviceAddress(out: *mut [u8; 8], value: u32) -> HRESULT {
@@ -194,5 +349,8 @@ pub(crate) fn exports() -> Vec<crate::HleExport> {
         hle_export!(XCrdStorageWriteBlobEx),
         hle_export!(XCrdStorageWriteBlob),
         hle_export!(XCrdStorageQueryExternalDeviceAddress),
+        hle_export!(XCrdPopulateSparseCacheBlocks),
+        hle_export!(XCrdReadBatInfoXVD),
+        hle_export!(XCrdReadUserDataXVD),
     ]
 }
