@@ -12392,6 +12392,24 @@ impl<'a> Lower<'a> {
             off = self.s.m.bin(c, Bin::Add, at, off);
             index = None;
         }
+        // A descriptor the program built around an address with a stride
+        // of its own (dword 1 bits 16-29): the card steps by that stride,
+        // whatever the root view's entry says. The structure builder builds
+        // one over its geometry records (32 bytes each, `s_or_b32 s5, s11,
+        // 0x200000`) and reads each record's index buffer address there;
+        // stepped by the entry's stride instead, it read other bytes as that
+        // address, and its index fetches went all over title memory (run
+        // site2: 71,000 of the 95,000 accesses a minute to pages that are no
+        // one's, from two of its loads).
+        if let (Some(element), Source::Built { bits, .. }) = (index, src)
+            && !typed
+            && (bits >> 16) & 0x3fff != 0
+        {
+            let k = self.s.m.i32((bits >> 16) & 0x3fff);
+            let at = self.s.m.bin(c, Bin::Mul, element, k);
+            off = self.s.m.bin(c, Bin::Add, at, off);
+            index = None;
+        }
         // A structured buffer by its used-resource entry's stride: raw
         // bytes too. The host makes its buffer views raw (a raw read
         // through a structured view gives zeros on NVIDIA), and one kind
