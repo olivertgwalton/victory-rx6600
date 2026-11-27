@@ -782,3 +782,56 @@ fn fuzz_region_queue() {
     fuzz("XCrdStreamingQueueQueryRegionList", &[OutOpt(64), Out(4), Adp, Int(&[7, 0]), Int(&[4, 0, 1, 16]), Int(kinds)], W32);
     fuzz("XCrdStreamingQueueQueryRegionListByPath", &[OutOpt(64), Out(4), Adp, Path, Int(&[4, 0, 1, 16]), Int(kinds)], W32);
 }
+
+const IDS: &[u64] = &[0x13, 0, 1, 0xb, 0x12, 0x1a, 0x1b, 0x24, 0x25, 0xffff_ffff];
+
+#[test]
+fn fuzz_storage_devices() {
+    fuzz("XCrdFindStorageDevice", &[Adp, In(16), OutOpt(4)], W32);
+    fuzz("XCrdGetDeviceIdMapping", &[Adp, InOpt(16), OutOpt(16)], W32);
+    fuzz("XCrdSetDeviceIdMapping", &[Adp, InOpt(16), InOpt(16)], W32);
+    fuzz("XCrdSetEraLaunchMapping", &[Adp, Path, Int(IDS)], W32);
+    fuzz("XCrdSetExternalPlsMapping", &[Adp, Path, Int(IDS)], W32);
+    fuzz("XCrdStorageAttachExternalDevice", &[Out(8), Adp, Int(IDS), Int(BYTES)], W32);
+    fuzz("XCrdStorageCheck", &[Adp, Int(IDS), Int(&[0, 1, 2, 3, 4])], W32);
+    fuzz("XCrdStorageConnectDevice", &[Adp, Path], W32);
+    fuzz("XCrdStorageCreateBlob", &[Adp, Path, Int(&[0x1000, 0]), Int(&[0, 1])], W32);
+    fuzz("XCrdStorageCreateDirectory", &[Adp, Path, Int(&[0, 1])], W32);
+    fuzz("XCrdStorageDeleteBlob", &[Adp, Path], W32);
+    fuzz("XCrdStorageDeleteDirectory", &[Adp, Path], W32);
+    fuzz("XCrdStorageFormat", &[Adp, Int(IDS), Int(FLAG1), Path, OutOpt(16)], W32);
+    fuzz("XCrdStorageMoveBlob", &[Adp, Path, Path, Int(&[0, 1])], W32);
+    fuzz("XCrdStorageRemapDevice", &[Adp, Int(IDS), Int(IDS)], W32);
+    fuzz("XCrdStorageSetConsoleAssociation", &[Adp, Int(IDS), Int(&[1, 0, 2, 3, 0xffff_ffff])], W32);
+    fuzz("XCrdStorageSetDeviceName", &[Adp, Int(IDS), Path], W32);
+    fuzz("XCrdStorageSetLastUsedConsole", &[Adp, Int(IDS)], W32);
+}
+
+#[test]
+fn fuzz_disconnect_device() {
+    // The volume path must end inside the answer (the library reads on).
+    fuzz_keeping("XCrdStorageDisconnectDevice", &[Adp, Int(IDS), OutOpt(0x200), InOpt(4)], W32, &[0x40..0x42]);
+    fuzz_keeping("XCrdStorageDisconnectDevice", &[Adp, Int(IDS), OutOpt(0x200), Int(&[0])], W32, &[0x40..0x42]);
+}
+
+#[test]
+fn storage_refuses_internal_devices() {
+    let s = session();
+    trace_all(&s);
+    let a = adapter();
+    let (rf, lf) = both!("XCrdStorageFormat": extern "system" fn(*const Adapter, u32, u32, *const u16, *mut [u8; 16]) -> HRESULT);
+    let (rc, lc) = both!("XCrdStorageCheck": extern "system" fn(*const Adapter, u32, u32) -> HRESULT);
+    let name = wz("Disk");
+    for (g, _) in INTERNAL {
+        for flags in [0, 1] {
+            same("format internal", run(&s, |s| s.reply(accepting(|_, _| {})), |r| {
+                let mut guid = g;
+                ((if r { rf(&a, 0x13, flags, name.as_ptr(), &mut guid) } else { lf(&a, 0x13, flags, name.as_ptr(), &mut guid) }), guid)
+            }));
+        }
+    }
+    for id in [1u32, 0x24] {
+        same("check internal", run(&s, |s| s.reply(accepting(|_, _| {})), |r| if r { rc(&a, id, 1) } else { lc(&a, id, 1) }));
+    }
+}
+

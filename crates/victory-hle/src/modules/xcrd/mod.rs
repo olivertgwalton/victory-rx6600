@@ -15,6 +15,7 @@
 pub mod ops;
 pub mod paths;
 pub mod regions;
+pub mod storage;
 pub mod srb;
 pub mod sys;
 #[cfg(test)]
@@ -209,7 +210,7 @@ pub extern "system" fn XCrdIsCorruptionError(hr: HRESULT) -> bool {
 }
 
 /// The internal storage devices (0x1800132a0): device GUID and id.
-const INTERNAL: [([u8; 16], u32); 2] = [
+pub(crate) const INTERNAL: [([u8; 16], u32); 2] = [
     (guid(0xa89e_ce52, 0x7e8e, 0x444f, [0xbb, 0xd0, 0xc6, 0x8b, 0x76, 0xc2, 0xec, 0xa4]), 0x1),
     (guid(0xeb2b_2f55, 0x83b3, 0x401e, [0xad, 0x7c, 0x13, 0x96, 0xd7, 0xd5, 0xb3, 0x0d]), 0x24),
 ];
@@ -506,6 +507,7 @@ pub(crate) fn exports() -> Vec<HleExport> {
     let mut all = ops::exports();
     all.extend(paths::exports());
     all.extend(regions::exports());
+    all.extend(storage::exports());
     all.extend([
         hle_export!(XCrdSetTraceFlags),
         hle_export!(XCrdBuildPath),
