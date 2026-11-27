@@ -32,6 +32,8 @@
 
 use std::sync::OnceLock;
 
+mod xor;
+
 /// A swizzle mode, by its hardware number (addrlib's `ADDR_SW_*` order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Swizzle(pub u32);
@@ -115,8 +117,11 @@ pub struct Desc {
     pub mips: u32,
     /// 1, 2, 4, 8 or 16.
     pub element_bytes: u32,
-    /// Texels per element side: 1, or 4 for block compression.
+    /// Texels per element side: 1, or 4 for block compression; 2 wide
+    /// for the packed 4:2:2 formats (see `block_height`).
     pub block: u32,
+    /// Texels per element vertically: `block`, except 1 for packed 4:2:2.
+    pub block_height: u32,
     pub samples: u32,
     pub swizzle: Swizzle,
 }
@@ -177,8 +182,10 @@ pub struct Layout {
     pub first_tail_mip: u32,
     pub mips: Vec<Mip>,
     /// Byte offsets inside a block for each coordinate, per axis.
-    /// Empty for linear and unsupported modes.
+    /// Empty for linear, the XOR modes and unsupported layouts.
     pattern: &'static SwizzlePattern,
+    /// The address equation of a pipe and bank XOR mode.
+    xor: Option<&'static xor::Equation>,
 }
 
 type SwizzlePattern = [Vec<u32>; 3];
@@ -282,20 +289,32 @@ impl Layout {
     pub fn new(desc: &Desc) -> Result<Layout, Error> {
         let d = *desc;
         let block_log2 = d.swizzle.block_log2().ok_or(Error::Invalid)?;
+        // The console library's rules: no 4 KiB render mode; depth modes
+        // for single texels of up to 8 bytes; samples in the render and
+        // depth modes of 2D textures (depth up to 4-byte elements); 1D
+        // textures linear or in those two modes, never block compressed;
+        // 3D in the standard modes and the 64 KiB XOR ones.
+        let s = d.swizzle.0;
+        let texel = d.block == 1 && d.block_height == 1;
         let valid = (1..=MAX_EXTENT).contains(&d.width)
             && (1..=MAX_EXTENT).contains(&d.height)
             && (1..=MAX_EXTENT).contains(&d.depth)
             && (1..=MAX_MIPS).contains(&d.mips)
             && d.element_bytes.is_power_of_two()
             && d.element_bytes <= 16
-            && matches!(d.block, 1 | 4)
+            && matches!((d.block, d.block_height), (1, 1) | (4, 4) | (2, 1))
             && d.samples.is_power_of_two()
             && d.samples <= 8
+            && s != Swizzle::SW_4KB_R_X.0
+            && (s != Swizzle::SW_64KB_Z_X.0 || (texel && d.element_bytes < 16))
             && (d.samples == 1
-                || (d.dimension == Dimension::Tex2d && d.mips == 1 && d.swizzle != Swizzle::LINEAR))
-            && (d.dimension != Dimension::Tex1d || d.height == 1)
-            && (d.dimension != Dimension::Tex3d
-                || matches!(d.swizzle.0, 0 | 5 | 9 | 17 | 21 | 24..=27));
+                || (d.dimension == Dimension::Tex2d
+                    && d.mips == 1
+                    && (s == Swizzle::SW_64KB_R_X.0
+                        || (s == Swizzle::SW_64KB_Z_X.0 && d.element_bytes <= 4))))
+            && (d.dimension != Dimension::Tex1d
+                || (d.height == 1 && texel && matches!(s, 0 | 24 | 27)))
+            && (d.dimension != Dimension::Tex3d || matches!(s, 0 | 5 | 9 | 17 | 21 | 24..=27));
         if !valid {
             return Err(Error::Invalid);
         }
@@ -303,6 +322,24 @@ impl Layout {
             Ok(Layout::linear(d))
         } else {
             Ok(Layout::tiled(d, block_log2))
+        }
+    }
+
+    /// A plane the console's library lays out with no bytes (the depth of
+    /// a stencil view format).
+    fn empty(desc: Desc) -> Layout {
+        Layout {
+            desc,
+            block: [0; 3],
+            thick: false,
+            slices: 0,
+            slice_size: 0,
+            size: 0,
+            alignment: 0,
+            first_tail_mip: 0,
+            mips: vec![],
+            pattern: &EMPTY_PATTERN,
+            xor: None,
         }
     }
 
@@ -315,11 +352,11 @@ impl Layout {
         let mut mips = vec![];
         let mut offset = 0;
         for i in (0..d.mips).rev() {
-            let h = padded_dim(d.height, i, d.block);
+            let h = padded_dim(d.height, i, d.block_height);
             let pitch = padded_dim(d.width, i, d.block).next_multiple_of(align);
             mips.push(Mip {
                 width: dim(d.width, i, d.block),
-                height: dim(d.height, i, d.block),
+                height: dim(d.height, i, d.block_height),
                 depth: if three_d { dim(d.depth, i, 1) } else { 1 },
                 pitch,
                 rows: h,
@@ -341,6 +378,7 @@ impl Layout {
             first_tail_mip: d.mips,
             mips,
             pattern: &EMPTY_PATTERN,
+            xor: None,
         }
     }
 
@@ -369,8 +407,8 @@ impl Layout {
         // slices).
         let mip_depth = |i: u32| if thick { padded_dim(d.depth, i, 1) } else { 1 };
         let depth_of = |i: u32| if three_d { dim(d.depth, i, 1) } else { 1 };
-        let (width, height) = (|i| dim(d.width, i, d.block), |i| dim(d.height, i, d.block));
-        let padded = |i| (padded_dim(d.width, i, d.block), padded_dim(d.height, i, d.block));
+        let (width, height) = (|i| dim(d.width, i, d.block), |i| dim(d.height, i, d.block_height));
+        let padded = |i| (padded_dim(d.width, i, d.block), padded_dim(d.height, i, d.block_height));
         let mut mips = Vec::with_capacity(d.mips as usize);
         let mut first_tail_mip = d.mips;
         let mut slice_size = 0u64;
@@ -502,6 +540,11 @@ impl Layout {
         let slice_size = slice_size * slab;
         let slices = slices / block[2];
         let addressable = !d.swizzle.xor() && d.samples == 1;
+        let xor = if d.swizzle.xor() {
+            xor::equation(d.swizzle, element_log2, d.samples, d.dimension == Dimension::Tex3d)
+        } else {
+            None
+        };
         let pattern = if addressable {
             let kind = if thick {
                 2
@@ -523,18 +566,15 @@ impl Layout {
             first_tail_mip,
             mips,
             pattern,
+            xor,
         }
     }
 
     /// Whether [`Layout::offset`] and the copies work for this layout:
-    /// linear and the modes without pipe or bank XOR, single-sampled.
-    ///
-    /// shortcut: no addressing for the XOR modes (`_X`, `_T`) and MSAA;
-    /// they need the GPU's pipe and bank configuration (Series X and S
-    /// differ). Titles use them for render targets and depth, which the
-    /// host renders; add them when a title copies into or out of one.
+    /// every layout the console's library addresses (it has no addresses
+    /// for 3D `64KB_D_X` textures of 8- and 16-byte elements).
     pub fn addressable(&self) -> bool {
-        self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty()
+        self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty() || self.xor.is_some()
     }
 
     /// The slice and the depth inside it for `z` (an array slice or a 3D
@@ -557,20 +597,59 @@ impl Layout {
             self.slices
         };
         let inside = x < m.width && y < m.height && z < depth;
-        if !inside || !self.addressable() {
-            return Err(if inside {
-                Error::Unsupported
-            } else {
-                Error::Invalid
-            });
+        if !inside {
+            return Err(Error::Invalid);
         }
-        let (slice, z) = self.split(z);
+        self.address(mip, x, y, z, 0)
+    }
+
+    /// Byte offset of element (`x`, `y`) of sample `sample` of mip `mip`
+    /// in array slice or depth slice `z`, as the console's library gives
+    /// it: the slice (or 3D depth) and sample must exist, the mip's
+    /// addressing carries on past its width and height.
+    pub fn address(&self, mip: u32, x: u32, y: u32, z: u32, sample: u32) -> Result<u64, Error> {
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let depth = if self.desc.dimension == Dimension::Tex3d {
+            m.depth
+        } else {
+            self.desc.depth
+        };
+        if z >= depth || sample >= self.desc.samples {
+            return Err(Error::Invalid);
+        }
+        if !self.addressable() {
+            return Err(Error::Unsupported);
+        }
+        let (slice, inner) = self.split(z);
         let base = u64::from(slice) * self.slice_size + m.offset;
         if self.desc.swizzle == Swizzle::LINEAR {
             let row = u64::from(y) * u64::from(m.pitch) + u64::from(x);
             return Ok(base + row * u64::from(self.desc.element_bytes));
         }
-        Ok(base + self.row(m, y, z) + self.column(m, x))
+        if let Some(e) = self.xor {
+            return Ok(base + self.xor_address(e, m, x, y, z, sample));
+        }
+        Ok(base + self.row(m, y, inner) + self.column(m, x))
+    }
+
+    /// The offset from the slice's mip of an element in a XOR mode: its
+    /// block in the mip, and inside the block the XOR of what each set bit
+    /// of its position (in the tail block for a tail mip), slice or depth
+    /// and sample flips.
+    fn xor_address(&self, e: &xor::Equation, m: &Mip, x: u32, y: u32, z: u32, sample: u32) -> u64 {
+        let [bw, bh, _] = self.block;
+        // Which block from the position, inside it the position in the tail.
+        let blocks = u64::from(y / bh) * u64::from(m.pitch / bw) + u64::from(x / bw);
+        let (x, y) = (x + m.tail.map_or(0, |t| t.x), y + m.tail.map_or(0, |t| t.y));
+        let flip = |masks: &[u16], v: u32| {
+            masks
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| v >> i & 1 != 0)
+                .fold(0u32, |a, (_, &m)| a ^ u32::from(m))
+        };
+        let inside = flip(&e.x, x) ^ flip(&e.y, y) ^ flip(&e.z, z) ^ flip(&e.s, sample);
+        (blocks << self.alignment.trailing_zeros()) + u64::from(inside)
     }
 
     /// The part of an address that depends on the row (and depth in a
@@ -579,18 +658,19 @@ impl Layout {
         let [bw, bh, _] = self.block;
         let log2 = self.alignment.trailing_zeros();
         // In the tail the pattern of the shifted position gives the mip's
-        // offset inside the tail block.
-        let y = y + m.tail.map_or(0, |t| t.y);
+        // offset inside the tail block; which block comes from the position
+        // itself (past the mip, as the console's library addresses it).
         let blocks = u64::from(y / bh) * u64::from(m.pitch / bw);
+        let y = y + m.tail.map_or(0, |t| t.y);
         (blocks << log2) + u64::from(self.pattern[1][(y % bh) as usize] | self.pattern[2][z as usize])
     }
 
     /// The part of an address that depends on the column.
     fn column(&self, m: &Mip, x: u32) -> u64 {
         let bw = self.block[0];
+        let blocks = u64::from(x / bw);
         let x = x + m.tail.map_or(0, |t| t.x);
-        (u64::from(x / bw) << self.alignment.trailing_zeros())
-            + u64::from(self.pattern[0][(x % bw) as usize])
+        (blocks << self.alignment.trailing_zeros()) + u64::from(self.pattern[0][(x % bw) as usize])
     }
 
     /// Depth slices a subresource of mip `mip` covers: the mip's depth for
@@ -707,6 +787,19 @@ impl Layout {
         if tiled_len < tiled_need as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
+        if self.xor.is_some() {
+            // XOR modes: an address per element.
+            for z in 0..depth {
+                for y in 0..m.height {
+                    let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                    for x in 0..m.width {
+                        let at = self.address(mip, x, y, first + z, 0)? as usize;
+                        copy_run::<DETILE>(src, dst, at, linear_row + x as usize * n, n);
+                    }
+                }
+            }
+            return Ok(());
+        }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
         // the same contiguous runs repeat on every row, including mip tails.
@@ -806,9 +899,74 @@ fn copy_runs<const N: usize, const DETILE: bool>(
     }
 }
 
-/// What a DXGI format stores per element: bytes, texels per element side
-/// (4 for block compression), and whether its stencil is a second plane
-/// (the GPU keeps depth and stencil apart).
+/// One plane of a format: element bytes (0 for a plane the console's
+/// library lays out empty), texels per element across and down, and the
+/// texture's texels per plane texel along each side (2 for the chroma of
+/// 4:2:0 video).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaneFormat {
+    pub bytes: u32,
+    pub block: u32,
+    pub block_height: u32,
+    pub subsample: u32,
+}
+
+const fn plane(bytes: u32, block: u32) -> PlaneFormat {
+    PlaneFormat {
+        bytes,
+        block,
+        block_height: block,
+        subsample: 1,
+    }
+}
+
+/// The planes of a DXGI format as the console's library lays it out
+/// (`xg_xs.dll`, measured): `None` for the formats it refuses (96-bit and
+/// format 0), no planes for the numbers it accepts with an empty layout
+/// (`Y210`, `Y216` and numbers it has no entry for). Depth formats with
+/// stencil have the stencil as a second, 1-byte plane; the `X24` and `X32`
+/// stencil views an empty first one.
+pub fn planes(dxgi: u32) -> Option<&'static [PlaneFormat]> {
+    const P16: &[PlaneFormat] = &[plane(16, 1)];
+    const P8: &[PlaneFormat] = &[plane(8, 1)];
+    const P4: &[PlaneFormat] = &[plane(4, 1)];
+    const P2: &[PlaneFormat] = &[plane(2, 1)];
+    const P1: &[PlaneFormat] = &[plane(1, 1)];
+    const BC8: &[PlaneFormat] = &[plane(8, 4)];
+    const BC16: &[PlaneFormat] = &[plane(16, 4)];
+    const PACKED: &[PlaneFormat] = &[PlaneFormat { block_height: 1, ..plane(4, 2) }];
+    const DEPTH4: &[PlaneFormat] = &[plane(4, 1), plane(1, 1)];
+    const DEPTH2: &[PlaneFormat] = &[plane(2, 1), plane(1, 1)];
+    const STENCIL: &[PlaneFormat] = &[plane(0, 1), plane(1, 1)];
+    const NV12: &[PlaneFormat] = &[plane(1, 1), PlaneFormat { subsample: 2, ..plane(2, 1) }];
+    const P010: &[PlaneFormat] = &[plane(2, 1), PlaneFormat { subsample: 2, ..plane(4, 1) }];
+    const P016: &[PlaneFormat] = &[plane(2, 1), plane(4, 1)];
+    const NV11: &[PlaneFormat] = &[plane(1, 1), plane(2, 1)];
+    Some(match dxgi {
+        0 | 5..=8 => return None,
+        1..=4 => P16,
+        9..=18 | 21 | 102 => P8,
+        19 | 20 | 44 | 45 => DEPTH4,
+        22 | 47 | 120 => STENCIL,
+        23..=43 | 46 | 67 | 87..=93 | 100 | 101 | 116 | 117 | 189 | 191 => P4,
+        48..=59 | 85 | 86 | 114 | 115 | 119 => P2,
+        60..=66 | 111..=113 | 190 => P1,
+        68 | 69 | 107 => PACKED,
+        70..=72 | 79..=81 => BC8,
+        73..=78 | 82..=84 | 94..=99 => BC16,
+        103 => NV12,
+        104 => P010,
+        105 => P016,
+        106 | 110 => NV11,
+        118 => DEPTH2,
+        _ => &[],
+    })
+}
+
+/// What a DXGI format stores per element of its first plane: bytes, texels
+/// per element side (4 for block compression), and whether its stencil is
+/// a second plane. `None` for formats without a single laid-out first
+/// plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Format {
     pub bytes: u32,
@@ -816,28 +974,13 @@ pub struct Format {
     pub stencil: bool,
 }
 
-/// By DXGI format number. `None` for 96-bit, 1-bit, packed 4:2:2 and video
-/// formats.
-///
-/// shortcut: those formats have no layout here; add them when a title uses
-/// one.
 pub fn format(dxgi: u32) -> Option<Format> {
-    let (bytes, block, stencil) = match dxgi {
-        1..=4 => (16, 1, false),
-        9..=18 => (8, 1, false),
-        19..=22 | 44..=47 => (4, 1, true),
-        23..=43 | 67 | 87..=93 | 116 | 117 => (4, 1, false),
-        48..=59 | 85 | 86 | 115 => (2, 1, false),
-        118..=120 => (2, 1, true),
-        60..=65 => (1, 1, false),
-        70..=72 | 79..=81 => (8, 4, false),
-        73..=78 | 82..=84 | 94..=99 => (16, 4, false),
-        _ => return None,
-    };
+    let p = planes(dxgi)?;
+    let first = p.first().filter(|f| f.bytes != 0 && f.block == f.block_height)?;
     Some(Format {
-        bytes,
-        block,
-        stencil,
+        bytes: first.bytes,
+        block: first.block,
+        stencil: matches!(dxgi, 19 | 20 | 44 | 45 | 118),
     })
 }
 
@@ -884,7 +1027,15 @@ pub struct Texture {
 
 impl Texture {
     pub fn new(desc: &TextureDesc) -> Result<Texture, Error> {
-        let f = format(desc.format).ok_or(Error::Invalid)?;
+        let formats = planes(desc.format).ok_or(Error::Invalid)?;
+        if formats.is_empty() {
+            // Accepted with nothing laid out.
+            return Ok(Texture {
+                planes: vec![],
+                size: 0,
+                alignment: 0,
+            });
+        }
         let depth3d = if desc.dimension == Dimension::Tex3d {
             desc.depth_or_array
         } else {
@@ -894,37 +1045,43 @@ impl Texture {
             0 => 32 - desc.width.max(desc.height).max(depth3d).max(1).leading_zeros(),
             n => n,
         };
-        let plane = |bytes| Desc {
-            dimension: desc.dimension,
-            width: desc.width,
-            height: desc.height,
-            depth: desc.depth_or_array,
-            mips,
-            element_bytes: bytes,
-            block: f.block,
-            samples: desc.samples.max(1),
-            swizzle: desc.swizzle,
-        };
-        let mut planes = vec![Plane {
-            offset: 0,
-            stencil: false,
-            layout: Layout::new(&plane(f.bytes))?,
-        }];
-        if f.stencil {
-            let layout = Layout::new(&plane(1))?;
-            let offset = planes[0].layout.size.next_multiple_of(layout.alignment);
+        let stencil = formats.len() == 2 && formats[1].bytes == 1 && formats[0].subsample == 1;
+        if formats.len() > 1 && desc.samples > 1 {
+            // The library has no multisampled two-plane textures.
+            return Err(Error::Invalid);
+        }
+        let mut planes: Vec<Plane> = vec![];
+        let mut end = 0u64;
+        for (i, f) in formats.iter().enumerate() {
+            let d = Desc {
+                dimension: desc.dimension,
+                width: desc.width.div_ceil(f.subsample),
+                height: desc.height.div_ceil(f.subsample),
+                depth: desc.depth_or_array,
+                mips,
+                element_bytes: f.bytes,
+                block: f.block,
+                block_height: f.block_height,
+                samples: desc.samples.max(1),
+                swizzle: desc.swizzle,
+            };
+            let layout = if f.bytes == 0 {
+                Layout::empty(d)
+            } else {
+                Layout::new(&d)?
+            };
+            let offset = end.next_multiple_of(layout.alignment.max(1));
+            end = offset + layout.size;
             planes.push(Plane {
                 offset,
-                stencil: true,
+                stencil: stencil && i == 1,
                 layout,
             });
         }
-        let last = &planes[planes.len() - 1];
-        let size = last.offset + last.layout.size;
         let alignment = planes.iter().map(|p| p.layout.alignment).max().unwrap_or(1);
         Ok(Texture {
             planes,
-            size,
+            size: end,
             alignment,
         })
     }
@@ -943,6 +1100,7 @@ mod tests {
             mips,
             element_bytes: bpe,
             block: 1,
+            block_height: 1,
             samples: 1,
             swizzle,
         }
@@ -1026,6 +1184,7 @@ mod tests {
             desc(83, 31, 6, 1, Swizzle::SW_256B_S),
             Desc {
                 block: 4,
+                block_height: 4,
                 ..desc(109, 71, 6, 16, Swizzle::SW_256B_D)
             },
             Desc {
@@ -1312,6 +1471,7 @@ mod tests {
                 mips,
                 element_bytes,
                 block,
+                block_height: block,
                 samples: 1,
                 swizzle,
             };
@@ -1338,7 +1498,7 @@ mod tests {
     #[test]
     fn smaller_mips_need_only_the_start_of_the_texture() {
         for swizzle in [Swizzle::SW_4KB_S, Swizzle(9)] {
-            let l = Layout::new(&Desc { block: 4, ..desc(1024, 1024, 9, 8, swizzle) }).unwrap();
+            let l = Layout::new(&Desc { block: 4, block_height: 4, ..desc(1024, 1024, 9, 8, swizzle) }).unwrap();
             assert_eq!(l.bytes_from(0), l.size);
             let needs: Vec<u64> = (0..9).map(|mip| l.bytes_from(mip)).collect();
             assert!(needs.windows(2).all(|w| w[0] >= w[1]), "{needs:?}");
@@ -1357,7 +1517,7 @@ mod tests {
             }
         }
         // Slices each hold their chain: the whole texture.
-        let l = Layout::new(&Desc { depth: 2, block: 4, ..desc(1024, 1024, 9, 8, Swizzle::SW_4KB_S) }).unwrap();
+        let l = Layout::new(&Desc { depth: 2, block: 4, block_height: 4, ..desc(1024, 1024, 9, 8, Swizzle::SW_4KB_S) }).unwrap();
         assert_eq!(l.bytes_from(4), l.size);
     }
 
@@ -1379,7 +1539,7 @@ mod tests {
         assert_eq!(t.planes[0].layout.size, 1920 * 1152 * 4);
         assert_eq!(t.planes[1].offset, t.planes[0].layout.size);
         assert_eq!(t.planes[1].layout.size, 2048 * 1280);
-        assert!(!t.planes[0].layout.addressable());
+        assert!(t.planes[0].layout.addressable());
     }
 
     #[test]
