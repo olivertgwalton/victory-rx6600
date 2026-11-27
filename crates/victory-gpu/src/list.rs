@@ -1354,6 +1354,136 @@ extern "system" fn resolve(
     let _ = (this, dst, dst_sub, src, src_sub, format);
 }
 
+/// List method 0x58 `ClearState(pipeline)` (GameOS `xgs12_10.dll` +0x5db90,
+/// named by its debug build): the host list's state cleared and the title's
+/// as a new list's ([`crate::draw::State::clear_state`]).
+pub(super) extern "system" fn clear_state(this: This, pipeline: This) {
+    #[cfg(windows)]
+    with_state(this, |host, state| {
+        // SAFETY: an open list.
+        unsafe { host.list.ClearState(None) };
+        state.clear_state(pipeline);
+    });
+    crate::pipeline::bound(pipeline);
+}
+
+/// The title's state of a list (tests).
+#[cfg(all(test, windows))]
+pub(crate) fn state_of(this: This) -> Option<(u32, bool, Option<u32>)> {
+    let mut out = None;
+    with_state(this, |_, s| out = Some(s.topology_and_stencil()));
+    out
+}
+
+/// What the host steps of the methods below were given, last first (tests).
+#[cfg(test)]
+pub(crate) static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+fn seen(what: String) {
+    SEEN.lock().unwrap_or_else(|e| e.into_inner()).push(what);
+}
+
+/// List method 0x378 `ResolveSubresourceRegion(dst, dst sub, dst x, dst y,
+/// src, src sub, src rect, format, mode)` (GameOS `xgs12_10.dll` +0x50590,
+/// D3D12's List1 method): the host's, prepared as [`resolve`] is.
+#[allow(clippy::too_many_arguments)] // the method's own arguments
+pub(super) extern "system" fn resolve_region(
+    this: This,
+    dst: This,
+    dst_sub: u32,
+    x: u32,
+    y: u32,
+    src: This,
+    src_sub: u32,
+    rect: *const [i32; 4],
+    format: u32,
+    mode: u32,
+) {
+    // SAFETY: the title passes a rectangle or none.
+    let rect = unsafe { rect.as_ref() }.copied();
+    resolve_region_at(this, dst, dst_sub, x, y, src, src_sub, rect, format, mode);
+}
+
+#[allow(clippy::too_many_arguments)] // the method's own arguments
+pub(super) fn resolve_region_at(
+    this: This,
+    dst: This,
+    dst_sub: u32,
+    x: u32,
+    y: u32,
+    src: This,
+    src_sub: u32,
+    rect: Option<[i32; 4]>,
+    format: u32,
+    mode: u32,
+) {
+    #[cfg(test)]
+    seen(format!("resolve {dst:?} {dst_sub} {x} {y} {src:?} {src_sub} {rect:?} {format} {mode}"));
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && let (Some(to), Some(from)) = (crate::resource::host_resource(dst), crate::resource::host_resource(src))
+    {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D12::{D3D12_RESOLVE_MODE, ID3D12GraphicsCommandList1};
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        use windows::core::Interface;
+        const RESOLVE_DEST: u32 = 0x1000;
+        const RESOLVE_SOURCE: u32 = 0x2000;
+        if unlike(dst, src) {
+            return;
+        }
+        list.twin_use(dst, false, true);
+        list.twin_use(src, false, false);
+        crate::texture::card_writes(list, dst, to, Some(dst_sub));
+        ensure_state(list, dst, RESOLVE_DEST);
+        ensure_state(list, src, RESOLVE_SOURCE);
+        crate::texture::host_written(dst);
+        let rect = rect.map(|[left, top, right, bottom]| RECT { left, top, right, bottom });
+        // SAFETY: an open list and live textures.
+        unsafe {
+            let format = if crate::resource::stands_in(dst) { to.GetDesc().Format } else { DXGI_FORMAT(format as i32) };
+            if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+                list1.ResolveSubresourceRegion(to, dst_sub, x, y, from, src_sub, rect.as_ref().map(|r| r as *const _), format, D3D12_RESOLVE_MODE(mode as i32));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (this, dst, dst_sub, x, y, src, src_sub, rect, format, mode);
+}
+
+/// List method 0x370 `SetSamplePositions(samples per pixel, pixels,
+/// positions)` (+0x38110, D3D12's List1 method; the debug build allows 0, 1
+/// or 4 pixels): the host's.
+pub(super) extern "system" fn sample_positions(this: This, per_pixel: u32, pixels: u32, positions: *const [i8; 2]) {
+    let n = (per_pixel as usize * pixels as usize).min(64);
+    let positions = if positions.is_null() || n == 0 {
+        &[][..]
+    } else {
+        // SAFETY: the title passes `per_pixel * pixels` positions.
+        unsafe { std::slice::from_raw_parts(positions, n) }
+    };
+    sample_positions_at(this, per_pixel, pixels, positions);
+}
+
+pub(super) fn sample_positions_at(this: This, per_pixel: u32, pixels: u32, positions: &[[i8; 2]]) {
+    #[cfg(test)]
+    seen(format!("positions {per_pixel} {pixels} {positions:?}"));
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        use windows::Win32::Graphics::Direct3D12::{D3D12_SAMPLE_POSITION, ID3D12GraphicsCommandList1};
+        use windows::core::Interface;
+        let p: Vec<D3D12_SAMPLE_POSITION> = positions.iter().map(|&[x, y]| D3D12_SAMPLE_POSITION { X: x, Y: y }).collect();
+        // SAFETY: an open list; the positions are as many as the counts say.
+        unsafe {
+            if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+                list1.SetSamplePositions(per_pixel, pixels, if p.is_empty() { std::ptr::null_mut() } else { p.as_ptr().cast_mut() });
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (this, per_pixel, pixels, positions);
+}
+
 #[repr(C)]
 pub(crate) struct Rect {
     left: i32,
@@ -1455,6 +1585,220 @@ extern "system" fn clear_dsv(
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
+/// List methods 0x1a8 and 0x1b0, `ClearUnorderedAccessViewUint/Float(gpu
+/// handle, cpu handle, resource, values, rect count, rects)`. The console's
+/// driver (GameOS `xgs12_10.dll` +0x178d0 and +0x17920) clears the view the
+/// CPU handle describes, with zeros for no values (+0xe5340), over the
+/// rectangles or all of it.
+extern "system" fn clear_uav_uint(
+    this: This,
+    _gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    // SAFETY: the title passes four values or none.
+    let values = unsafe { values.as_ref() }.copied().unwrap_or([0; 4]);
+    clear_uav(this, cpu, resource, values, false, count, rects);
+}
+
+extern "system" fn clear_uav_float(
+    this: This,
+    _gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    // SAFETY: the title passes four values or none.
+    let values = unsafe { values.as_ref() }.map_or([0; 4], |v| v.map(f32::to_bits));
+    clear_uav(this, cpu, resource, values, true, count, rects);
+}
+
+/// The host's half of the clears: the view (from the title's record at
+/// `record`) is made again in a ring of our own heaps, which the clear binds
+/// (it needs its view in the bound shader-visible heap); the next draw binds
+/// the title's heaps again.
+pub(super) fn clear_uav(
+    this: This,
+    record: u64,
+    resource: This,
+    values: [u32; 4],
+    float: bool,
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Direct3D12::D3D12_UNORDERED_ACCESS_VIEW_DESC;
+        let (Some(list), Some(host)) = (host_list(this), crate::host::host()) else {
+            return;
+        };
+        let Some((_, desc)) = crate::descriptor::unordered_view(record) else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("a UAV clear of a handle that holds no unordered view: left out"));
+            return;
+        };
+        let Some(texture) = crate::resource::host_resource(resource) else {
+            return;
+        };
+        let Some(ring) = uav_ring() else { return };
+        const UNORDERED_ACCESS: u32 = 0x8;
+        ensure_state(list, resource, UNORDERED_ACCESS);
+        let desc = desc.as_ref().map(|d| d.as_ptr().cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>());
+        let rects = (count > 0 && !rects.is_null()).then(|| {
+            // SAFETY: the title passes `count` rectangles, laid out as the host's.
+            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+        });
+        list.keep(&ring.visible);
+        // SAFETY: an open list and a live resource.
+        unsafe { host_clear_uav(&host.device, &list.list, ring, texture, desc, values, float, rects.unwrap_or(&[])) };
+        with_state(this, |_, state| state.heaps_changed());
+    }
+    #[cfg(not(windows))]
+    let _ = (this, record, resource, values, float, count, rects);
+}
+
+/// The clear on the host: the view made in a slot of each of our heaps, the
+/// shader-visible one bound, the clear recorded.
+///
+/// # Safety
+/// `list` is open and `texture` live.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)] // the clear's own arguments
+unsafe fn host_clear_uav(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList,
+    ring: &UavRing,
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    desc: Option<*const windows::Win32::Graphics::Direct3D12::D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+    values: [u32; 4],
+    float: bool,
+    rects: &[windows::Win32::Foundation::RECT],
+) {
+    let (cpu, visible, gpu) = ring.next();
+    // SAFETY: slots of our heaps, a live resource, an open list.
+    unsafe {
+        device.CreateUnorderedAccessView(texture, None, desc, cpu);
+        device.CreateUnorderedAccessView(texture, None, desc, visible);
+        list.SetDescriptorHeaps(&[Some(ring.visible.clone())]);
+        if float {
+            let v = values.map(f32::from_bits);
+            list.ClearUnorderedAccessViewFloat(gpu, cpu, texture, &v, rects);
+        } else {
+            list.ClearUnorderedAccessViewUint(gpu, cpu, texture, &values, rects);
+        }
+    }
+}
+
+/// Our heaps for UAV clears: a CPU-only one and a shader-visible one, used
+/// in turn (a slot comes round again after [`UAV_RING`] clears, long after
+/// the clear that had it ran).
+#[cfg(windows)]
+struct UavRing {
+    cpu: windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap,
+    visible: windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap,
+    size: u32,
+    next: std::sync::atomic::AtomicU32,
+}
+// SAFETY: descriptor heaps are free-threaded.
+#[cfg(windows)]
+unsafe impl Send for UavRing {}
+// SAFETY: as above; the counter is atomic.
+#[cfg(windows)]
+unsafe impl Sync for UavRing {}
+#[cfg(windows)]
+const UAV_RING: u32 = 4096;
+
+#[cfg(windows)]
+impl UavRing {
+    fn next(
+        &self,
+    ) -> (
+        windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE,
+        windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE,
+        windows::Win32::Graphics::Direct3D12::D3D12_GPU_DESCRIPTOR_HANDLE,
+    ) {
+        let at = (self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % UAV_RING * self.size) as usize;
+        // SAFETY: plain queries of heaps we made.
+        unsafe {
+            let mut cpu = self.cpu.GetCPUDescriptorHandleForHeapStart();
+            let mut visible = self.visible.GetCPUDescriptorHandleForHeapStart();
+            let mut gpu = self.visible.GetGPUDescriptorHandleForHeapStart();
+            cpu.ptr += at;
+            visible.ptr += at;
+            gpu.ptr += at as u64;
+            (cpu, visible, gpu)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn uav_ring() -> Option<&'static UavRing> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    static RING: std::sync::OnceLock<Option<UavRing>> = std::sync::OnceLock::new();
+    RING.get_or_init(|| {
+        let host = crate::host::host()?;
+        let heap = |flags| -> Option<ID3D12DescriptorHeap> {
+            // SAFETY: a plain heap description.
+            unsafe {
+                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: UAV_RING,
+                    Flags: flags,
+                    NodeMask: 0,
+                })
+            }
+            .ok()
+        };
+        Some(UavRing {
+            cpu: heap(D3D12_DESCRIPTOR_HEAP_FLAG_NONE)?,
+            visible: heap(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)?,
+            // SAFETY: a plain query.
+            size: unsafe { host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) },
+            next: std::sync::atomic::AtomicU32::new(0),
+        })
+    })
+    .as_ref()
+}
+
+/// List method 0xf8, `SetPredication(buffer, offset, op)` (GameOS
+/// `xgs12_10.dll` +0x4f740; no buffer ends predication): the host's, on
+/// the buffer's host copy.
+pub(super) extern "system" fn set_predication(this: This, buffer: This, offset: u64, op: u32) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Direct3D12::D3D12_PREDICATION_OP;
+        let Some(list) = host_list(this) else { return };
+        if buffer.is_null() {
+            // SAFETY: an open list; no buffer ends predication.
+            unsafe { list.list.SetPredication(None, 0, D3D12_PREDICATION_OP(0)) };
+            return;
+        }
+        let Some(host) = crate::resource::host_resource(buffer) else { return };
+        const PREDICATION: u32 = 0x200;
+        ensure_state(list, buffer, PREDICATION);
+        // SAFETY: an open list and a live buffer.
+        unsafe { list.list.SetPredication(host, offset, D3D12_PREDICATION_OP(op as i32 & 1)) };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, buffer, offset, op);
+}
+
+/// List method 0x470, `SetSampleMaskX(mask)` (+0x38580): the sample mask
+/// of the native graphics pipelines drawn after it ([`crate::pipeline::sample_mask_of`]).
+/// shortcut: kept per recording thread as the bound targets are, and not
+/// applied to pipelines made from D3D12 descriptions, which keep their own.
+pub(super) extern "system" fn set_sample_mask(_this: This, mask: u64) {
+    #[cfg(windows)]
+    crate::pipeline::note_sample_mask(crate::pipeline::sample_mask_of(mask));
+    #[cfg(not(windows))]
+    let _ = mask;
+}
+
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
@@ -1549,8 +1893,8 @@ extern "system" fn resolve_queries(
 }
 
 /// IUnknown 3, object 4, device child 1, allocator 2.
-static ALLOCATOR_FUNCTIONS: Table<24> = {
-    let mut f = object::d3d12_object(object::missing_table::<ALLOCATOR, 24>());
+pub(crate) static ALLOCATOR_FUNCTIONS: Table<24> = {
+    let mut f = object::d3d12_object(object::reference_stubs(object::missing_table::<ALLOCATOR, 24>(), &crate::reference::ALLOCATOR));
     f[0] = allocator_query as *const ();
     f[2] = allocator_release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
@@ -2201,6 +2545,145 @@ extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, fl
     }
 }
 
+/// A top-of-pipe write: the console's command processor stores it when it
+/// reaches the packet, before the work ahead of it is done. Here it is
+/// stored when the list is submitted, in order with the list's copies
+/// ([`crate::host::HostList::defer`]), not when the whole list has run.
+/// shortcut: earlier than the console by the issue of the commands ahead of
+/// it in the list.
+fn write_top(this: This, address: u64, what: Written, bytes: usize) {
+    if address == 0 {
+        return;
+    }
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.defer(move || what.write(address as *mut u8, bytes));
+        return;
+    }
+    let _ = this;
+    what.write(address as *mut u8, bytes);
+}
+
+/// List method 0x2d0, `Write32BitValueTopOfPipeX(address, value, flags)`
+/// (GameOS `xgs12_10.dll` +0x3a3f0).
+pub(super) extern "system" fn write32_top(this: This, address: u64, value: u32, _flags: u32) {
+    write_top(this, address, Written::Value(u64::from(value)), 4);
+    value_written(this, address, u64::from(value));
+}
+
+/// List method 0x2d8, `Write64BitValueTopOfPipeX(address, value, flags)`
+/// (+0x3a590). With flags 0x4 or 0x8 the driver copies from `address`
+/// instead (a COPY_DATA packet), which is left out here.
+pub(super) extern "system" fn write64_top(this: This, address: u64, value: u64, flags: u32) {
+    if flags & 0xc != 0 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(flags, "a top-of-pipe copy (Write64BitValueTopOfPipeX flags 0x4/0x8): left out"));
+        return;
+    }
+    write_top(this, address, Written::Value(value), 8);
+    value_written(this, address, value);
+}
+
+/// List method 0x2e0, `Write32BitValueBottomOfShaderX(address, value, mode)`
+/// (+0x3a330): stored when the list has run.
+pub(super) extern "system" fn write32_shader(this: This, address: u64, value: u32, _mode: u32) {
+    defer_write(this, address, Written::Value(u64::from(value)), 4);
+    value_written(this, address, u64::from(value));
+}
+
+/// List method 0x448, `Write32BitValueBottomOfPipe2X(address, value, write
+/// flags, sync flags)` (+0x38900).
+pub(super) extern "system" fn write32_bottom2(this: This, address: u64, value: u32, _write: u32, _sync: u32) {
+    defer_write(this, address, Written::Value(u64::from(value)), 4);
+    value_written(this, address, u64::from(value));
+}
+
+/// List method 0x450, `Write64BitValueBottomOfPipe2X(address, value, write
+/// flags, sync flags, data flags)` (+0x38a30): data flags bit 0 the GPU's
+/// clock, bit 1 the system's (RELEASE_MEM data 3 and 4), else the value.
+pub(super) extern "system" fn write64_bottom2(this: This, address: u64, value: u64, _write: u32, _sync: u32, data: u32) {
+    let what = match data & 3 {
+        0 => Written::Value(value),
+        1 => Written::GpuTimestamp,
+        _ => Written::SystemTimestamp,
+    };
+    defer_write(this, address, what, 8);
+    if let Written::Value(value) = what {
+        value_written(this, address, value);
+    }
+}
+
+/// List method 0x388, `WriteBufferImmediate(count, parameters, modes)`
+/// (+0x2e340): each parameter a destination address and a 32-bit value.
+#[repr(C)]
+pub(crate) struct WriteImmediate {
+    pub(crate) dest: u64,
+    pub(crate) value: u32,
+}
+pub(super) extern "system" fn write_immediate(this: This, count: u32, params: *const WriteImmediate, _modes: *const u32) {
+    if params.is_null() {
+        return;
+    }
+    for i in 0..count as usize {
+        // SAFETY: the title passes `count` parameters.
+        let p = unsafe { &*params.add(i) };
+        write32(this, p.dest, p.value, 0, 0);
+    }
+}
+
+/// List methods 0x1f8, 0x200 and 0x208, `FillMemoryWith{32,64,128}BitValueX
+/// (destination, size, value)` (+0x2ef60, +0x2f020, +0x2ef30; the 128-bit
+/// value by address): the pattern over `size` bytes of title memory.
+/// Written when the list is submitted, in order with its copies, as
+/// [`copy_memory`] without a host copy.
+/// shortcut: on the console the card writes it in the list's order.
+pub(super) extern "system" fn fill32(this: This, dst: u64, size: u64, value: u32) {
+    let mut p = [0u8; 16];
+    for c in p.chunks_mut(4) {
+        c.copy_from_slice(&value.to_le_bytes());
+    }
+    fill(this, dst, size, p);
+}
+pub(super) extern "system" fn fill64(this: This, dst: u64, size: u64, value: u64) {
+    let mut p = [0u8; 16];
+    for c in p.chunks_mut(8) {
+        c.copy_from_slice(&value.to_le_bytes());
+    }
+    fill(this, dst, size, p);
+}
+pub(super) extern "system" fn fill128(this: This, dst: u64, size: u64, value: *const [u8; 16]) {
+    // SAFETY: the title passes 16 bytes.
+    let Some(&p) = (unsafe { value.as_ref() }) else { return };
+    fill(this, dst, size, p);
+}
+pub(super) fn fill(this: This, dst: u64, size: u64, pattern: [u8; 16]) {
+    if dst == 0 || size == 0 {
+        return;
+    }
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.defer(move || fill_now(dst, size, pattern));
+        return;
+    }
+    // Without a host GPU nothing runs later: write now.
+    let _ = this;
+    fill_now(dst, size, pattern);
+}
+
+/// Writes the pattern if the range is committed title memory.
+pub(crate) fn fill_now(dst: u64, size: u64, pattern: [u8; 16]) {
+    let len = size as usize;
+    #[cfg(windows)]
+    if !crate::texture::committed(dst as *const u8, len) {
+        return;
+    }
+    for at in (0..len).step_by(16) {
+        let n = (len - at).min(16);
+        // SAFETY: committed title memory, `len` bytes from `dst`.
+        unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), (dst as usize + at) as *mut u8, n) };
+    }
+}
+
 /// The title wrote a value at the bottom of the pipe (not a timestamp, not
 /// a query result): listed (diagnostics), and with `VICTORY_CUT_WRITES=1`
 /// the host list is cut right behind it, so that the value is stored when
@@ -2275,13 +2758,14 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 52] = [
+const METHODS: [(usize, *const ()); 84] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
     (8, list_type as *const ()),                  // 0x40
     (9, close as *const ()),                      // 0x48
     (10, reset as *const ()),                     // 0x50
+    (11, clear_state as *const ()),               // 0x58 ClearState
     (12, state::draw as *const ()),               // 0x60 instanced
     (13, state::draw_indexed as *const ()),       // 0x68 indexed
     (14, state::dispatch as *const ()),           // 0x70
@@ -2296,6 +2780,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (24, state::stencil_ref as *const ()),        // 0xc0
     (25, set_pipeline as *const ()),              // 0xc8
     (26, barrier as *const ()),                   // 0xd0
+    (31, set_predication as *const ()),           // 0xf8
     (32, state::heaps as *const ()),              // 0x100
     (33, ignored_state as *const ()),             // 0x108 compute root signature
     (34, ignored_state as *const ()),             // 0x110 graphics root signature
@@ -2316,9 +2801,48 @@ const METHODS: [(usize, *const ()); 52] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
+    (53, clear_uav_uint as *const ()),            // 0x1a8
+    (54, clear_uav_float as *const ()),           // 0x1b0
+    // DiscardResource(resource, region) (GameOS xgs12_10.dll +0x38c90):
+    // the contents become undefined, which keeping them is.
+    (55, object::VOID_STUB),                      // 0x1b8
+    // PIX markers, packets the GPU passes over: SetMarker (+0x39e60),
+    // BeginEvent (+0x38bb0), EndEvent (+0x39060).
+    (56, object::VOID_STUB),                      // 0x1c0
+    (57, object::VOID_STUB),                      // 0x1c8
+    (58, object::VOID_STUB),                      // 0x1d0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
+    (61, fill32 as *const ()),                    // 0x1f8 FillMemoryWith32BitValueX
+    (62, fill64 as *const ()),                    // 0x200 FillMemoryWith64BitValueX
+    (63, fill128 as *const ()),                   // 0x208 FillMemoryWith128BitValueX
+    (88, write32_top as *const ()),               // 0x2d0 Write32BitValueTopOfPipeX
+    (89, write64_top as *const ()),               // 0x2d8 Write64BitValueTopOfPipeX
+    (90, write32_shader as *const ()),            // 0x2e0 Write32BitValueBottomOfShaderX
+    (111, write_immediate as *const ()),          // 0x388 WriteBufferImmediate
+    (135, write32_bottom2 as *const ()),          // 0x448 Write32BitValueBottomOfPipe2X
+    (136, write64_bottom2 as *const ()),          // 0x450 Write64BitValueBottomOfPipe2X
+    // GPU tuning and hints without a host counterpart: nothing to do
+    // (GameOS xgs12_10.dll; the driver's function in each).
+    (67, object::VOID_STUB), // 0x228 FlushPipelineX (+0x39120): caches the host keeps coherent
+    (79, object::VOID_STUB), // 0x288 SetHiStencilStateX (+0x5e390): hierarchical stencil, an accelerator
+    (80, object::VOID_STUB), // 0x290 RSSetMSAAParametersX (+0x392f0). shortcut: the console's sample settings are not applied
+    (95, object::VOID_STUB), // 0x308 SetGraphicsShaderLimitsX (+0x5e1a0): wave limits
+    (96, object::VOID_STUB), // 0x310 SetComputeShaderLimitsX (+0x5df40): wave limits
+    (97, object::VOID_STUB), // 0x318 SetResourceCompressionStateX (+0x34350): the host has no compression state
+    (103, object::VOID_STUB), // 0x348 SetDeferredPrimitiveBatchBinningX (+0x5dfd0): binning
+    (133, object::VOID_STUB), // 0x438 PrefetchMemoryX (+0x385e0): a prefetch
+    (134, object::VOID_STUB), // 0x440 PrefetchPipelineStateX (+0x385f0): a prefetch
+    (139, object::VOID_STUB), // 0x468 SetShaderScratchSpaceX (+0x38870): translated shaders keep their scratch
+    (143, object::VOID_STUB), // 0x488 SetComputeShaderLaunchParametersX (+0x38820): wave launch tuning
     (68, state::depth_bounds as *const ()),       // 0x220 depth bounds
+    // OMSetDepthBounds (D3D12's List1; GameOS xgs12_10.dll +0x38110, the
+    // debug build validating it as OMSetDepthBoundsX) and a second
+    // RSSetScissorRects entry (+0x5dd30, the same validation).
+    (107, state::depth_bounds as *const ()),      // 0x368
+    (108, sample_positions as *const ()),         // 0x370 SetSamplePositions
+    (109, resolve_region as *const ()),           // 0x378 ResolveSubresourceRegion
+    (104, state::scissors as *const ()),          // 0x350
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait_value as *const ()),                // 0x238, 32 bits
@@ -2356,18 +2880,25 @@ const fn newer_slot(slot: usize) -> usize {
 
 /// Methods only newer titles' lists have. 0x490: the enhanced barrier
 /// `(group count, groups)`, with 16-byte groups `(type, count, barriers)`
-/// and 40-byte buffer barriers (title+0x95e0 builds them). 0x470 `(u64)`,
-/// called from the title's state flush with its result unused.
-/// shortcut: 0x470's purpose is unknown; ignored until a title shows it
-/// matters.
-const NEWER_METHODS: [(usize, *const ()); 3] = [
-    (142, ignored_state as *const ()),
+/// and 40-byte buffer barriers (title+0x95e0 builds them). 0x470 is
+/// `SetSampleMaskX(mask)` (named by the driver's debug build, GameOS
+/// `xgs12_10d.dll`; retail +0x38580), called from the title's state flush.
+/// shortcut: the sample mask is not applied (host pipelines keep every
+/// sample); see `crate::reference::LIST_NAMES` for every slot's name.
+const NEWER_METHODS: [(usize, *const ()); 4] = [
+    // A marker of a kind (+0x39160), as the others.
+    (59, object::VOID_STUB),
+    (142, set_sample_mask as *const ()),
     (146, barrier_groups as *const ()),
     (148, allocate_upload as *const ()),
 ];
 
 const fn list_table(newer: bool) -> [*const (); 160] {
-    let mut f = object::d3d12_object(object::missing_table::<LIST, 160>());
+    let mut f = object::missing_table::<LIST, 160>();
+    if newer {
+        f = object::reference_stubs(f, &crate::reference::LIST);
+    }
+    let mut f = object::d3d12_object(f);
     let mut i = 0;
     while i < METHODS.len() + MORE_METHODS.len() {
         let (slot, method) = if i < METHODS.len() {
@@ -2389,7 +2920,7 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// Every slot up to the limit exists and logs, for the methods newer
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
-static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+pub(crate) static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 /// Of lists whose calls are written down.
 #[cfg(windows)]
 static THIN_FUNCTIONS: Table<160> = Table(thin::table(false));
@@ -2465,5 +2996,107 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+}
+
+/// List 0x1a8/0x1b0 on the host GPU: a buffer cleared through our heaps reads
+/// back as the values, as integers and as floats.
+#[cfg(all(test, windows))]
+mod uav_clear_on_the_card {
+    use super::*;
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    fn buffer(host: &crate::host::Host, kind: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES) -> ID3D12Resource {
+        let props = D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        let mut r: Option<ID3D12Resource> = None;
+        // SAFETY: plain descriptions.
+        unsafe { host.device.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut r) }.unwrap();
+        r.unwrap()
+    }
+
+    fn cleared(values: [u32; 4], float: bool, format: DXGI_FORMAT) -> Option<Vec<u32>> {
+        let host = crate::host::host()?;
+        let ring = uav_ring()?;
+        let target = buffer(host, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        let back = buffer(host, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Buffer: D3D12_BUFFER_UAV { NumElements: 64, ..Default::default() } },
+        };
+        // SAFETY: objects of our own, used in order and waited for.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+            let list: ID3D12GraphicsCommandList = host.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).ok()?;
+            host_clear_uav(&host.device, &list, ring, &target, Some(&desc), values, float, &[]);
+            list.ResourceBarrier(&[crate::host::transition(&target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.CopyBufferRegion(&back, 0, &target, 0, 256);
+            list.Close().ok()?;
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+            host.queue().ExecuteCommandLists(&[Some(list.cast().ok()?)]);
+            host.queue().Signal(&fence, 1).ok()?;
+            let start = std::time::Instant::now();
+            while fence.GetCompletedValue() < 1 {
+                if start.elapsed().as_secs() > 10 {
+                    return None;
+                }
+                std::thread::yield_now();
+            }
+            let mut data = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut data)).ok()?;
+            let out = std::slice::from_raw_parts(data.cast::<u32>(), 64).to_vec();
+            back.Unmap(0, None);
+            Some(out)
+        }
+    }
+
+    #[test]
+    fn a_buffer_cleared_reads_back_as_the_values() {
+        let Some(words) = cleared([0xdead_beef, 0, 0, 0], false, DXGI_FORMAT_R32_UINT) else {
+            eprintln!("no host GPU here: the clear is not run");
+            return;
+        };
+        eprintln!("cleared on the host GPU: {:#x}", words[0]);
+        assert!(words.iter().all(|&w| w == 0xdead_beef), "{words:x?}");
+        let words = cleared([1.5f32.to_bits(), 0, 0, 0], true, DXGI_FORMAT_R32_FLOAT).unwrap();
+        assert!(words.iter().all(|&w| w == 1.5f32.to_bits()), "{words:x?}");
+    }
+}
+
+/// List 0x58 ClearState on a list with a host list: the stencil reference
+/// and topology set before are a new list's after.
+#[cfg(all(test, windows))]
+mod clear_state_test {
+    use super::*;
+
+    #[test]
+    fn clear_state_forgets_what_the_title_set() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        if host_list(list).is_none() {
+            eprintln!("no host GPU here: ClearState not checked");
+            return;
+        }
+        state::stencil_ref(list, 7);
+        state::topology(list, 4);
+        assert_eq!(state_of(list), Some((4, true, Some(7))));
+        clear_state(list, null);
+        assert_eq!(state_of(list), Some((0, false, None)));
     }
 }

@@ -438,6 +438,9 @@ plain! {
     DISPATCH_MESH_X dispatch_mesh_x = state::dispatch_mesh_x, (x: u32, flags: u64, indirect: u64, payload: u64);
     COPY_BUFFER copy_buffer_region = super::copy_buffer_region, (dst: This, dst_offset: u64, src: This, src_offset: u64, len: u64);
     COPY_RESOURCE copy_resource = super::copy_resource, (dst: This, src: This);
+    CLEAR_STATE clear_state = super::clear_state, (pipeline: This);
+    SAMPLE_MASK set_sample_mask = super::set_sample_mask, (mask: u64);
+    SET_PREDICATION set_predication = super::set_predication, (buffer: This, offset: u64, op: u32);
     COPY_RESOURCE_X copy_resource_x = super::copy_resource_x, (dst: This, src: This, flags: u32);
     COPY_MEMORY copy_memory = super::copy_memory, (dst: u64, src: u64, len: u64, flags: u32);
     RESOLVE resolve = super::resolve, (dst: This, dst_sub: u32, src: This, src_sub: u32, format: u32);
@@ -445,6 +448,14 @@ plain! {
     EXECUTE_INDIRECT execute_indirect = super::execute_indirect, (signature: This, max: u32, arguments: This, offset: u64, count: This, count_offset: u64);
     WRITE32 write32 = super::write32, (address: u64, value: u32, flush: u32, flags: u32);
     WRITE64 write64 = super::write64, (address: u64, value: u64, flush: u32, flags: u32);
+    WRITE32_TOP write32_top = super::write32_top, (address: u64, value: u32, flags: u32);
+    WRITE64_TOP write64_top = super::write64_top, (address: u64, value: u64, flags: u32);
+    WRITE32_SHADER write32_shader = super::write32_shader, (address: u64, value: u32, mode: u32);
+    WRITE32_BOTTOM2 write32_bottom2 = super::write32_bottom2, (address: u64, value: u32, write: u32, sync: u32);
+    WRITE64_BOTTOM2 write64_bottom2 = super::write64_bottom2, (address: u64, value: u64, write: u32, sync: u32, data: u32);
+    FILL32 fill32 = super::fill32, (dst: u64, size: u64, value: u32);
+    FILL64 fill64 = super::fill64, (dst: u64, size: u64, value: u64);
+    FILL128 fill128_words = fill128_played, (dst: u64, size: u64, lo: u64, hi: u64);
     WAIT_VALUE wait_value = super::wait_value, (address: u64, comparison: u32, reference: u64);
     WAIT_VALUE64 wait_value64 = super::wait_value64, (address: u64, comparison: u32, reference: u64);
     SYNC sync = super::sync, (flags: u32, control: u32, address: u64, size: u64);
@@ -470,6 +481,9 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+const CLEAR_UAV: u64 = after(17);
+const RESOLVE_REGION: u64 = after(18);
+const SAMPLE_POSITIONS: u64 = after(19);
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -646,6 +660,96 @@ extern "system" fn clear_dsv(
         &[bytes_of(view.as_ptr(), RECORD), bytes_of(rects, count as usize)],
     );
 }
+extern "system" fn clear_uav_uint(
+    this: This,
+    _gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    // SAFETY: the title passes four values or none.
+    let values = unsafe { values.as_ref() }.copied().unwrap_or([0; 4]);
+    record_uav_clear(this, cpu, resource, values, false, count, rects);
+}
+extern "system" fn clear_uav_float(
+    this: This,
+    _gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    // SAFETY: the title passes four values or none.
+    let values = unsafe { values.as_ref() }.map_or([0; 4], |v| v.map(f32::to_bits));
+    record_uav_clear(this, cpu, resource, values, true, count, rects);
+}
+/// The view's record is copied: the handle may be written again before the
+/// list is played.
+fn record_uav_clear(this: This, cpu: u64, resource: This, values: [u32; 4], float: bool, count: u32, rects: *const Rect) {
+    if cpu == 0 || resource.is_null() {
+        return;
+    }
+    let count = if rects.is_null() { 0 } else { count };
+    let view = record(cpu);
+    let v = |i: usize| u64::from(values[i]) | u64::from(values[i + 1]) << 32;
+    front(this).put_with(
+        CLEAR_UAV,
+        &[u64::from(count), resource as u64, u64::from(float), v(0), v(2)],
+        &[bytes_of(view.as_ptr(), RECORD), bytes_of(rects, count as usize)],
+    );
+}
+extern "system" fn fill128(this: This, dst: u64, size: u64, value: *const [u8; 16]) {
+    // SAFETY: the title passes 16 bytes.
+    let Some(v) = (unsafe { value.as_ref() }) else { return };
+    let w = |i: usize| u64::from_le_bytes(v[i..i + 8].try_into().unwrap());
+    fill128_words(this, dst, size, w(0), w(8));
+}
+extern "system" fn fill128_played(this: This, dst: u64, size: u64, lo: u64, hi: u64) {
+    let mut p = [0u8; 16];
+    p[..8].copy_from_slice(&lo.to_le_bytes());
+    p[8..].copy_from_slice(&hi.to_le_bytes());
+    super::fill(this, dst, size, p);
+}
+/// WriteBufferImmediate is written down as its 32-bit writes.
+extern "system" fn write_immediate(this: This, count: u32, params: *const super::WriteImmediate, _modes: *const u32) {
+    if params.is_null() {
+        return;
+    }
+    for i in 0..count as usize {
+        // SAFETY: the title passes `count` parameters.
+        let p = unsafe { &*params.add(i) };
+        write32(this, p.dest, p.value, 0, 0);
+    }
+}
+extern "system" fn resolve_region(
+    this: This,
+    dst: This,
+    dst_sub: u32,
+    x: u32,
+    y: u32,
+    src: This,
+    src_sub: u32,
+    rect: *const [i32; 4],
+    format: u32,
+    mode: u32,
+) {
+    // SAFETY: the title passes a rectangle or none.
+    let r = unsafe { rect.as_ref() }.copied();
+    let w = |a: i32, b: i32| u64::from(a as u32) | u64::from(b as u32) << 32;
+    let [l, t, rt, b] = r.unwrap_or([0; 4]);
+    front(this).put(
+        RESOLVE_REGION,
+        &[dst as u64, u64::from(dst_sub), u64::from(x) | u64::from(y) << 32, src as u64, u64::from(src_sub), u64::from(r.is_some()), w(l, t), w(rt, b), u64::from(format) | u64::from(mode) << 32],
+    );
+}
+extern "system" fn sample_positions(this: This, per_pixel: u32, pixels: u32, positions: *const [i8; 2]) {
+    let n = (per_pixel as usize * pixels as usize).min(64);
+    let n = if positions.is_null() { 0 } else { n };
+    front(this).put_with(SAMPLE_POSITIONS, &[u64::from(per_pixel) | u64::from(pixels) << 32, n as u64], &[bytes_of(positions, n)]);
+}
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -767,6 +871,22 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                     at(w, 3 + RECORD, n),
                 );
             }
+            RESOLVE_REGION => {
+                let rect = (w[5] != 0).then(|| [w[6] as i32, (w[6] >> 32) as i32, w[7] as i32, (w[7] >> 32) as i32]);
+                super::resolve_region_at(list, w[0] as This, w[1] as u32, w[2] as u32, (w[2] >> 32) as u32, w[3] as This, w[4] as u32, rect, w[8] as u32, (w[8] >> 32) as u32);
+            }
+            SAMPLE_POSITIONS => {
+                let n = w[1] as usize;
+                let p: &[[i8; 2]] = if n == 0 { &[] } else {
+                    // SAFETY: the `n` positions written down after the counts.
+                    unsafe { std::slice::from_raw_parts(w[2..].as_ptr().cast(), n) }
+                };
+                super::sample_positions_at(list, w[0] as u32, (w[0] >> 32) as u32, p);
+            }
+            CLEAR_UAV => {
+                let v = [w[3] as u32, (w[3] >> 32) as u32, w[4] as u32, (w[4] >> 32) as u32];
+                super::clear_uav(list, w[5..].as_ptr() as u64, w[1] as This, v, w[2] != 0, n as u32, at(w, 5 + RECORD, n));
+            }
             COPY_TEXTURE => {
                 let step = size_of::<CopyLocation>().div_ceil(8);
                 let boxed = (w[1] >> 32) as usize;
@@ -797,21 +917,24 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
         i += 1;
     }
     if newer {
+        f[142] = set_sample_mask as *const ();
         f[146] = barrier_groups as *const ();
         f[148] = allocate_upload as *const ();
     }
     f
 }
 
-const MINE: [(usize, *const ()); 50] = [
+const MINE: [(usize, *const ()); 67] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
+    (11, clear_state as *const ()),
     (12, draw as *const ()),
     (13, draw_indexed as *const ()),
     (14, dispatch as *const ()),
     (15, copy_buffer_region as *const ()),
     (16, copy_texture_region as *const ()),
     (17, copy_resource as *const ()),
+    (31, set_predication as *const ()),
     (19, resolve as *const ()),
     (20, topology as *const ()),
     (21, viewports as *const ()),
@@ -839,6 +962,21 @@ const MINE: [(usize, *const ()); 50] = [
     (50, targets as *const ()),
     (51, clear_dsv as *const ()),
     (52, clear_rtv as *const ()),
+    (107, depth_bounds as *const ()),
+    (108, sample_positions as *const ()),
+    (109, resolve_region as *const ()),
+    (104, scissors as *const ()),
+    (61, fill32 as *const ()),
+    (62, fill64 as *const ()),
+    (63, fill128 as *const ()),
+    (88, write32_top as *const ()),
+    (89, write64_top as *const ()),
+    (90, write32_shader as *const ()),
+    (111, write_immediate as *const ()),
+    (135, write32_bottom2 as *const ()),
+    (136, write64_bottom2 as *const ()),
+    (53, clear_uav_uint as *const ()),
+    (54, clear_uav_float as *const ()),
     (59, execute_indirect as *const ()),
     (60, copy_memory as *const ()),
     (68, depth_bounds as *const ()),
@@ -864,7 +1002,7 @@ mod tests {
     /// left in both tables alike records nothing.
     #[test]
     fn every_recording_method_is_written_down() {
-        const NOTHING: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 28, 29, 33, 34, 73, 99, 124];
+        const NOTHING: [usize; 31] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 28, 29, 33, 34, 55, 56, 57, 58, 67, 73, 79, 80, 95, 96, 97, 99, 103, 124, 133, 134, 139, 143];
         let mine: Vec<usize> = MINE.iter().map(|m| m.0).collect();
         for (slot, _) in METHODS.iter().chain(MORE_METHODS.iter()) {
             assert!(mine.contains(slot) != NOTHING.contains(slot), "slot {slot}");
@@ -910,5 +1048,45 @@ mod tests {
         assert_eq!(slot[1], 99);
         assert_eq!(kept[1], 2);
         assert_eq!(record(0), [0; RECORD]);
+    }
+}
+
+/// ResolveSubresourceRegion and SetSamplePositions (list 0x378/0x370; GameOS
+/// `xgs12_10.dll` +0x50590, +0x38110: D3D12's List1 arguments) reach the
+/// host step with the same arguments called plainly and written down and
+/// played.
+#[cfg(test)]
+mod list1_methods {
+    use super::*;
+
+    fn last() -> String {
+        super::super::SEEN.lock().unwrap().last().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn written_down_and_played_as_called() {
+        let rect = [1i32, 2, 30, 40];
+        let (dst, src) = (0x1000usize as This, 0x2000usize as This);
+        super::super::resolve_region(std::ptr::null(), dst, 3, 4, 5, src, 6, &rect, 28, 2);
+        let plain = last();
+        let positions = [[1i8, -2], [3, -4], [5, -6], [7, -8]];
+        super::super::sample_positions(std::ptr::null(), 4, 1, positions.as_ptr());
+        let plain_positions = last();
+        assert_eq!(plain_positions, "positions 4 1 [[1, -2], [3, -4], [5, -6], [7, -8]]");
+
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(super::super::create_allocator(null, 0, &super::super::ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(super::super::create_list(null, 0, 0, allocator, null, &super::super::LIST_IIDS[1], &mut list), S_OK);
+        front(list).recording = Some(Arc::new(Recording::new(0)));
+        front(list).words.clear();
+        resolve_region(list, dst, 3, 4, 5, src, 6, &rect, 28, 2);
+        sample_positions(list, 4, 1, positions.as_ptr());
+        let stream = std::mem::take(&mut front(list).words);
+        translate(std::ptr::null(), &stream, || false);
+        let n = super::super::SEEN.lock().unwrap().len();
+        let both = super::super::SEEN.lock().unwrap()[n - 2..].to_vec();
+        assert_eq!(both, vec![plain, plain_positions]);
     }
 }

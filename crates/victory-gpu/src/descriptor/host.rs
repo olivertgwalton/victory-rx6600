@@ -6840,12 +6840,12 @@ mod bake_flip_tests {
             pending.push(PendingListFlip {
                 id: id1,
                 origin: (1, 1),
-                flip: Flip { after: 0, heap, index: 7, handle: 0, key: 11, late: Some(1) },
+                flip: Flip { after: 0, heap, index: 7, handle: 0, key: 11, late: Some(1), asked: 0 },
             });
             pending.push(PendingListFlip {
                 id: id2,
                 origin: (2, 1),
-                flip: Flip { after: 0, heap, index: 8, handle: 0, key: 12, late: Some(1) },
+                flip: Flip { after: 0, heap, index: 8, handle: 0, key: 12, late: Some(1), asked: 0 },
             });
             PENDING_LIST_COUNT.store(pending.len(), std::sync::atomic::Ordering::Release);
         }
@@ -6867,7 +6867,7 @@ mod bake_flip_tests {
                 pending.push(PendingListFlip {
                     id,
                     origin: (3, 1),
-                    flip: Flip { after: 0, heap, index: idx, handle: 0, key: 20, late: Some(1) },
+                    flip: Flip { after: 0, heap, index: idx, handle: 0, key: 20, late: Some(1), asked: 0 },
                 });
             }
             PENDING_LIST_COUNT.store(pending.len(), std::sync::atomic::Ordering::Release);

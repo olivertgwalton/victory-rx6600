@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
-const PIPELINE_IIDS: [Iid; 4] = [
+pub(crate) const PIPELINE_IIDS: [Iid; 4] = [
     guid(
         0x765a30f3,
         0xf624,
@@ -438,9 +438,10 @@ struct Pipeline {
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
-/// Render target formats, their count, depth format and samples, as bound.
+/// Render target formats, their count, depth format and samples, as bound,
+/// and the list's sample mask ([`note_sample_mask`]).
 #[cfg(windows)]
-type Bound = ([i32; 8], u32, i32, u32);
+type Bound = ([i32; 8], u32, i32, u32, u32);
 
 /// A pipeline the title made with device method 0x1c8: its register image
 /// and vertex layout, and its host pipelines by the targets bound.
@@ -454,7 +455,7 @@ pub(crate) struct NativeGraphics {
 #[cfg(windows)]
 thread_local! {
     /// The targets the list this thread records has bound (`draw.rs`).
-    static BOUND: std::cell::Cell<Bound> = const { std::cell::Cell::new(([0; 8], 0, 0, 1)) };
+    static BOUND: std::cell::Cell<Bound> = const { std::cell::Cell::new(([0; 8], 0, 0, 1, u32::MAX)) };
 }
 
 /// The render targets (host formats), depth format and sample count the
@@ -466,13 +467,40 @@ pub(crate) fn note_targets(formats: &[DXGI_FORMAT], depth: DXGI_FORMAT, samples:
     for (slot, x) in f.iter_mut().zip(formats) {
         *slot = x.0;
     }
-    BOUND.set((f, formats.len().min(8) as u32, depth.0, samples.max(1)));
+    let mask = BOUND.get().4;
+    BOUND.set((f, formats.len().min(8) as u32, depth.0, samples.max(1), mask));
+}
+
+/// The sample mask the list being recorded on this thread set (list method
+/// 0x470), for the native graphics pipelines it draws with; all samples
+/// after a reset.
+#[cfg(windows)]
+pub(crate) fn note_sample_mask(mask: u32) {
+    let mut b = BOUND.get();
+    b.4 = mask;
+    BOUND.set(b);
+}
+
+/// The mask [`note_sample_mask`] keeps on this thread.
+#[cfg(all(test, windows))]
+pub(crate) fn noted_sample_mask() -> u32 {
+    BOUND.get().4
+}
+
+/// `SetSampleMaskX(mask)`'s 64 bits as D3D12's sample mask. The driver
+/// (GameOS `xgs12_10.dll` +0x38580) writes them to PA_SC_AA_MASK_X0Y0_X1Y0
+/// and _X0Y1_X1Y1: 16 sample bits for each pixel of a 2x2 quad. The same 16
+/// for every pixel are D3D12's mask (samples 16 and up kept); otherwise
+/// D3D12 has no per-pixel mask, and their union is taken.
+pub(crate) fn sample_mask_of(mask: u64) -> u32 {
+    let p = |i: u32| (mask >> (16 * i)) as u32 & 0xffff;
+    0xffff_0000 | p(0) | p(1) | p(2) | p(3)
 }
 
 /// Stage names, in description order.
 const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geometry"];
 
-fn pipeline<'a>(this: This) -> &'a Pipeline {
+pub(crate) fn pipeline<'a>(this: This) -> &'a Pipeline {
     // SAFETY: the title passes one of our pipelines.
     unsafe { &*this.cast::<Pipeline>() }
 }
@@ -510,7 +538,8 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
                 Some((_, pending)) => pending.clone(),
                 None => {
                     let targets: Vec<DXGI_FORMAT> = bound.0[..bound.1 as usize].iter().map(|&f| DXGI_FORMAT(f)).collect();
-                    let g = host::GraphicsState::native(&n.regs, &n.layout, &targets, DXGI_FORMAT(bound.2), bound.3);
+                    let mut g = host::GraphicsState::native(&n.regs, &n.layout, &targets, DXGI_FORMAT(bound.2), bound.3);
+                    g.sample_mask = bound.4;
                     let pending = Arc::new(make::Pending::new(p.shaders.clone(), Some(Box::new(g))));
                     v.push((bound, pending.clone()));
                     pending
@@ -753,6 +782,92 @@ pub(crate) fn hand_out_compute(container: &[u8], iid: *const Iid, out: *mut This
     )
 }
 
+/// Device method 0x1b8, `(base, count, records, iid, out)`: a variant of
+/// `base` with `count` state records written over its register image
+/// ([`variant`]). The console's driver makes it whatever the interface id
+/// (it never reads it), with one reference, and returns `E_OUTOFMEMORY` only
+/// when it cannot allocate. The title keeps variants by the state it asked
+/// for (title+0x2479f40) and draws with them.
+/// shortcut: only variants of pipelines made by device method 0x1c8, and
+/// of record kinds 0, 1, 2 and 5 (those the title makes), are written; the
+/// others fail as before. Kind 2's format-dependent registers (the
+/// driver's +0x479b0, +0x4b350, +0x4b110) are not.
+pub(crate) extern "system" fn create_variant(
+    _: This,
+    base: This,
+    count: u32,
+    records: *const u8,
+    _iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: the title's out pointer.
+    unsafe { *out = std::ptr::null() };
+    if base.is_null() || (count > 0 && records.is_null()) {
+        return E_INVALIDARG;
+    }
+    let records = if count == 0 {
+        &[][..]
+    } else {
+        // SAFETY: the title passes `count` records.
+        unsafe { std::slice::from_raw_parts(records, count as usize * variant::RECORD) }
+    };
+    let kinds: Vec<u32> =
+        records.chunks_exact(variant::RECORD).map(|r| u32::from_le_bytes(r[..4].try_into().unwrap())).collect();
+    #[cfg(windows)]
+    {
+        let p = pipeline(base);
+        if let Some(n) = &p.native {
+            let mut regs = n.regs.clone();
+            match variant::apply(&mut regs, records) {
+                Ok(()) => {
+                    static MADE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    let made = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if made <= 4 || made.is_power_of_two() {
+                        tracing::info!(made, ?kinds, "pipeline variant (device method 0x1b8): made");
+                    }
+                    let native = Box::new(NativeGraphics {
+                        regs,
+                        layout: n.layout.clone(),
+                        variants: std::sync::Mutex::new(Vec::new()),
+                    });
+                    return hand_out_with(p.shaders.clone(), None, Some(native), &PIPELINE_IIDS[0], out);
+                }
+                Err(kind) => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(kind, ?kinds, "pipeline variant (device method 0x1b8): a record kind not written; the title goes without it")
+                    });
+                }
+            }
+        } else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(?kinds, "pipeline variant (device method 0x1b8) of a pipeline not made by method 0x1c8; the title goes without it")
+            });
+        }
+    }
+    let _ = kinds;
+    object::E_NOTIMPL
+}
+
+/// Device method 0x1e0 `CreateGraphicsPipelineStateX(desc, extended count,
+/// extended descs, iid, out)` (GameOS `xgs12_10.dll` +0x4d520, named by its
+/// debug build): the graphics twin of 0x1f0.
+/// shortcut: the extensions are ignored, as 0x1f0's are.
+pub(crate) extern "system" fn create_graphics_x(
+    this: This,
+    desc: *const GraphicsHead,
+    _extensions: u32,
+    _extended: *const u8,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    create_graphics(this, desc, iid, out)
+}
+
 /// Device method 0x1f0: the plain compute description plus console
 /// extensions `(desc, extension count, extensions, iid, out)`.
 /// shortcut: the extensions (console shader settings) are ignored, as is
@@ -855,6 +970,80 @@ pub(crate) extern "system" fn create_stream(
     )
 }
 
+/// The pipeline id the console's driver keeps for a pipeline made by device
+/// method 0x1c8 (GameOS `xgs12_10.dll`, set at pipeline+0x70 while it reads
+/// the description's vertex layout block, version 0x1000 at +4): after the
+/// block's first table (count at 0x40; entries of a word, a length, that
+/// many bytes, a word and three bytes, from 0x44), a 32-bit word.
+pub(crate) fn native_pipeline_id(layout: &[u8]) -> Option<u32> {
+    let u = |o: usize| layout.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    if u(4)? != 0x1000 {
+        return None;
+    }
+    let mut at = 0x44;
+    for _ in 0..u(0x40)?.min(4096) {
+        let len = u(at + 4)? as usize;
+        at += 8 + len + 7;
+    }
+    u(at)
+}
+
+/// A blob of bytes (`ID3DBlob`): QueryInterface, AddRef, Release,
+/// GetBufferPointer, GetBufferSize.
+#[repr(C)]
+struct Blob {
+    object: Object,
+    bytes: Vec<u8>,
+}
+const BLOB_IIDS: [Iid; 1] = [guid(0x8ba5fb08, 0x5195, 0x40e2, [0xac, 0x58, 0x0d, 0x98, 0x9c, 0x3a, 0x01, 0x02])];
+extern "system" fn blob_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+    let found = object::is(iid, &BLOB_IIDS).then_some(this);
+    object::answer(PIPELINE, iid, found, out)
+}
+extern "system" fn blob_release(this: This) -> u32 {
+    object::release_boxed::<Blob>(this)
+}
+extern "system" fn blob_pointer(this: This) -> *mut u8 {
+    // SAFETY: one of our blobs.
+    unsafe { (*this.cast_mut().cast::<Blob>()).bytes.as_mut_ptr() }
+}
+extern "system" fn blob_size(this: This) -> usize {
+    // SAFETY: one of our blobs.
+    unsafe { (*this.cast::<Blob>()).bytes.len() }
+}
+static BLOB_FUNCTIONS: Table<5> = Table([
+    blob_query as *const (),
+    object::add_ref as *const (),
+    blob_release as *const (),
+    blob_pointer as *const (),
+    blob_size as *const (),
+]);
+
+/// Pipeline method 0x58 `(kind, _, out)` (+0x66020 -> +0x62d30, the driver's
+/// path for pipelines it did not make as its 0x4005cf00 type, which ours
+/// are not): E_INVALIDARG for a kind other than 0; else a new 4-byte blob
+/// (+0x3e9d0) holding the root pipeline's id (a variant's is its base's,
+/// whose layout it keeps). Pipelines not made by 0x1c8 have no id here.
+extern "system" fn pipeline_id_blob(this: This, kind: u32, _unused: u64, out: *mut This) -> HRESULT {
+    if kind != 0 {
+        return E_INVALIDARG;
+    }
+    #[cfg(windows)]
+    let id = pipeline(this).native.as_ref().and_then(|n| native_pipeline_id(&n.layout));
+    #[cfg(not(windows))]
+    let id: Option<u32> = { let _ = this; None };
+    let Some(id) = id else {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!("pipeline method 0x58 of a pipeline without the console's id (not made by device method 0x1c8)"));
+        return object::E_NOTIMPL;
+    };
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    let blob = Box::new(Blob { object: Object::new(&BLOB_FUNCTIONS), bytes: id.to_le_bytes().to_vec() });
+    object::hand_out(PIPELINE, blob, &BLOB_IIDS[0], &BLOB_IIDS, out)
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &PIPELINE_IIDS).then_some(this);
     object::answer(PIPELINE, iid, found, out)
@@ -864,11 +1053,15 @@ extern "system" fn release(this: This) -> u32 {
 }
 
 /// IUnknown 3, object 4, device child 1, pipeline 3.
-static FUNCTIONS: Table<24> = {
-    let mut f = object::d3d12_object(object::missing_table::<PIPELINE, 24>());
+pub(crate) static FUNCTIONS: Table<24> = {
+    let mut f = object::d3d12_object(object::reference_stubs(object::missing_table::<PIPELINE, 24>(), &crate::reference::PIPELINE));
     f[0] = query as *const ();
     f[2] = release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
+    // 0x60 (+0x66040): E_NOTIMPL for pipelines without the driver's
+    // 0x4005cf00 type, which none of ours have.
+    f[11] = pipeline_id_blob as *const (); // 0x58
+    f[12] = object::not_implemented as *const (); // 0x60
     Table(f)
 };
 
@@ -880,6 +1073,7 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+pub(crate) mod variant;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
@@ -1026,5 +1220,55 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pipeline_id {
+    use super::*;
+    use crate::object::slot;
+
+    /// A layout block as the driver reads it: version 0x1000, `entries` in
+    /// the first table, then the id.
+    fn block(entries: &[&[u8]], id: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 0x44];
+        b[4..8].copy_from_slice(&0x1000u32.to_le_bytes());
+        b[0x40..0x44].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        for e in entries {
+            b.extend_from_slice(&7u32.to_le_bytes());
+            b.extend_from_slice(&(e.len() as u32).to_le_bytes());
+            b.extend_from_slice(e);
+            b.extend_from_slice(&[9; 7]);
+        }
+        b.extend_from_slice(&id.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn the_id_follows_the_first_table() {
+        assert_eq!(native_pipeline_id(&block(&[], 0x1234)), Some(0x1234));
+        assert_eq!(native_pipeline_id(&block(&[b"POSITION", b"UV"], 0xabcd)), Some(0xabcd));
+        let mut other = block(&[], 1);
+        other[5] = 0;
+        assert_eq!(native_pipeline_id(&other), None, "the driver refuses other versions");
+    }
+
+    /// Pipeline 0x58 (+0x62d30): kind 0 a 4-byte blob of the id; other kinds
+    /// E_INVALIDARG.
+    #[cfg(windows)]
+    #[test]
+    fn method_0x58_hands_out_the_id_in_a_blob() {
+        let mut p: This = std::ptr::null();
+        assert_eq!(hand_out_native_graphics(Vec::new(), vec![0; 0x100], block(&[b"N"], 77), &PIPELINE_IIDS[0], &mut p), object::S_OK);
+        let f = slot::<extern "system" fn(This, u32, u64, *mut This) -> HRESULT>(p, 0x58);
+        let mut blob: This = std::ptr::null();
+        assert_eq!(f(p, 1, 0, &mut blob), E_INVALIDARG);
+        assert_eq!(f(p, 0, 0, &mut blob), object::S_OK);
+        let size = slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob);
+        let data = slot::<extern "system" fn(This) -> *mut u8>(blob, 0x18)(blob);
+        // SAFETY: the blob's 4 bytes.
+        assert_eq!((size, unsafe { data.cast::<u32>().read_unaligned() }), (4, 77));
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob), 0);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 }

@@ -497,6 +497,63 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     E_NOTIMPL
 }
 
+/// Device method 0x3a8 (GameOS `xgs12_10.dll` +0x6ca70): of the 32-byte
+/// description at `desc`, byte 0x18 when bit 31 of word 0xc, bits 20-28 of
+/// word 4 and bit 25 of word 0x14 are all set; -1 otherwise.
+pub(crate) extern "system" fn description_byte(_: This, desc: *const [u32; 8]) -> u32 {
+    // SAFETY: the title passes a description (null is tolerated here; the
+    // driver reads it unchecked).
+    let Some(d) = (unsafe { desc.as_ref() }) else { return u32::MAX };
+    if d[3] >> 31 != 0 && d[1] & 0x1ff0_0000 != 0 && d[5] & 0x0200_0000 != 0 {
+        d[6] & 0xff
+    } else {
+        u32::MAX
+    }
+}
+
+/// Device method 0x3b8 (+0xa1a00), trace data `(data, size)`: E_INVALIDARG
+/// without data or size; otherwise the driver writes it to its trace
+/// (+0xa1220), which answers E_FAIL while no capture tool has started one,
+/// as here.
+pub(crate) extern "system" fn trace_data(_: This, data: *const u8, size: u32) -> HRESULT {
+    if data.is_null() || size == 0 {
+        return E_INVALIDARG;
+    }
+    0x8000_4005_u32 as i32
+}
+
+/// What the device's setters keep (the driver keeps them in the device, or
+/// for 0x3c8 in a global): 0x190's three words, 0x198/0x420's capture
+/// flags, 0x3c8's word.
+pub(crate) static KEPT: std::sync::Mutex<([u64; 3], u32, u64)> = std::sync::Mutex::new(([0; 3], 0, 0));
+
+fn kept() -> std::sync::MutexGuard<'static, ([u64; 3], u32, u64)> {
+    KEPT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Device method 0x190 (+0xa1a70): keeps three words, returns nothing.
+pub(crate) extern "system" fn keep_three(_: This, a: u64, b: u64, c: u64) {
+    kept().0 = [a, b, c];
+}
+
+/// Device methods 0x198 (+0xa1a40: flag = bit 0) and 0x420 (+0xa1a20:
+/// flags as given): the driver keeps the flags and, with bit 0, begins a
+/// GPU capture (+0xa1450), else ends one (+0xa13c0), which is nothing
+/// without one going.
+/// shortcut: no capture is made here (no capture tool).
+pub(crate) extern "system" fn capture_bit(_: This, on: u8) {
+    kept().1 = u32::from(on & 1);
+}
+pub(crate) extern "system" fn capture_flags(_: This, flags: u32) {
+    kept().1 = flags;
+}
+
+/// Device method 0x3c8 (+0x4cbd0): keeps a word in a global, returns
+/// nothing.
+pub(crate) extern "system" fn keep_global(_: This, word: u64) {
+    kept().2 = word;
+}
+
 /// The host device's state: the console's device is removed when the host's is
 /// (VIctory 13185f5: the default answer, E_NOTIMPL, reads as a lost device).
 extern "system" fn removed_reason(_: This) -> HRESULT {
@@ -515,8 +572,8 @@ extern "system" fn removed_reason(_: This) -> HRESULT {
 /// 1, 2, 9 (0x298-0x3a0, the console's own among them), then those of
 /// `ID3D12Device9` to `ID3D12Device11`, whose console layout is unknown.
 /// Every slot exists so that a call to one we have not written logs it.
-static FUNCTIONS: Table<160> = {
-    let mut f = object::d3d12_object(object::missing_table::<{ object::DEVICE }, 160>());
+pub(crate) static FUNCTIONS: Table<160> = {
+    let mut f = object::d3d12_object(object::reference_stubs(object::missing_table::<{ object::DEVICE }, 160>(), &crate::reference::DEVICE));
     f[0] = query_interface as *const (); // 0x00
     f[7] = node_count as *const (); // 0x38
     f[8] = queue::create as *const (); // 0x40
@@ -547,11 +604,31 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
+    f[55] = pipeline::create_variant as *const (); // 0x1b8 pipeline variant
+    f[50] = keep_three as *const (); // 0x190
+    f[51] = capture_bit as *const (); // 0x198
+    f[117] = description_byte as *const (); // 0x3a8
+    f[119] = trace_data as *const (); // 0x3b8
+    f[121] = keep_global as *const (); // 0x3c8
+    f[132] = capture_flags as *const (); // 0x420
+    f[44] = resource::create_at_address_x as *const (); // 0x160 CreatePlacedResourceX
+    f[92] = resource::create_committed1 as *const (); // 0x2e0 CreateCommittedResource1
+    f[109] = resource::create_committed1 as *const (); // 0x368 CreateCommittedResource2
+    f[110] = resource::create_placed1 as *const (); // 0x370 CreatePlacedResource1
+    f[112] = resource::copyable_footprints1 as *const (); // 0x380 GetCopyableFootprints1
+    f[128] = resource::create_placed2 as *const (); // 0x400 CreatePlacedResource2
+    // CreatePlaced{ShaderResource,UnorderedAccess}ViewX (+0x73cb0, +0x73d90):
+    // the arguments of their Raw twins at 0x230/0x238 (+0x73a50, +0x73bf0),
+    // whose views are kept as their words and made from their own fields.
+    f[46] = descriptor::create_placed_srv as *const (); // 0x170
+    f[47] = descriptor::create_placed_uav as *const (); // 0x178
+    f[60] = pipeline::create_graphics_x as *const (); // 0x1e0 CreateGraphicsPipelineStateX
     f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
     f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
-    f[69] = object::ignore as *const (); // 0x228 debug error filter
+    // 0x228 (debug error filter): the retail driver's E_NOTIMPL stub.
+    f[69] = object::not_implemented as *const (); // 0x228
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
     f[73] = list::create_list_x as *const (); // 0x248

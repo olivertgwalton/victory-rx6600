@@ -236,8 +236,8 @@ extern "system" fn release(this: This) -> u32 {
 }
 
 /// IUnknown 3, object 4, device child 1.
-static FUNCTIONS: Table<24> = {
-    let mut f = object::d3d12_object(object::missing_table::<ROOT_SIGNATURE, 24>());
+pub(crate) static FUNCTIONS: Table<24> = {
+    let mut f = object::d3d12_object(object::reference_stubs(object::missing_table::<ROOT_SIGNATURE, 24>(), &crate::reference::ROOT_SIGNATURE));
     f[0] = query as *const ();
     f[2] = release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
@@ -247,7 +247,7 @@ static FUNCTIONS: Table<24> = {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::{E_NOINTERFACE, E_POINTER, S_FALSE, S_OK, slot};
+    use crate::object::{E_INVALIDARG, E_NOINTERFACE, E_POINTER, S_FALSE, S_OK, slot};
 
     /// An interface we do not implement.
     const OTHER_IID: Iid = guid(0x5a5a_5a5a, 0x5a5a, 0x5a5a, [0x5a; 8]);
@@ -443,10 +443,14 @@ mod tests {
     #[test]
     fn the_table_has_the_object_and_device_child_slots() {
         let root = created(&ROOT_SIGNATURE_IIDS[1]);
-        // SetPrivateDataInterface is the one object method left out.
+        // SetPrivateDataInterface (`crate::reference`): no id, no entry.
         assert_eq!(
-            slot::<extern "system" fn() -> HRESULT>(root, 0x28)(),
-            E_NOTIMPL
+            slot::<extern "system" fn(This, *const Iid, This) -> HRESULT>(root, 0x28)(
+                root,
+                std::ptr::null(),
+                std::ptr::null()
+            ),
+            E_INVALIDARG
         );
         assert_eq!(
             slot::<extern "system" fn(This, *const u16) -> HRESULT>(root, 0x30)(

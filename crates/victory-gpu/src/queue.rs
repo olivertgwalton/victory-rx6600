@@ -852,7 +852,9 @@ extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
     unsafe { out.write(TIMESTAMP_FREQUENCY) };
     S_OK
 }
-const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
+/// The console's: its driver's queue method 0x90 answers 99.75 MHz
+/// (GameOS `xgs12_10.dll` +0x19470).
+const TIMESTAMP_FREQUENCY: u64 = 99_750_000;
 
 /// What a list's bottom-of-pipe write stores when the list has run.
 #[derive(Debug, Clone, Copy)]
@@ -873,7 +875,7 @@ impl Written {
             Written::GpuTimestamp => {
                 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
                 let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                let now = (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64;
+                let now = (elapsed.as_nanos() * u128::from(TIMESTAMP_FREQUENCY) / 1_000_000_000) as u64;
                 #[cfg(all(windows, feature = "diagnostics"))]
                 crate::host::spans::stamped(at as usize, now);
                 as_loaded(now, at as usize, gpu_load())
@@ -1314,19 +1316,59 @@ const fn newer_slot(slot: usize) -> usize {
     if slot >= 14 { slot + 2 } else { slot }
 }
 
-const fn queue_table(newer: bool) -> [*const (); 36] {
-    let mut f = object::d3d12_object(object::missing_table::<QUEUE, 36>());
+const fn queue_table(newer: bool) -> [*const (); 40] {
+    let mut f = object::missing_table::<QUEUE, 40>();
+    if newer {
+        f = object::reference_stubs(f, &crate::reference::QUEUE);
+    }
+    let mut f = object::d3d12_object(f);
     let mut i = 0;
     while i < METHODS.len() {
         let (slot, method) = METHODS[i];
         f[if newer { newer_slot(slot) } else { slot }] = method;
         i += 1;
     }
+    if newer {
+        // 0x70 (+0x1b5c0): a PIX marker of a kind, as 0x58..0x68.
+        f[14] = marker as *const ();
+        f[19] = object::stub_s_ok() as *const (); // 0x98: S_OK (+0x19460; its kernel notification is not modelled)
+        f[23] = suspend as *const (); // 0xb8
+        f[27] = flush as *const (); // 0xd8
+        f[24] = resume as *const (); // 0xc0
+    }
     f
 }
 
-static FUNCTIONS: Table<36> = Table(queue_table(false));
-static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
+/// Queue method 0xb8, `SuspendX(flags)`. The console's driver (GameOS
+/// `xgs12_10.dll` +0x68170) waits for each of its rings to go idle, saves
+/// the queue's state and tells the kernel, returning `S_OK` (`E_FAIL` only
+/// when the device was never configured). Here: what the title has given
+/// its queues goes to the card, and what waits on reached fences runs.
+extern "system" fn suspend(_: This, _flags: u32) -> HRESULT {
+    #[cfg(windows)]
+    {
+        before_sync();
+        release_held(false);
+    }
+    S_OK
+}
+
+/// Queue method 0xd8: the driver (+0x1b5f0) kicks the queue's ring
+/// (+0x4570), sending what it holds to the GPU. Here: what the title gave
+/// its queues goes to the card.
+extern "system" fn flush(_: This) {
+    #[cfg(windows)]
+    before_sync();
+}
+
+/// Queue method 0xc0, `ResumeX()`: the driver (+0x67d00) asks the kernel to
+/// resume the rings and returns `S_OK`; nothing here was stopped.
+extern "system" fn resume(_: This) -> HRESULT {
+    S_OK
+}
+
+static FUNCTIONS: Table<40> = Table(queue_table(false));
+pub(crate) static NEWER_FUNCTIONS: Table<40> = Table(queue_table(true));
 
 #[cfg(test)]
 mod tests {
