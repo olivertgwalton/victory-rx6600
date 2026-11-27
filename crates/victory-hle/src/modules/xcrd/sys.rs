@@ -47,6 +47,8 @@ pub struct Sys {
     pub rtl_query_wnf_state_data: unsafe extern "system" fn(*mut u32, u64, *const std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void) -> i32,
     pub rtl_subscribe_wnf: unsafe extern "system" fn(*mut *mut std::ffi::c_void, u64, u32, *const std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void, u32, u32) -> i32,
     pub rtl_unsubscribe_wnf: unsafe extern "system" fn(*mut std::ffi::c_void) -> i32,
+    /// `NtQueryVolumeInformationFile` (handle, status block, buffer, length, class).
+    pub nt_query_volume_information_file: unsafe extern "system" fn(Handle, *mut IoStatus, *mut c_void, u32, u32) -> i32,
 }
 
 unsafe extern "system" fn create_file_w(
@@ -140,6 +142,10 @@ unsafe extern "system" fn rtl_unsubscribe_wnf(subscription: *mut std::ffi::c_voi
     host!("ntdll.dll", "RtlUnsubscribeWnfNotificationWaitForCompletion": extern "system" fn(*mut std::ffi::c_void) -> i32)(subscription)
 }
 
+unsafe extern "system" fn nt_query_volume_information_file(file: Handle, io: *mut IoStatus, buffer: *mut c_void, length: u32, class: u32) -> i32 {
+    host!("ntdll.dll", "NtQueryVolumeInformationFile": extern "system" fn(Handle, *mut IoStatus, *mut c_void, u32, u32) -> i32)(file, io, buffer, length, class)
+}
+
 pub const HOST: Sys = Sys {
     create_file_w,
     nt_device_io_control_file,
@@ -153,6 +159,7 @@ pub const HOST: Sys = Sys {
     rtl_query_wnf_state_data,
     rtl_subscribe_wnf,
     rtl_unsubscribe_wnf,
+    nt_query_volume_information_file,
 };
 
 static SYS: RwLock<Sys> = RwLock::new(HOST);

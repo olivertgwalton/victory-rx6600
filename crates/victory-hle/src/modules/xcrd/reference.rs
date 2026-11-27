@@ -144,6 +144,24 @@ unsafe extern "system" fn fake_device_io_control(
     }
 }
 
+/// Volume queries reach the driver's answer as code `0xffff_0000 | class`,
+/// no input, the buffer to fill. A failure also sets the thread's last
+/// error (the library reads it), so both sides see the same one.
+pub const VOLUME_QUERY: u32 = 0xffff_0000;
+
+unsafe extern "system" fn fake_query_volume(file: Handle, io: *mut IoStatus, buffer: *mut c_void, length: u32, class: u32) -> i32 {
+    let status = answer(file, VOLUME_QUERY | class, std::ptr::null(), 0, buffer, length);
+    if !io.is_null() {
+        // SAFETY: the caller's status block.
+        unsafe { io.write(IoStatus { status: status as u32 as usize, information: length as usize }) };
+    }
+    if status < 0 {
+        // SAFETY: plain.
+        unsafe { windows_sys::Win32::Foundation::SetLastError(sys::dos_error(status)) };
+    }
+    status
+}
+
 unsafe extern "system" fn fake_close_handle(handle: Handle) -> i32 {
     if (handle as usize) >= FAKE {
         driver().record.closed.push(handle as usize);
@@ -223,6 +241,7 @@ const FAKE_SYS: Sys = Sys {
     rtl_query_wnf_state_data: fake_query_wnf,
     rtl_subscribe_wnf: fake_subscribe_wnf,
     rtl_unsubscribe_wnf: fake_unsubscribe_wnf,
+    nt_query_volume_information_file: fake_query_volume,
     ..sys::HOST
 };
 
@@ -263,7 +282,8 @@ fn load() -> Option<Library> {
 /// `base` is a loaded PE module.
 unsafe fn patch_imports(base: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let fakes: [(&str, usize); 11] = [
+    let fakes: [(&str, usize); 12] = [
+        ("NtQueryVolumeInformationFile", fake_query_volume as *const () as usize),
         ("RtlQueryWnfStateData", fake_query_wnf as *const () as usize),
         ("RtlSubscribeWnfStateChangeNotification", fake_subscribe_wnf as *const () as usize),
         ("RtlUnsubscribeWnfNotificationWaitForCompletion", fake_unsubscribe_wnf as *const () as usize),

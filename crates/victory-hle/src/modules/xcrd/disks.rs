@@ -107,7 +107,9 @@ pub(crate) fn device(disk: u32, address: &Address) -> Result<*mut Device, HRESUL
     let name = format!("\\\\?\\GLOBALROOT\\Device\\Harddisk{disk}\\Partition1");
     let h = open(&name, 0x80, 0);
     if h == INVALID {
-        return Err(hresult_from_win32(sys::last_error()));
+        // No last error: success, and no device.
+        let hr = hresult_from_win32(sys::last_error());
+        return if hr < 0 { Err(hr) } else { Ok(std::ptr::null_mut()) };
     }
     let result = (|| {
         if !device_io_control(h, 0x7_0024, &[], &mut []) {
@@ -205,7 +207,97 @@ pub extern "system" fn XCrdQueryDevicePathByPath(adapter: *const Adapter, path: 
     }
 }
 
+/// `GetLastError` as the library maps it after a failed system call.
+fn last_hresult() -> HRESULT {
+    hresult_from_win32(sys::last_error())
+}
+
+/// 0x180006300: grows a mounted XVD to `size` bytes: the driver resizes the
+/// file, then the disk's properties are refreshed, its first partition
+/// grown by `size` and its volume extended by `size` in sectors. A failed
+/// system call that leaves no last error does not stop it.
+pub extern "system" fn XCrdResizeXVD(adapter: *const Adapter, path: *const u16, size: i64) -> HRESULT {
+    use super::srb::{check, copy_string};
+    if let Err(hr) = check(!adapter.is_null(), "Invalid Adapter Handle.\n").and_then(|_| check(size > 0, "Invalid resize size.\n")) {
+        return hr;
+    }
+    let mut device = std::ptr::null_mut();
+    let hr = XCrdQueryDevicePathByPath(adapter, path, &mut device);
+    if hr < 0 {
+        heap_free(device.cast());
+        return hr;
+    }
+    let s = sys();
+    // SAFETY: the device path just built; read and write, shared both ways,
+    // existing.
+    let file = unsafe { (s.create_file_w)(device, 0xc000_0000, 3, std::ptr::null(), 3, 0, std::ptr::null_mut()) };
+    let invalid = file as isize == -1;
+    let hr = (|| {
+        if invalid && last_hresult() < 0 {
+            return last_hresult();
+        }
+        // FILE_FS_SIZE_INFORMATION: total units, available, sectors per
+        // unit, bytes per sector.
+        let mut info = [0u8; 0x18];
+        let mut io = sys::IoStatus::default();
+        // SAFETY: our buffer and status block.
+        if unsafe { (s.nt_query_volume_information_file)(file, &mut io, info.as_mut_ptr().cast(), 0x18, 3) } < 0 && last_hresult() < 0 {
+            return last_hresult();
+        }
+        // SAFETY: checked non-null by the device-path lookup.
+        let name = unsafe { wide(path) };
+        let n = name.len() * 2;
+        let mut p = Payload::new(0x7800_00a0, n + 0x1a);
+        p.u32(0, (n + 0x1a) as u32);
+        p.u32(4, 0x18);
+        p.u32(8, n as u32);
+        p.u64(0x10, size as u64);
+        let status = copy_string(p.body(), 0x18, n + 2, name);
+        if status < 0 {
+            return status;
+        }
+        let mut hr = send(handle_of(adapter), &mut p);
+        if hr < 0 {
+            return hr;
+        }
+        let mut returned = 0u32;
+        // SAFETY: the volume's handle; no buffers. IOCTL_DISK_UPDATE_PROPERTIES.
+        if unsafe { (s.device_io_control)(file, 0x7_0140, std::ptr::null(), 0, std::ptr::null_mut(), 0, &mut returned, std::ptr::null_mut()) } == 0 {
+            hr = last_hresult();
+            if hr < 0 {
+                return hr;
+            }
+        }
+        // DISK_GROW_PARTITION {partition 1, bytes to grow}.
+        let mut grow = [0u8; 16];
+        grow[0] = 1;
+        grow[8..].copy_from_slice(&size.to_le_bytes());
+        // SAFETY: our buffer. IOCTL_DISK_GROW_PARTITION.
+        if unsafe { (s.device_io_control)(file, 0x7_c0d0, grow.as_ptr().cast(), 16, std::ptr::null_mut(), 0, std::ptr::null_mut(), std::ptr::null_mut()) } == 0 {
+            hr = last_hresult();
+            if hr < 0 {
+                return hr;
+            }
+        }
+        let total = u64::from_le_bytes(info[0..8].try_into().unwrap());
+        let sector = u32::from_le_bytes(info[0x14..0x18].try_into().unwrap()) as u64;
+        // The library divides unchecked (a zero sector size faults there).
+        let sectors = (size as u64).checked_div(sector).unwrap_or(0).wrapping_add(total);
+        // SAFETY: our value. FSCTL_EXTEND_VOLUME.
+        if unsafe { (s.device_io_control)(file, 0x9_00f0, (&sectors as *const u64).cast(), 8, std::ptr::null_mut(), 0, std::ptr::null_mut(), std::ptr::null_mut()) } == 0 {
+            hr = last_hresult();
+        }
+        hr
+    })();
+    if !invalid {
+        // SAFETY: the handle we opened.
+        unsafe { (s.close_handle)(file) };
+    }
+    heap_free(device.cast());
+    hr
+}
+
 pub(crate) fn exports() -> Vec<crate::HleExport> {
     use crate::hle_export;
-    vec![hle_export!(XCrdQueryDevicePath), hle_export!(XCrdQueryDevicePathByPath)]
+    vec![hle_export!(XCrdQueryDevicePath), hle_export!(XCrdQueryDevicePathByPath), hle_export!(XCrdResizeXVD)]
 }

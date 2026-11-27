@@ -1007,6 +1007,231 @@ pub extern "system" fn XCrdStreamingStart(
     })())
 }
 
+/// The caller's optional outs, zeroed when given.
+fn zero<T: Default>(out: *mut T) {
+    if !out.is_null() {
+        // SAFETY: the caller's, checked non-null.
+        unsafe { *out = T::default() };
+    }
+}
+
+fn store<T>(out: *mut T, value: T) {
+    if !out.is_null() {
+        // SAFETY: as above.
+        unsafe { *out = value };
+    }
+}
+
+fn spec_pairs<'a>(count: u32, specs: *const [*const u16; 2]) -> Vec<(&'a [u16], &'a [u16])> {
+    // SAFETY: `count` pairs of strings.
+    (0..count as usize).map(|i| unsafe { let s = *specs.add(i); (text(s[0]), text(s[1])) }).collect()
+}
+
+fn spec_size(pairs: &[(&[u16], &[u16])]) -> u32 {
+    pairs.iter().fold(0u32, |n, (a, b)| n.wrapping_add(((a.len() + b.len()) * 2 + 4) as u32))
+}
+
+/// 0x18000a0e0: updates a base XVC from an updated one (control 0x30, as
+/// streaming). Flag 1 asks only the update's size, 2 a hybrid update, 8
+/// specifier selection (not with 2), 0x10 another mode; the size and free
+/// space come back, and a byte and a value whatever the driver said.
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn XCrdUpdateXvc(
+    adapter: *const Adapter,
+    base: *const u16,
+    updated: *const u16,
+    extra: *const u16,
+    count: u32,
+    specs: *const [*const u16; 2],
+    flags: u32,
+    update_size: *mut u64,
+    free_space: *mut u64,
+    out8: *mut u8,
+    out32: *mut u32,
+) -> HRESULT {
+    zero(out8);
+    zero(out32);
+    zero(free_space);
+    result((|| {
+        check(!adapter.is_null(), "Invalid Adapter Handle\n")?;
+        check(!base.is_null(), "BaseXvcPath must be specified\n")?;
+        check(!updated.is_null(), "UpdatedXvcPath must be specified\n")?;
+        check(flags & 0xffff_ffc4 == 0, "Invalid Flags\n")?;
+        check(flags & 0xa != 0xa, "Cannot combine XCRD_UPDATE_XVC_FLAG_SPECIFIER_UPDATE with HYBRID flags\n")?;
+        check(flags & 3 == 0 || !update_size.is_null() || !free_space.is_null(), "UpdateSize and FreeSpaceRequired cannot be null\n")?;
+        if count == 0 {
+            check(specs.is_null(), "Specifiers must be NULL if zero specifiers are passed\n")?;
+        } else {
+            check(!specs.is_null(), "Specifiers must not be NULL\n")?;
+        }
+        let (base, updated) = (text(base), text(updated));
+        let extra = (!extra.is_null()).then(|| text(extra));
+        let pairs = spec_pairs(count, specs);
+        let mut size = ((base.len() + updated.len()) as u32).wrapping_mul(2).wrapping_add(0x6c);
+        if let Some(e) = extra {
+            size = size.wrapping_add((e.len() * 2 + 2) as u32);
+        }
+        size = size.wrapping_add(count.wrapping_shl(4)).wrapping_add(spec_size(&pairs));
+        check(size as usize <= super::srb::MAX_BODY, "Payload too large for XVIO\n")?;
+        let mut p = Payload::new(0x7800_0030, size as usize);
+        p.u32(0, 0x68);
+        p.u32(4, (updated.len() * 2) as u32);
+        let base_at = updated.len() * 2 + 0x6a;
+        p.u32(8, base_at as u32);
+        p.u32(0xc, (base.len() * 2) as u32);
+        let mut cursor = base_at + 2 + base.len() * 2;
+        if let Some(e) = extra {
+            p.u32(0x48, (e.len() * 2) as u32);
+            if !e.is_empty() {
+                p.u32(0x44, cursor as u32);
+                cursor += e.len() * 2 + 2;
+            }
+        }
+        if count != 0 {
+            p.u32(0x34, count);
+            p.u32(0x2c, cursor as u32);
+            p.u32(0x30, count.wrapping_shl(4));
+        }
+        for (at, s) in [(0x68, updated), (base_at, base)] {
+            let status = copy_string(p.body(), at, s.len() * 2 + 2, s);
+            if status < 0 {
+                return Ok(status);
+            }
+        }
+        if let Some(e) = extra.filter(|e| !e.is_empty()) {
+            let at = p.read_u32(0x44) as usize;
+            let status = copy_string(p.body(), at, e.len() * 2 + 2, e);
+            if status < 0 {
+                return Ok(status);
+            }
+        }
+        if count != 0 {
+            let table = p.read_u32(0x2c) as usize;
+            let strings = table + p.read_u32(0x30) as usize;
+            if let Err(status) = specifier_table(&mut p, table, strings, 0x30, &pairs) {
+                return Ok(status);
+            }
+        }
+        let mut mode: u64 = if flags & 1 != 0 { 2 } else if flags & 2 != 0 { 4 } else { 1 };
+        if flags & 8 != 0 {
+            mode |= 0x20;
+        }
+        if flags & 0x10 != 0 {
+            mode |= 0x2000;
+        }
+        p.u64(0x10, mode);
+        let hr = send(handle_of(adapter), &mut p);
+        let b = &p.bytes[super::srb::HEADER..];
+        let q = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        if hr >= 0 {
+            store(update_size, q(0x18));
+        }
+        store(out8, b[0x28]);
+        store(out32, q(0x40) as u32);
+        store(free_space, q(0x38));
+        Ok(hr)
+    })())
+}
+
+/// 0x18000a560 (control 0x110): action 0 sizes the update (both outs
+/// needed), 1 applies it, anything else (negative too) a third action;
+/// flag 0x10 is the only flag.
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn XCrdUpdateXvcEx(
+    adapter: *const Adapter,
+    base: *const u16,
+    updated: *const u16,
+    extra: *const u16,
+    count: u32,
+    specs: *const [*const u16; 2],
+    action: i32,
+    flags: u32,
+    update_size: *mut u64,
+    free_space: *mut u64,
+    out32: *mut u32,
+) -> HRESULT {
+    zero(out32);
+    zero(free_space);
+    result((|| {
+        check(!adapter.is_null(), "Invalid Adapter Handle\n")?;
+        check(!base.is_null(), "BaseXvcPath must be specified\n")?;
+        check(!updated.is_null(), "UpdatedXvcPath must be specified\n")?;
+        check(action < 3, "Invalid update action\n")?;
+        if action == 0 {
+            check(!update_size.is_null(), "UpdateSize cannot be null\n")?;
+            check(!free_space.is_null(), "FreeSpaceRequired cannot be null\n")?;
+        }
+        check(flags & 0xffff_ffef == 0, "Invalid flags\n")?;
+        if count == 0 {
+            check(specs.is_null(), "Specifiers must be NULL\n")?;
+        } else {
+            check(!specs.is_null(), "Specifiers must not be NULL\n")?;
+        }
+        let (base, updated) = (text(base), text(updated));
+        let extra = (!extra.is_null()).then(|| text(extra));
+        let pairs = spec_pairs(count, specs);
+        let mut size = ((base.len() + updated.len()) as u32).wrapping_mul(2).wrapping_add(0x4c);
+        if let Some(e) = extra {
+            size = size.wrapping_add((e.len() * 2 + 2) as u32);
+        }
+        size = size.wrapping_add(count.wrapping_shl(4)).wrapping_add(spec_size(&pairs));
+        check(size as usize <= super::srb::MAX_BODY, "Payload too large for XVIO\n")?;
+        let mut p = Payload::new(0x7800_0110, size as usize);
+        p.u32(0x24, match action { 0 => 0, 1 => 1, _ => 2 });
+        if flags & 0x10 != 0 {
+            p.u32(0x28, 1);
+        }
+        p.u32(0, 0x48);
+        p.u32(4, (base.len() * 2) as u32);
+        let updated_at = base.len() * 2 + 0x4a;
+        p.u32(8, updated_at as u32);
+        p.u32(0xc, (updated.len() * 2) as u32);
+        let mut cursor = updated_at + 2 + updated.len() * 2;
+        if let Some(e) = extra {
+            p.u32(0x14, (e.len() * 2) as u32);
+            if !e.is_empty() {
+                p.u32(0x10, cursor as u32);
+                cursor += e.len() * 2 + 2;
+            }
+        }
+        if count != 0 {
+            p.u32(0x20, count);
+            p.u32(0x18, cursor as u32);
+            p.u32(0x1c, count.wrapping_shl(4));
+        }
+        for (at, s) in [(0x48, base), (updated_at, updated)] {
+            let status = copy_string(p.body(), at, s.len() * 2 + 2, s);
+            if status < 0 {
+                return Ok(status);
+            }
+        }
+        if let Some(e) = extra {
+            // An empty string is copied too: its NUL lands at offset 0.
+            let (at, cap) = (p.read_u32(0x10) as usize, p.read_u32(0x14) as usize + 2);
+            let status = copy_string(p.body(), at, cap, e);
+            if status < 0 {
+                return Ok(status);
+            }
+        }
+        if count != 0 {
+            let table = p.read_u32(0x18) as usize;
+            let strings = table + p.read_u32(0x1c) as usize;
+            if let Err(status) = specifier_table(&mut p, table, strings, 0x1c, &pairs) {
+                return Ok(status);
+            }
+        }
+        let hr = send(handle_of(adapter), &mut p);
+        let b = &p.bytes[super::srb::HEADER..];
+        let q = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        if hr >= 0 {
+            store(update_size, q(0x30));
+        }
+        store(free_space, q(0x38));
+        store(out32, q(0x40) as u32);
+        Ok(hr)
+    })())
+}
+
 pub(crate) fn exports() -> Vec<crate::HleExport> {
     use crate::hle_export;
     vec![
@@ -1030,6 +1255,8 @@ pub(crate) fn exports() -> Vec<crate::HleExport> {
         hle_export!(XCrdCreateXVD),
         hle_export!(XCrdCreateXvdPointer),
         hle_export!(XCrdStreamingStart),
+        hle_export!(XCrdUpdateXvc),
+        hle_export!(XCrdUpdateXvcEx),
         hle_export!(XCrdSetFlatContentPath),
         hle_export!(XCrdStorageQueryBlobAttributes),
         hle_export!(XCrdStreamingAdjustStreamingFlags),

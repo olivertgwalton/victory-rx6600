@@ -65,8 +65,8 @@ fn same<T: std::fmt::Debug + PartialEq>(what: &str, ((r, rr), (l, lr)): ((T, Rec
     if std::env::var_os("VICTORY_FUZZ_TRACE").is_some() {
         eprintln!("{what}: done");
     }
-    assert_eq!(r, l, "{what}: result");
     assert_eq!(rr, lr, "{what}: what the driver saw");
+    assert_eq!(r, l, "{what}: result");
 }
 
 // Fixed values, from the library's code.
@@ -1390,7 +1390,12 @@ fn machine(s: &Session, disk: u32, refuse: &'static str) {
         }
         if name.contains("Harddisk") { Ok(FAKE + 0x400) } else { Err(2) }
     });
-    s.reply(move |call, b| {
+    s.reply(machine_reply(disk));
+}
+
+/// The machine's answers to the device-path lookups.
+fn machine_reply(disk: u32) -> impl FnMut(&reference::Call, &mut [u8]) -> i32 + Send + 'static {
+    move |call, b| {
         let drive = (call.handle.wrapping_sub(FAKE + 0x100) / 2) as u32;
         match call.code {
             srb::IOCTL_SCSI_MINIPORT => {
@@ -1412,7 +1417,7 @@ fn machine(s: &Session, disk: u32, refuse: &'static str) {
             0x56_001c => { b[..4].copy_from_slice(&0x4242u32.to_le_bytes()); 0 }
             _ => 0xc000_0010_u32 as i32,
         }
-    });
+    }
 }
 
 #[test]
@@ -1605,4 +1610,102 @@ fn streaming_start() {
             }
         }
     }
+}
+
+type Update = extern "system" fn(*const Adapter, *const u16, *const u16, *const u16, u32, *const [*const u16; 2], u32, *mut u64, *mut u64, *mut u8, *mut u32) -> HRESULT;
+type UpdateEx = extern "system" fn(*const Adapter, *const u16, *const u16, *const u16, u32, *const [*const u16; 2], i32, u32, *mut u64, *mut u64, *mut u32) -> HRESULT;
+
+#[test]
+fn update_xvc() {
+    let s = session();
+    trace_all(&s);
+    let (r, l) = both!("XCrdUpdateXvc": Update);
+    let (rx, lx) = both!("XCrdUpdateXvcEx": UpdateEx);
+    let a = adapter();
+    let (base, upd, extra, empty) = (wz("[XUC:]\\\\base.xvc"), wz("[XTE:]\\upd.xvc"), wz("extra-name"), wz(""));
+    let words: Vec<Vec<u16>> = ["", "en-US", "chunk"].iter().map(|x| wz(x)).collect();
+    let specs: Vec<[*const u16; 2]> = (0..3).map(|i| [words[i % 3].as_ptr(), words[(i + 2) % 3].as_ptr()]).collect();
+    let flag_cases: Vec<u32> = (0..8).map(|b| 1u32 << b).chain([0, 3, 0xa, 0x19, 0x1b, 0x3b, 0x8000_0000]).collect();
+    // opt bits: 1 base, 2 updated, 4 extra, 8 extra empty, 16 size out, 32 free out, 64 small outs, 128 specs with count 0
+    let opts = [0b111_0111u32, 0b111_0011, 0b111_1111, 0b000_0011, 0b001_0011, 0b010_0011, 0b000_0001, 0b000_0010, 0b1000_0011, 0b111_0110];
+    let ptr = |on: bool, v: &Vec<u16>| if on { v.as_ptr() } else { std::ptr::null() };
+    for opt in opts {
+        for count in [0u32, 1, 3] {
+            let sp = if count != 0 || opt & 128 != 0 { specs.as_ptr() } else { std::ptr::null() };
+            let x = if opt & 8 != 0 { empty.as_ptr() } else { ptr(opt & 4 != 0, &extra) };
+            let call = |f: &dyn Fn(*mut u64, *mut u64, *mut u8, *mut u32) -> HRESULT| {
+                let (mut us, mut fs, mut o8, mut o32) = (0xccccu64, 0xccccu64, 0xccu8, 0xccccu32);
+                let hr = f(if opt & 16 != 0 { &mut us } else { std::ptr::null_mut() }, if opt & 32 != 0 { &mut fs } else { std::ptr::null_mut() }, if opt & 64 != 0 { &mut o8 } else { std::ptr::null_mut() }, if opt & 64 != 0 { &mut o32 } else { std::ptr::null_mut() });
+                (hr, us, fs, o8, o32)
+            };
+            for flags in &flag_cases {
+                for (what, driver) in drivers(&[]) {
+                    same(&format!("update {flags:#x} {opt:b} {count} {what}"), run(&s, |s| driver(s), |side| {
+                        let f = if side { r } else { l };
+                        call(&|us, fs, o8, o32| f(&a, ptr(opt & 1 != 0, &base), ptr(opt & 2 != 0, &upd), x, count, sp, *flags, us, fs, o8, o32))
+                    }));
+                }
+            }
+            for action in [0i32, 1, 2, 3, -1] {
+                for flags in [0u32, 0x10, 1, 0x8000_0010] {
+                    for (what, driver) in drivers(&[]) {
+                        same(&format!("ex {action} {flags:#x} {opt:b} {count} {what}"), run(&s, |s| driver(s), |side| {
+                            let f = if side { rx } else { lx };
+                            call(&|us, fs, _, o32| f(&a, ptr(opt & 1 != 0, &base), ptr(opt & 2 != 0, &upd), x, count, sp, action, flags, us, fs, o32))
+                        }));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn resize_xvd() {
+    let s = session();
+    trace_all(&s);
+    let (r, l) = both!("XCrdResizeXVD": extern "system" fn(*const Adapter, *const u16, i64) -> HRESULT);
+    let a = adapter();
+    let p = wz("[XUC:]\\mounted.xvd");
+    // fail: 0 none, 1 volume query, 2 the resize block, 3 update properties, 4 grow, 5 extend, 6 open (error 5), 7 open (no error)
+    for fail in 0..8u32 {
+        for size in [0x10_0000i64, 0, -1, 0x7fff_ffff_ffff_ffff, 0x1234_5678] {
+            same(&format!("fail {fail} size {size:#x}"), run(&s, |s| {
+                machine(s, 3, "");
+                if fail >= 6 {
+                    let error = if fail == 6 { 5 } else { 0 };
+                    s.open(move |name| {
+                        if let Some(n) = name.strip_prefix("\\\\.\\PhysicalDrive") {
+                            let n: u32 = n.parse().unwrap();
+                            return if n < 6 { Ok(FAKE + 0x100 + 2 * n as usize) } else { Err(2) };
+                        }
+                        if name.ends_with("Partition1") { Err(error) } else if name.contains("Harddisk") { Ok(FAKE + 0x400) } else { Err(2) }
+                    });
+                }
+                let mut inner = machine_reply(3);
+                s.reply(move |call, b| {
+                    let failing = 0xc000_0022_u32 as i32;
+                    match call.code {
+                        c if c == reference::VOLUME_QUERY | 3 => {
+                            if fail == 1 { return failing }
+                            b[..8].copy_from_slice(&0x1000u64.to_le_bytes());
+                            b[0x10..0x14].copy_from_slice(&8u32.to_le_bytes());
+                            b[0x14..0x18].copy_from_slice(&0x200u32.to_le_bytes());
+                            0
+                        }
+                        srb::IOCTL_SCSI_MINIPORT if u32::from_le_bytes(b[0x10..0x14].try_into().unwrap()) == 0x7800_00a0 => {
+                            b[0x14..0x18].copy_from_slice(&(if fail == 2 { 0xc05e_0003u32 } else { 0 }).to_le_bytes());
+                            0
+                        }
+                        0x7_0140 => if fail == 3 { failing } else { 0 },
+                        0x7_c0d0 => if fail == 4 { failing } else { 0 },
+                        0x9_00f0 => if fail == 5 { failing } else { 0 },
+                        _ => inner(call, b),
+                    }
+                });
+            }, |side| if side { r(&a, p.as_ptr(), size) } else { l(&a, p.as_ptr(), size) }));
+        }
+    }
+    same("null adapter", run(&s, |_| {}, |side| if side { r(std::ptr::null(), p.as_ptr(), 1) } else { l(std::ptr::null(), p.as_ptr(), 1) }));
+    same("null path", run(&s, |_| {}, |side| if side { r(&a, std::ptr::null(), 1) } else { l(&a, std::ptr::null(), 1) }));
 }
