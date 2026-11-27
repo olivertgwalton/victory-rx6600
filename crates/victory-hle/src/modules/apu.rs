@@ -946,6 +946,135 @@ mod console_checks {
 }
 
 #[cfg(test)]
+mod commands {
+    use super::*;
+    use opus_pure::{Application, OpusEncoder};
+
+    fn id(kind: u32) -> CommandId {
+        CommandId {
+            kind,
+            stream: 1,
+            sequence: 9,
+            options: 0,
+            context: 0xfeed,
+        }
+    }
+
+    fn take(handle: *mut Connection) -> ApuResult {
+        let mut r = std::mem::MaybeUninit::<ApuResult>::zeroed();
+        assert_eq!(XApuDequeueResult(handle, r.as_mut_ptr()), S_OK);
+        // SAFETY: written above.
+        unsafe { r.assume_init() }
+    }
+
+    /// Reset, a missing packet, buffers outside the connection memory,
+    /// unknown command kinds, result counts and the null handle.
+    #[test]
+    fn commands_as_xapu_checks_them() {
+        let input = ConnectInput {
+            process: DECODE_OPUS,
+            streams: 2,
+            commands_per_stream: 4,
+            memory: 0x4_0000,
+            frames_per_output: 0,
+            options: 0,
+        };
+        let mut output = ConnectOutput {
+            memory: std::ptr::null_mut(),
+            result_event: std::ptr::null_mut(),
+        };
+        let mut handle = std::ptr::null_mut();
+        assert_eq!(XApuConnect(&input, &mut output, &mut handle), S_OK);
+        let base = output.memory.cast::<u8>();
+        // Commands other than activate, deactivate, process and reset,
+        // notify (4) included, are refused (0x180003294).
+        for kind in [0, 4, 6] {
+            assert_eq!(XApuEnqueueCommand(handle, &id(kind), std::ptr::null_mut()), E_INVALIDARG);
+        }
+        // Reset and process need an active stream; streams past the
+        // connection's are invalid.
+        assert_eq!(XApuEnqueueCommand(handle, &id(RESET), std::ptr::null_mut()), INVALID_STREAM);
+        let mut far = id(ACTIVATE);
+        far.stream = 2;
+        assert_eq!(XApuEnqueueCommand(handle, &far, std::ptr::null_mut()), INVALID_STREAM);
+        let activate = Activate {
+            id: id(ACTIVATE),
+            channels: 1,
+            init_length: 0,
+            init: std::ptr::null(),
+            start_pitch: 1.0,
+            processing_length: 0,
+            processing: std::ptr::null_mut(),
+        };
+        assert_eq!(XApuEnqueueCommand(handle, (&raw const activate).cast(), std::ptr::null_mut()), S_OK);
+        assert_eq!({ take(handle).error }, S_OK);
+        let tone: Vec<f32> = (0..960).map(|i| (i as f32 * 0.07).sin() * 0.5).collect();
+        let mut encoder = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+        let mut packet = [0u8; 1500];
+        let n = encoder.encode(&tone, 960, &mut packet).unwrap();
+        // SAFETY: inside the connection memory.
+        unsafe { std::ptr::copy_nonoverlapping(packet.as_ptr(), base, n) };
+        let process = |input: *const u8, output: *mut u8| Process {
+            id: id(PROCESS),
+            pitch_ramp: 0.0,
+            target_pitch: 1.0,
+            first_frame: 0,
+            frame_count: 960,
+            input_length: n as u32,
+            input,
+            output_length: 960 * 4,
+            output,
+        };
+        let out = base.wrapping_add(0x1_0000);
+        let mut total = 0;
+        for cmd in [process(base, out), process(std::ptr::null(), out)] {
+            assert_eq!(XApuEnqueueCommand(handle, (&raw const cmd).cast(), &mut total), S_OK);
+        }
+        // Two results ready, one dequeued so far.
+        let mut dequeued = 0;
+        assert_eq!(XApuGetResultCount(handle, &mut dequeued), 2);
+        assert_eq!((dequeued, total), (1, 3));
+        let decoded = take(handle);
+        let (e, f, c) = (decoded.error, decoded.frames, decoded.id.context);
+        assert_eq!((e, f, c), (S_OK, 960, 0xfeed));
+        // No packet: the frames are concealed, as many as asked for.
+        let concealed = take(handle);
+        let (e, f, inp) = (concealed.error, concealed.frames, concealed.input);
+        assert_eq!((e, f), (S_OK, 960));
+        assert!(inp.is_null());
+        // A packet outside the connection memory reaches the decoder as
+        // none; an output outside it fails.
+        let stray = [0u8; 8];
+        let outside = vec![0u8; 960 * 4];
+        let cmd = process(stray.as_ptr(), out);
+        assert_eq!(XApuEnqueueCommand(handle, (&raw const cmd).cast(), &mut total), S_OK);
+        let r = take(handle);
+        let (e, inp) = (r.error, r.input);
+        assert_eq!(e, S_OK);
+        assert!(inp.is_null());
+        let cmd = process(base, outside.as_ptr().cast_mut());
+        assert_eq!(XApuEnqueueCommand(handle, (&raw const cmd).cast(), &mut total), S_OK);
+        assert_eq!({ take(handle).error }, E_INVALIDARG);
+        // Reset keeps the stream active.
+        assert_eq!(XApuEnqueueCommand(handle, &id(RESET), &mut total), S_OK);
+        assert_eq!({ take(handle).id.kind }, RESET);
+        let cmd = process(base, out);
+        assert_eq!(XApuEnqueueCommand(handle, (&raw const cmd).cast(), &mut total), S_OK);
+        assert_eq!({ take(handle).frames }, 960);
+        // Nothing left; null handles.
+        let mut r = std::mem::MaybeUninit::<ApuResult>::zeroed();
+        assert_eq!(XApuDequeueResult(handle, r.as_mut_ptr()), PENDING_RESULTS);
+        assert_eq!(XApuGetResultCount(std::ptr::null_mut(), std::ptr::null_mut()), 0);
+        assert_eq!(XApuDisconnect(std::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(XApuDisconnect(handle), S_OK);
+        let mut u = Utilization { available: 1, total: 1 };
+        assert_eq!(XApuGetUtilization(1, 3, &mut u), E_INVALIDARG);
+        assert_eq!((u.available, u.total), (0, 0));
+        assert_eq!(XApuGetUtilization(1, 1, std::ptr::null_mut()), E_POINTER);
+    }
+}
+
+#[cfg(test)]
 mod bench {
     use super::*;
     use opus_pure::{Application, OpusEncoder};
