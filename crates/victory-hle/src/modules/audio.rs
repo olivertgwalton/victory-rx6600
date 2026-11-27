@@ -17,7 +17,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::Layout;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 use std::time::Instant;
@@ -36,194 +36,517 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-// The APU heap.
+// The APU heap, as `AcpHal.dll` keeps it.
+//
+// Opening the device (on the first allocation, mapping, free or context
+// request) makes three heaps of device memory: heap 1 ("cached", 64 MiB
+// unless `ApuCreateHeap` said otherwise), heap 2 (the non-cached size, by
+// default 0x114000, plus 8 KiB) and an internal 4 KiB one; then takes three
+// blocks from heap 1 for itself (0x1000 bytes, then two of 256). A heap is
+// an address-ordered list of blocks. An allocation rounds an alignment
+// below 256 up to 256 and its size up to the alignment, takes the smallest
+// free block that holds it at that alignment of its device address
+// (stopping at an exact fit), and splits off the rest. The padding before
+// the aligned address is up to the next multiple of the alignment strictly
+// above the block's start, so a block already aligned gives up one whole
+// alignment. Freeing merges a
+// block with free neighbours. The heap counts free bytes, bytes asked for,
+// alignment padding, the largest free block (recomputed only when that
+// block is taken) and blocks in use, which `ApuHeapGetState` reports. When
+// the last block a title took is freed and no interface is connected, the
+// device closes, and `ApuCreateHeap` may size it again.
+//
+// The heaps' device addresses are ours to choose: heap 1 starts at 64 KiB,
+// each next one at the following 64 KiB boundary.
 
+const ALREADY_OPEN: HRESULT = 0x8ACA_0001_u32 as i32;
+const NO_HEAP: HRESULT = 0x8ACA_0002_u32 as i32;
+const CONTEXTS_ALLOCATED: HRESULT = 0x8AC8_0001_u32 as i32;
+const NO_CONTEXTS: HRESULT = 0x8AC8_0002_u32 as i32;
+const STILL_CONNECTED: HRESULT = 0x8AC8_0010_u32 as i32;
+
+const CACHED_DEFAULT: u32 = 0x400_0000;
+const NON_CACHED_DEFAULT: u32 = 0x11_4000;
+/// The heaps' first device address.
+const APU_BASE: u64 = 0x1_0000;
+/// Blocks the device takes from heap 1 when it opens.
+const DEVICE_BLOCKS: u32 = 3;
+
+#[derive(Clone, Copy, Debug)]
 struct Block {
-    size: usize,
+    /// Bytes from the block's start to the next block's.
+    size: u32,
+    /// Bytes asked for, rounded up to the alignment.
+    asked: u32,
+    /// The block's start, as an offset into the heap.
+    start: u32,
+    /// The address handed out (host and device offsets are the same), or
+    /// `None` for a block never handed out since it was split off.
+    user: Option<u32>,
+    used: bool,
+}
+
+/// What `ApuHeapGetState` copies out.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HeapState {
+    free: u32,
+    used: u32,
+    overhead: u32,
+    largest: u32,
+    blocks: u32,
+}
+
+struct Arena {
+    host: usize,
     apu: u32,
+    size: u32,
     layout: Layout,
+    blocks: Vec<Block>,
+    state: HeapState,
+    /// The start of the block counted as the largest free one.
+    largest: Option<u32>,
+    /// The largest padding any block has had: how far past its end a
+    /// block in use can still claim addresses (see `claims`).
+    most_pad: u32,
 }
 
-struct Heap {
-    /// By host address.
-    blocks: BTreeMap<usize, Block>,
-    /// Host address by device address.
-    by_apu: BTreeMap<u32, usize>,
-    /// Free device address ranges, start to end, merged with neighbours.
-    free: BTreeMap<u32, u32>,
-    /// Set by `ApuCreateHeap` or the first allocation: the heap exists.
-    created: bool,
+impl Arena {
+    fn new(apu: u32, size: u32) -> Option<Arena> {
+        let layout = Layout::from_size_align(size as usize, 4096).ok()?;
+        // SAFETY: non-zero size (every heap has some).
+        let host = unsafe { std::alloc::alloc_zeroed(layout) } as usize;
+        (host != 0).then(|| Arena {
+            host,
+            apu,
+            size,
+            layout,
+            blocks: vec![Block {
+                size,
+                asked: 0,
+                start: 0,
+                user: None,
+                used: false,
+            }],
+            state: HeapState {
+                free: size,
+                largest: size,
+                ..HeapState::default()
+            },
+            largest: Some(0),
+            most_pad: 0,
+        })
+    }
+
+    fn holds_host(&self, p: usize) -> bool {
+        p.wrapping_sub(self.host) < self.size as usize
+    }
+
+    fn holds_apu(&self, apu: u32) -> bool {
+        apu.wrapping_sub(self.apu) < self.size
+    }
+
+    /// A block of `size` bytes at `align`, as offset into the heap.
+    fn take(&mut self, size: u32, align: u32) -> Option<u32> {
+        let align = if align & 0xff != 0 { (align + 0xff) & !0xff } else { align };
+        let size = if size & (align - 1) != 0 {
+            (size + align - 1) & !(align - 1)
+        } else {
+            size
+        };
+        let mut best: Option<(usize, u32, u32)> = None;
+        for (i, b) in self.blocks.iter().enumerate() {
+            if b.used {
+                continue;
+            }
+            // The console's padding: up to the next multiple strictly above,
+            // so an aligned block gives up a whole alignment.
+            let apu = self.apu as u64 + b.start as u64;
+            let pad = ((apu + align as u64) / align as u64 * align as u64 - apu) as u32;
+            let need = pad.wrapping_add(size);
+            if b.size >= need && best.is_none_or(|(j, _, _)| b.size < self.blocks[j].size) {
+                best = Some((i, pad, need));
+                if b.size == need {
+                    break;
+                }
+            }
+        }
+        let (i, pad, need) = best?;
+        let block = self.blocks[i];
+        if block.size > need {
+            self.blocks.insert(
+                i + 1,
+                Block {
+                    size: block.size - need,
+                    asked: 0,
+                    start: block.start + need,
+                    user: None,
+                    used: false,
+                },
+            );
+        }
+        let user = block.start + pad;
+        self.most_pad = self.most_pad.max(pad);
+        self.blocks[i] = Block {
+            size: need,
+            asked: size,
+            start: block.start,
+            user: Some(user),
+            used: true,
+        };
+        self.state.free -= need;
+        self.state.used += size;
+        self.state.overhead += need - size;
+        if self.largest == Some(block.start) {
+            self.largest = None;
+            self.state.largest = 0;
+            for b in self.blocks.iter().filter(|b| !b.used) {
+                if b.size > self.state.largest {
+                    self.state.largest = b.size;
+                    self.largest = Some(b.start);
+                }
+            }
+        }
+        self.state.blocks += 1;
+        Some(user)
+    }
+
+    /// Frees the block handed out at `user`; false if there is none.
+    fn give_back(&mut self, user: u32) -> bool {
+        let Some(i) = self
+            .blocks
+            .iter()
+            .position(|b| b.used && b.user == Some(user))
+        else {
+            return false;
+        };
+        let block = self.blocks[i];
+        let mut at = i;
+        if let Some(next) = self.blocks.get(i + 1).copied()
+            && !next.used
+        {
+            if self.largest == Some(next.start) {
+                self.largest = Some(block.start);
+            }
+            self.blocks[i].size += next.size;
+            self.blocks.remove(i + 1);
+        }
+        if i > 0 && !self.blocks[i - 1].used {
+            if self.largest == Some(block.start) {
+                self.largest = Some(self.blocks[i - 1].start);
+            }
+            self.blocks[i - 1].size += self.blocks[i].size;
+            self.blocks.remove(i);
+            at = i - 1;
+        } else {
+            self.blocks[i].used = false;
+        }
+        if self.largest.is_none() {
+            self.largest = Some(self.blocks[at].start);
+        }
+        self.state.free += block.size;
+        self.state.used -= block.asked;
+        self.state.overhead -= block.size - block.asked;
+        let largest = self.largest.expect("set above");
+        self.state.largest = self
+            .blocks
+            .iter()
+            .find(|b| b.start == largest)
+            .map_or(0, |b| b.size);
+        self.state.blocks -= 1;
+        true
+    }
+
+    /// The block a heap offset maps through, as the console's walk finds
+    /// it (0x18000547c, 0x180005508): blocks in order, the walk ending at
+    /// the first one handed out above the offset, a block in use claiming
+    /// `size` bytes from its handed-out address (so up to its padding past
+    /// its end). Every handed-out address lies inside its own block, so no
+    /// block before the one holding the offset ends the walk, and only
+    /// blocks within `most_pad` before it can claim it: a binary search and
+    /// a short look back give the walk's answer.
+    fn claims(&self, offset: u32) -> bool {
+        let k = self.blocks.partition_point(|b| b.start <= offset);
+        let Some(k) = k.checked_sub(1) else {
+            return false;
+        };
+        for b in self.blocks[..k].iter().rev() {
+            if b.start + b.size + self.most_pad <= offset {
+                break;
+            }
+            if b.used && offset < b.user.unwrap_or(0) + b.size {
+                return true;
+            }
+        }
+        let b = &self.blocks[k];
+        let user = b.user.unwrap_or(0);
+        !(b.user.is_some() && offset < user) && b.used && offset < user + b.size
+    }
+
+    /// The device address of a host address inside a block in use, 0 if
+    /// none.
+    fn map(&self, p: usize) -> u32 {
+        if !self.holds_host(p) {
+            return 0;
+        }
+        let offset = (p - self.host) as u32;
+        if self.claims(offset) { self.apu + offset } else { 0 }
+    }
+
+    /// The host address of a device address inside a block in use.
+    fn unmap(&self, apu: u32) -> Option<usize> {
+        if !self.holds_apu(apu) {
+            return None;
+        }
+        let offset = apu - self.apu;
+        self.claims(offset).then(|| self.host + offset as usize)
+    }
+
+    /// The console's walk itself, which `claims` must agree with.
+    #[cfg(test)]
+    fn walk(&self, offset: u32) -> bool {
+        for b in &self.blocks {
+            let user = b.user.unwrap_or(0);
+            if offset < user && b.user.is_some() {
+                return false;
+            }
+            if b.used && offset < user + b.size {
+                return true;
+            }
+        }
+        false
+    }
 }
 
-static HEAP: Mutex<Heap> = Mutex::new(Heap {
-    blocks: BTreeMap::new(),
-    by_apu: BTreeMap::new(),
-    free: BTreeMap::new(),
-    created: false,
+impl Drop for Arena {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `Arena::new` with this layout.
+        unsafe { std::alloc::dealloc(self.host as *mut u8, self.layout) };
+    }
+}
+
+/// The SHAPE context arrays the device was given.
+#[derive(Clone, Copy)]
+struct Contexts {
+    /// Offsets of the blocks in heap 2, by array (XMA and PCM share one).
+    blocks: [Option<u32>; 5],
+}
+
+struct Device {
+    cached: u32,
+    non_cached: u32,
+    /// Heaps 1, 2 and the internal one; all `None` while closed.
+    heaps: Option<[Arena; 3]>,
+    contexts: Option<Contexts>,
+    /// Interfaces connected to the coprocessor.
+    connected: u32,
+}
+
+// SAFETY: the arenas' host addresses are plain memory shared with title
+// code; the device's lock guards the bookkeeping.
+unsafe impl Send for Device {}
+
+static DEVICE: Mutex<Device> = Mutex::new(Device {
+    cached: CACHED_DEFAULT,
+    non_cached: NON_CACHED_DEFAULT,
+    heaps: None,
+    contexts: None,
+    connected: 0,
 });
 
-/// Device addresses start above 0, which means "none" to titles.
-const APU_BASE: u32 = 0x0001_0000;
-
-impl Heap {
-    /// First fit in the free ranges.
-    fn take(&mut self, size: u32, align: u32) -> Option<u32> {
-        if self.free.is_empty() && !self.created {
-            self.free.insert(APU_BASE, u32::MAX);
+impl Device {
+    /// Opens the device if it is closed.
+    fn open(&mut self) -> Result<&mut [Arena; 3], HRESULT> {
+        if self.heaps.is_none() {
+            let sizes = [self.cached as u64, self.non_cached as u64 + 0x2000, 0x1000];
+            let mut apu = APU_BASE;
+            let mut heaps = Vec::new();
+            for size in sizes {
+                if apu + size > u32::MAX as u64 {
+                    return Err(E_OUTOFMEMORY);
+                }
+                heaps.push(Arena::new(apu as u32, size as u32).ok_or(E_OUTOFMEMORY)?);
+                apu = (apu + size).next_multiple_of(0x1_0000);
+            }
+            let mut heaps: [Arena; 3] = heaps.try_into().map_err(|_| E_FAIL)?;
+            // The device's own blocks.
+            for (size, align) in [(0x1000, 0x100), (0x14, 4), (8, 4)] {
+                heaps[0].take(size, align).ok_or(E_OUTOFMEMORY)?;
+            }
+            heaps[2].take(0x4c, 4).ok_or(E_OUTOFMEMORY)?;
+            self.heaps = Some(heaps);
         }
-        self.created = true;
-        let (start, end, apu) = self.free.iter().find_map(|(&start, &end)| {
-            let apu = start.checked_next_multiple_of(align)?;
-            (apu.checked_add(size)? <= end).then_some((start, end, apu))
-        })?;
-        self.free.remove(&start);
-        if start < apu {
-            self.free.insert(start, apu);
-        }
-        if apu + size < end {
-            self.free.insert(apu + size, end);
-        }
-        Some(apu)
+        Ok(self.heaps.as_mut().expect("opened above"))
     }
 
-    fn give_back(&mut self, mut start: u32, mut end: u32) {
-        if let Some((&before, &before_end)) = self.free.range(..start).next_back()
-            && before_end == start
+    /// Closes the device once titles hold nothing of it. True if context
+    /// arrays went with it: the caller then resets the XMA decoder, after
+    /// letting go of the device (the decoder reads device memory under its
+    /// own lock).
+    #[must_use]
+    fn close_if_idle(&mut self) -> bool {
+        if self.connected == 0
+            && let Some(heaps) = &self.heaps
+            && heaps[0].state.blocks == DEVICE_BLOCKS
+            && heaps[1].state.blocks == 0
         {
-            self.free.remove(&before);
-            start = before;
+            self.heaps = None;
+            return self.contexts.take().is_some();
         }
-        if let Some(after_end) = self.free.remove(&end) {
-            end = after_end;
-        }
-        self.free.insert(start, end);
+        false
+    }
+
+    /// The heap of a host address: heap 1 if it holds it, else heap 2.
+    fn heap_of_host(heaps: &[Arena; 3], p: usize) -> &Arena {
+        if heaps[0].holds_host(p) { &heaps[0] } else { &heaps[1] }
     }
 }
 
-/// Zeroed host memory and its device address.
-fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
-    let layout = Layout::from_size_align(size.max(1), align.max(16)).ok()?;
-    let mut heap = lock(&HEAP);
-    let apu = heap.take(u32::try_from(layout.size()).ok()?, align as u32)?;
-    // SAFETY: non-zero size.
-    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-    if ptr.is_null() {
-        heap.give_back(apu, apu + layout.size() as u32);
-        return None;
-    }
-    heap.blocks
-        .insert(ptr as usize, Block { size, apu, layout });
-    heap.by_apu.insert(apu, ptr as usize);
-    // The big ones are named in the log: they are the title's audio memory
-    // given out of our allocator, which the memory line counts as ours.
-    if size >= 32 << 20 {
-        tracing::info!(mb = size >> 20, at = ?ptr, "audio memory for the title from our allocator");
-    }
-    Some((ptr, apu))
+fn device() -> MutexGuard<'static, Device> {
+    lock(&DEVICE)
 }
 
-fn heap_free(ptr: *mut u8) {
-    let mut heap = lock(&HEAP);
-    let Some(block) = heap.blocks.remove(&(ptr as usize)) else {
-        return;
-    };
-    heap.by_apu.remove(&block.apu);
-    heap.give_back(block.apu, block.apu + block.layout.size() as u32);
-    drop(heap);
-    // SAFETY: allocated by `heap_alloc` with this layout.
-    unsafe { std::alloc::dealloc(ptr, block.layout) };
-}
-
-/// Sizes the heap once, before anything is allocated from it. The console
-/// reserves both parts up front; we allocate per block, so the sizes only
-/// decide whether the call is valid.
-// shortcut: the cached and non-cached sizes are not enforced as limits;
-// enforce them if a title relies on running out.
-pub extern "system" fn ApuCreateHeap(cached: u32, _non_cached: u32) -> HRESULT {
-    const ALREADY_ALLOCATED: HRESULT = 0x8ACA_0001_u32 as i32;
+/// Sizes heaps 1 and 2 and opens the device; a non-cached size of 0 keeps
+/// the default. Too late once the device is open.
+pub extern "system" fn ApuCreateHeap(cached: u32, non_cached: u32) -> HRESULT {
+    let mut device = device();
     if cached == 0 {
         return E_INVALIDARG;
     }
-    let mut heap = lock(&HEAP);
-    if heap.created {
-        return ALREADY_ALLOCATED;
+    if device.heaps.is_some() {
+        return ALREADY_OPEN;
     }
-    heap.created = true;
-    heap.free.insert(APU_BASE, u32::MAX);
-    S_OK
-}
-
-/// The host address of a device address, null outside the heap.
-pub extern "system" fn ApuMapApuAddress(apu: u32) -> *mut c_void {
-    heap_unmap(apu).map_or(std::ptr::null_mut(), |p| p.cast())
-}
-
-/// The device address of any byte of a heap block, 0 elsewhere.
-fn heap_map(ptr: usize) -> u32 {
-    let heap = lock(&HEAP);
-    match heap.blocks.range(..=ptr).next_back() {
-        Some((&start, block)) if ptr < start + block.size.max(1) => {
-            block.apu + (ptr - start) as u32
-        }
-        _ => 0,
+    device.cached = cached;
+    if non_cached != 0 {
+        device.non_cached = non_cached;
     }
+    device.open().err().unwrap_or(S_OK)
 }
 
-/// The host address of a device address, if a heap block holds it.
-fn heap_unmap(apu: u32) -> Option<*mut u8> {
-    let heap = lock(&HEAP);
-    let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
-    let block = &heap.blocks[&host];
-    (apu < start.saturating_add(block.size.max(1) as u32))
-        .then(|| (host + (apu - start) as usize) as *mut u8)
-}
-
-/// `len` bytes of title memory at a device address, if one heap block holds
-/// them all.
-fn heap_bytes<'a>(apu: u32, len: usize) -> Option<&'a mut [u8]> {
-    let heap = lock(&HEAP);
-    let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
-    let offset = (apu - start) as usize;
-    (offset + len <= heap.blocks[&host].size)
-        // SAFETY: inside a live heap block, which the title and the audio
-        // hardware share like on the console.
-        .then(|| unsafe { std::slice::from_raw_parts_mut((host + offset) as *mut u8, len) })
-}
-
+/// A block of heap `heap` (1 or 2); both outputs are cleared first.
 pub extern "system" fn ApuAlloc(
     out: *mut *mut c_void,
     apu: *mut u32,
     size: u32,
     align: u32,
-    _flags: u32,
+    heap: u32,
 ) -> HRESULT {
-    if out.is_null() || size == 0 || align < 4 || !align.is_power_of_two() {
+    if !(1..=2).contains(&heap) {
         return E_INVALIDARG;
     }
-    let Some((ptr, address)) = heap_alloc(size as usize, align as usize) else {
+    let mut device = device();
+    let heaps = match device.open() {
+        Ok(h) => h,
+        Err(e) => return e,
+    };
+    let valid = !out.is_null() && size != 0 && align != 0 && align & 3 == 0 && align.is_power_of_two();
+    // SAFETY: optional out parameters, cleared when given.
+    unsafe {
+        if !out.is_null() {
+            out.write(std::ptr::null_mut());
+        }
+        if !apu.is_null() {
+            apu.write(0);
+        }
+    }
+    if !valid {
+        return E_INVALIDARG;
+    }
+    let arena = &mut heaps[heap as usize - 1];
+    let Some(offset) = arena.take(size, align) else {
         return E_OUTOFMEMORY;
     };
-    // SAFETY: checked non-null; optional out parameter checked below.
+    if size >= 32 << 20 {
+        tracing::info!(mb = size >> 20, heap, "audio memory for the title from our allocator");
+    }
+    // SAFETY: checked non-null; optional.
     unsafe {
-        out.write(ptr.cast());
+        out.write((arena.host + offset as usize) as *mut c_void);
         if !apu.is_null() {
-            apu.write(address);
+            apu.write(arena.apu + offset);
         }
     }
     S_OK
 }
 
 pub extern "system" fn ApuFree(ptr: *mut c_void) {
-    heap_free(ptr.cast());
+    let mut device = device();
+    let Ok(heaps) = device.open() else {
+        return;
+    };
+    let p = ptr as usize;
+    let index = if heaps[0].holds_host(p) { 0 } else { 1 };
+    let arena = &mut heaps[index];
+    if p.wrapping_sub(arena.host) < u32::MAX as usize {
+        arena.give_back((p - arena.host) as u32);
+    }
+    if device.close_if_idle() {
+        drop(device);
+        reset_xma();
+    }
+}
+
+/// Heap 1 or 2's counters.
+pub extern "system" fn ApuHeapGetState(out: *mut HeapState, heap: u32) -> HRESULT {
+    let device = device();
+    if out.is_null() || !(1..=2).contains(&heap) {
+        return E_INVALIDARG;
+    }
+    let Some(heaps) = &device.heaps else {
+        return NO_HEAP;
+    };
+    // SAFETY: checked non-null.
+    unsafe { out.write_unaligned(heaps[heap as usize - 1].state) };
+    S_OK
 }
 
 pub extern "system" fn ApuMapVirtualAddress(ptr: *const c_void) -> u32 {
-    heap_map(ptr as usize)
+    let mut device = device();
+    match device.open() {
+        Ok(heaps) => Device::heap_of_host(heaps, ptr as usize).map(ptr as usize),
+        Err(_) => 0,
+    }
 }
 
+/// Whether `ptr` lies in a block in use at a device address aligned to
+/// `align` (0 counts as 1).
 pub extern "system" fn ApuIsVirtualAddressValid(ptr: *const c_void, align: u32) -> bool {
-    let apu = heap_map(ptr as usize);
-    apu != 0 && (align == 0 || apu.is_multiple_of(align))
+    let apu = ApuMapVirtualAddress(ptr);
+    apu != 0 && apu & (align.max(1) - 1) == 0
+}
+
+/// The host address of a device address in a block in use, null elsewhere.
+pub extern "system" fn ApuMapApuAddress(apu: u32) -> *mut c_void {
+    let mut device = device();
+    let Ok(heaps) = device.open() else {
+        return std::ptr::null_mut();
+    };
+    let arena = if heaps[0].holds_apu(apu) { &heaps[0] } else { &heaps[1] };
+    arena.unmap(apu).map_or(std::ptr::null_mut(), |p| p as *mut c_void)
+}
+
+/// The host address of a device address anywhere in the device's heaps, as
+/// the hardware sees it.
+fn heap_unmap(apu: u32) -> Option<*mut u8> {
+    let device = device();
+    let heaps = device.heaps.as_ref()?;
+    heaps
+        .iter()
+        .find(|a| a.holds_apu(apu))
+        .map(|a| (a.host + (apu - a.apu) as usize) as *mut u8)
+}
+
+/// `len` bytes of device memory at a device address, if one heap holds
+/// them all.
+fn heap_bytes<'a>(apu: u32, len: usize) -> Option<&'a mut [u8]> {
+    let device = device();
+    let heaps = device.heaps.as_ref()?;
+    let a = heaps.iter().find(|a| a.holds_apu(apu))?;
+    let offset = (apu - a.apu) as usize;
+    (offset + len <= a.size as usize)
+        // SAFETY: inside a heap of the open device, which the title and the
+        // audio hardware share like on the console.
+        .then(|| unsafe { std::slice::from_raw_parts_mut((a.host + offset) as *mut u8, len) })
 }
 
 // SHAPE context arrays.
@@ -237,40 +560,96 @@ pub struct ShapeContexts {
     apu: [u32; 6],
 }
 
-/// Bytes per context: rate conversion, DMA and XMA as fmod clears them;
-/// the others (not seen yet) get a generous upper bound.
-const CONTEXT_BYTES: [usize; 6] = [32, 256, 256, 16, 64, 256];
+/// Most contexts of each kind.
+const MOST_CONTEXTS: [u32; 6] = [0x1000, 0x1000, 0x1000, 0x1000, 0x200, 0xE00];
+/// Bytes per context of the first four kinds, and their alignment; XMA
+/// (64 bytes) and PCM (32) contexts share one block aligned to 64.
+const CONTEXT_BYTES: [(u32, u32); 4] = [(32, 0x20), (160, 0x10), (32, 0x20), (16, 0x10)];
 
-static CONTEXTS: Mutex<Option<[usize; 6]>> = Mutex::new(None);
+/// Frees the context blocks in heap 2 and lets go of the device, then
+/// resets the XMA decoder.
+fn free_contexts(mut device: MutexGuard<'_, Device>) {
+    if let Some(contexts) = device.contexts.take()
+        && let Some(heaps) = device.heaps.as_mut()
+    {
+        for offset in contexts.blocks.into_iter().flatten() {
+            heaps[1].give_back(offset);
+        }
+    }
+    drop(device);
+    reset_xma();
+}
 
+fn reset_xma() {
+    *XMA.write().unwrap_or_else(|e| e.into_inner()) = Xma::EMPTY;
+}
+
+/// Gives the device its SHAPE context arrays, from heap 2. A second request
+/// while arrays are given frees them and fails, as on the console.
 pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts) -> HRESULT {
+    let mut device = device();
+    if let Err(e) = device.open() {
+        return e;
+    }
+    if device.contexts.is_some() {
+        free_contexts(device);
+        return CONTEXTS_ALLOCATED;
+    }
     if contexts.is_null() {
         return E_INVALIDARG;
     }
-    let mut allocated = lock(&CONTEXTS);
-    if allocated.is_some() {
-        return E_FAIL;
-    }
     // SAFETY: the title passes its request; packed fields are copied out.
     let counts = unsafe { std::ptr::addr_of!((*contexts).counts).read_unaligned() };
+    if counts.iter().zip(MOST_CONTEXTS).any(|(&c, most)| c > most)
+        || !((counts[0] == 0 && counts[5] == 0) || counts[0] == counts[4] + counts[5])
+    {
+        return E_INVALIDARG;
+    }
     let mut arrays: [*mut c_void; 6] = [std::ptr::null_mut(); 6];
     let mut addresses = [0u32; 6];
-    for i in 0..6 {
-        if counts[i] == 0 {
+    let mut given = Contexts { blocks: [None; 5] };
+    let heaps = device.heaps.as_mut().expect("opened above");
+    let heap = &mut heaps[1];
+    let mut failed = false;
+    for i in 0..5 {
+        let (count, bytes, align) = if i < 4 {
+            (counts[i], counts[i] * CONTEXT_BYTES[i].0, CONTEXT_BYTES[i].1)
+        } else {
+            (counts[4] + counts[5], (counts[5] + 2 * counts[4]) * 32, 0x40)
+        };
+        if count == 0 {
             continue;
         }
-        let Some((ptr, apu)) = heap_alloc(counts[i] as usize * CONTEXT_BYTES[i], 256) else {
-            arrays.iter().for_each(|&p| heap_free(p.cast()));
-            return E_OUTOFMEMORY;
+        let Some(offset) = heap.take(bytes, align) else {
+            failed = true;
+            break;
         };
-        (arrays[i], addresses[i]) = (ptr.cast(), apu);
+        given.blocks[i] = Some(offset);
+        let (host, apu) = (heap.host + offset as usize, heap.apu + offset);
+        if i < 4 {
+            (arrays[i], addresses[i]) = (host as *mut c_void, apu);
+        } else {
+            if counts[4] != 0 {
+                (arrays[4], addresses[4]) = (host as *mut c_void, apu);
+            }
+            if counts[5] != 0 {
+                arrays[5] = (host + counts[4] as usize * 64) as *mut c_void;
+                // The console adds the XMA count itself, not its bytes.
+                addresses[5] = apu + counts[4];
+            }
+        }
     }
+    device.contexts = Some(given);
+    if failed {
+        free_contexts(device);
+        return E_OUTOFMEMORY;
+    }
+    drop(device);
     // SAFETY: as above.
     unsafe {
         std::ptr::addr_of_mut!((*contexts).arrays).write_unaligned(arrays);
         std::ptr::addr_of_mut!((*contexts).apu).write_unaligned(addresses);
     }
-    *allocated = Some(arrays.map(|p| p as usize));
     let mut xma = XMA.write().unwrap_or_else(|e| e.into_inner());
     xma.array = arrays[4] as usize;
     xma.voices = (0..counts[4]).map(|_| Mutex::new(None)).collect();
@@ -278,14 +657,25 @@ pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts)
 }
 
 pub extern "system" fn AcpHalReleaseShapeContexts() -> HRESULT {
-    match lock(&CONTEXTS).take() {
-        Some(arrays) => {
-            *XMA.write().unwrap_or_else(|e| e.into_inner()) = Xma::EMPTY;
-            arrays.iter().for_each(|&p| heap_free(p as *mut u8));
-            S_OK
+    let device = device();
+    if device.contexts.is_none() {
+        let mut device = device;
+        if device.close_if_idle() {
+            drop(device);
+            reset_xma();
         }
-        None => E_FAIL,
+        return NO_CONTEXTS;
     }
+    if device.connected != 0 {
+        return STILL_CONNECTED;
+    }
+    free_contexts(device);
+    let mut device = self::device();
+    if device.close_if_idle() {
+        drop(device);
+        reset_xma();
+    }
+    S_OK
 }
 
 // The XMA decoder.
@@ -745,6 +1135,18 @@ const LOAD_FLOWGRAPH: u32 = 1;
 const REGISTER_MESSAGES: u32 = 2;
 const UNREGISTER_MESSAGES: u32 = 3;
 
+/// The interface's own errors (AcpHal.dll 0x1800029a0, 0x180002e70,
+/// 0x180003130).
+const ALREADY_CONNECTED: HRESULT = 0x8AC8_0009_u32 as i32;
+const NOT_CONNECTED: HRESULT = 0x8AC8_000A_u32 as i32;
+const SUBMIT_UNCONNECTED: HRESULT = 0x8000_000E_u32 as i32;
+const E_UNEXPECTED: HRESULT = 0x8000_FFFF_u32 as i32;
+/// Interfaces the device takes at once.
+const INTERFACES: u32 = 4;
+/// The highest command kind; 4 is the one that carries no data.
+const LAST_COMMAND: u32 = 27;
+const NO_DATA_COMMAND: u32 = 4;
+
 const FLOWGRAPH_COMPLETED: u32 = 0x02;
 const COMMAND_COMPLETED: u32 = 0x10;
 const DISCONNECTED: u32 = 0x80;
@@ -763,6 +1165,11 @@ struct Message {
 
 struct State {
     connected: bool,
+    /// The command ring, its completion words and the message ring, in
+    /// heap 1 (offsets of their blocks), and the counts they were sized
+    /// for.
+    rings: [Option<u32>; 3],
+    sized: (u32, u32),
     /// Message kinds the title registered for.
     mask: u32,
     messages: VecDeque<Message>,
@@ -836,11 +1243,60 @@ fn state(this: *mut Acp) -> MutexGuard<'static, State> {
     lock(unsafe { &(*this).state })
 }
 
+/// Connects with rings for `commands` commands and `messages` messages,
+/// taken from heap 1 as the console takes them (256 bytes per command, 12
+/// per command for completions, 256 per message), kept across a
+/// reconnection with the same counts.
 extern "system" fn connect(this: *mut Acp, commands: u32, messages: u32) -> HRESULT {
+    let mut state = state(this);
+    if state.connected {
+        return ALREADY_CONNECTED;
+    }
     if commands == 0 {
         return E_INVALIDARG;
     }
-    let mut state = state(this);
+    let mut device = device();
+    let heaps = match device.open() {
+        Ok(h) => h,
+        Err(e) => return e,
+    };
+    let heap = &mut heaps[0];
+    let mut free = |offset: &mut Option<u32>| {
+        if let Some(o) = offset.take() {
+            heap.give_back(o);
+        }
+    };
+    if state.rings[0].is_none() || state.sized.0 != commands {
+        free(&mut state.rings[0]);
+        free(&mut state.rings[1]);
+    }
+    if state.rings[2].is_none() || state.sized.1 != messages {
+        free(&mut state.rings[2]);
+    }
+    let sizes = [commands.checked_mul(256), commands.checked_mul(12), messages.checked_mul(256)];
+    let mut failed = false;
+    for (ring, size) in state.rings.iter_mut().zip(sizes) {
+        match size {
+            Some(0) => {}
+            Some(size) if ring.is_none() => match heaps[0].take(size, 256) {
+                Some(o) => *ring = Some(o),
+                None => failed = true,
+            },
+            Some(_) => {}
+            None => failed = true,
+        }
+    }
+    if failed || device.connected >= INTERFACES {
+        let heap = &mut device.heaps.as_mut().expect("opened above")[0];
+        for ring in &mut state.rings {
+            if let Some(o) = ring.take() {
+                heap.give_back(o);
+            }
+        }
+        return if failed { E_OUTOFMEMORY } else { E_UNEXPECTED };
+    }
+    device.connected += 1;
+    state.sized = (commands, messages);
     state.connected = true;
     state.capacity = messages as usize;
     S_OK
@@ -849,10 +1305,12 @@ extern "system" fn connect(this: *mut Acp, commands: u32, messages: u32) -> HRES
 extern "system" fn disconnect(this: *mut Acp) -> HRESULT {
     let mut state = state(this);
     if !state.connected {
-        return E_FAIL;
+        return NOT_CONNECTED;
     }
     state.post(DISCONNECTED, &[]);
     state.connected = false;
+    drop(state);
+    device().connected -= 1;
     S_OK
 }
 
@@ -868,6 +1326,14 @@ extern "system" fn submit(
     notification: u32,
 ) -> HRESULT {
     static SEEN: Mutex<u64> = Mutex::new(0);
+    if !state(this).connected {
+        return SUBMIT_UNCONNECTED;
+    }
+    if (data.is_null() && command != NO_DATA_COMMAND)
+        || (!data.is_null() && (command == NO_DATA_COMMAND || !(1..=LAST_COMMAND).contains(&command)))
+    {
+        return E_INVALIDARG;
+    }
     if command < 64 && *lock(&SEEN) & 1 << command == 0 {
         *lock(&SEEN) |= 1 << command;
         tracing::info!(command, "first coprocessor command of this kind");
@@ -906,14 +1372,16 @@ extern "system" fn submit(
     S_OK
 }
 
+/// The oldest message, if there is one and room for it.
 extern "system" fn pop_message(this: *mut Acp, out: *mut Message) -> bool {
+    if out.is_null() {
+        return false;
+    }
     let Some(message) = state(this).messages.pop_front() else {
         return false;
     };
-    if !out.is_null() {
-        // SAFETY: the title passes room for one message.
-        unsafe { out.write_unaligned(message) };
-    }
+    // SAFETY: the title passes room for one message.
+    unsafe { out.write_unaligned(message) };
     true
 }
 
@@ -921,7 +1389,21 @@ extern "system" fn message_count(this: *mut Acp) -> u32 {
     state(this).messages.len() as u32
 }
 
+/// Disconnects if connected, gives back the rings and frees the object.
 extern "system" fn release(this: *mut Acp) {
+    let _ = disconnect(this);
+    let rings = std::mem::take(&mut state(this).rings);
+    let mut device = device();
+    if let Some(heaps) = device.heaps.as_mut() {
+        for o in rings.into_iter().flatten() {
+            heaps[0].give_back(o);
+        }
+    }
+    let reset = device.close_if_idle();
+    drop(device);
+    if reset {
+        reset_xma();
+    }
     // SAFETY: made by `AcpHalCreate` with `Box::into_raw`; released once.
     drop(unsafe { Box::from_raw(this) });
 }
@@ -934,6 +1416,8 @@ pub extern "system" fn AcpHalCreate(out: *mut *mut Acp) -> HRESULT {
         vtable: &ACP_METHODS,
         state: Mutex::new(State {
             connected: false,
+            rings: [None; 3],
+            sized: (0, 0),
             mask: 0,
             messages: VecDeque::new(),
             capacity: 0,
@@ -957,6 +1441,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(ApuAlloc),
             hle_export!(ApuCreateHeap),
             hle_export!(ApuFree),
+            hle_export!(ApuHeapGetState),
             hle_export!(ApuIsVirtualAddressValid),
             hle_export!(ApuMapApuAddress),
             hle_export!(ApuMapVirtualAddress),
@@ -970,57 +1455,289 @@ mod tests {
 
     #[test]
     fn heap_maps_every_byte_of_a_block() {
-        let _serial = lock(&CONTEXT_TESTS);
+        let _serial = fresh();
         let (mut ptr, mut apu) = (std::ptr::null_mut(), 0);
         assert_eq!(ApuAlloc(&mut ptr, &mut apu, 0x100, 128, 1), S_OK);
-        assert!(apu != 0 && apu.is_multiple_of(128));
+        // Alignments below 256 become 256.
+        assert!(apu != 0 && apu.is_multiple_of(256));
         let inner = ptr.cast::<u8>().wrapping_add(0x40).cast_const().cast();
         assert_eq!(ApuMapVirtualAddress(inner), apu + 0x40);
         assert!(ApuIsVirtualAddressValid(ptr, 128));
-        assert_eq!(heap_unmap(apu + 4), Some(ptr.cast::<u8>().wrapping_add(4)));
+        // Any alignment, power of two or not, is a mask of `align - 1`.
+        assert!(ApuIsVirtualAddressValid(ptr, 0));
+        assert_eq!(ApuIsVirtualAddressValid(inner, 3), (apu + 0x40) & 2 == 0);
+        assert_eq!(ApuMapApuAddress(apu + 4), ptr.cast::<u8>().wrapping_add(4).cast());
         ApuFree(ptr);
         assert_eq!(ApuMapVirtualAddress(ptr), 0);
-        assert_eq!(ApuAlloc(&mut ptr, &mut apu, 0x100, 6, 1), E_INVALIDARG);
+        for (align, heap) in [(6, 1), (2, 1), (0, 1), (256, 0), (256, 3)] {
+            ptr = 1 as *mut c_void;
+            assert_eq!(ApuAlloc(&mut ptr, &mut apu, 0x100, align, heap), E_INVALIDARG);
+            assert_eq!(ptr.is_null(), heap != 0 && heap != 3, "cleared unless the heap is bad");
+        }
+        assert_eq!(ApuAlloc(&mut ptr, &mut apu, 0, 256, 1), E_INVALIDARG);
     }
 
     /// The context arrays and the heap exist once per process: tests that
-    /// allocate from them run one at a time (a concurrent allocation could
-    /// take a freed range a test expects back).
+    /// use them run one at a time.
     static CONTEXT_TESTS: Mutex<()> = Mutex::new(());
 
+    /// One test at a time, each with the device as a new process has it.
+    fn fresh() -> MutexGuard<'static, ()> {
+        let serial = lock(&CONTEXT_TESTS);
+        {
+            let mut d = device();
+            d.heaps = None;
+            d.contexts = None;
+            d.connected = 0;
+            d.cached = CACHED_DEFAULT;
+            d.non_cached = NON_CACHED_DEFAULT;
+        }
+        reset_xma();
+        serial
+    }
+
+    fn state(heap: u32) -> HeapState {
+        let mut s = HeapState::default();
+        assert_eq!(ApuHeapGetState(&mut s, heap), S_OK);
+        s
+    }
+
+    /// The heap as AcpHal.dll keeps it (heap allocator at 0x180005038,
+    /// free at 0x18000532c, state at ApuHeapGetState): best fit, the
+    /// device's own three blocks first, the console's padding, counters.
     #[test]
-    fn heap_reuses_freed_addresses() {
-        let _serial = lock(&CONTEXT_TESTS);
-        let (mut a, mut b, mut c) = (
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        let (mut apu_a, mut apu_b, mut apu_c) = (0, 0, 0);
-        assert_eq!(ApuAlloc(&mut a, &mut apu_a, 0x1000, 0x1000, 1), S_OK);
-        assert_eq!(ApuAlloc(&mut b, &mut apu_b, 0x1000, 0x1000, 1), S_OK);
-        ApuFree(a);
-        assert_eq!(ApuAlloc(&mut c, &mut apu_c, 0x800, 0x800, 1), S_OK);
-        // The freed range is free again, whichever part `c` took.
-        assert!(
-            lock(&HEAP)
-                .free
-                .iter()
-                .any(|(&s, &e)| s <= apu_a + 0x800 && apu_a + 0x1000 <= e)
-                || apu_c == apu_a
+    fn heap_counts_and_fits_as_the_console() {
+        let _serial = fresh();
+        // A closed device has no heaps; sizing it opens it.
+        assert_eq!(ApuHeapGetState(&mut HeapState::default(), 1), NO_HEAP);
+        assert_eq!(ApuCreateHeap(0, 0), E_INVALIDARG);
+        assert_eq!(ApuCreateHeap(0x10_0000, 0x1_0000), S_OK);
+        assert_eq!(ApuCreateHeap(0x10_0000, 0), ALREADY_OPEN);
+        assert_eq!(ApuHeapGetState(std::ptr::null_mut(), 1), E_INVALIDARG);
+        assert_eq!(ApuHeapGetState(&mut HeapState::default(), 3), E_INVALIDARG);
+        // The device's blocks: 0x1000 at 0x100 (padded by 0x100: the start
+        // is aligned), then 0x14 and 8 at 256 (each padded by 256).
+        assert_eq!(
+            state(1),
+            HeapState {
+                free: 0x10_0000 - 0x1100 - 0x200 - 0x200,
+                used: 0x1200,
+                overhead: 0x300,
+                largest: 0x10_0000 - 0x1500,
+                blocks: 3,
+            }
         );
         assert_eq!(
-            ApuMapApuAddress(apu_b + 8),
-            b.cast::<u8>().wrapping_add(8).cast()
+            state(2),
+            HeapState {
+                free: 0x1_2000,
+                largest: 0x1_2000,
+                ..HeapState::default()
+            }
+        );
+        let alloc = |size, align, heap| {
+            let (mut p, mut apu) = (std::ptr::null_mut(), 0);
+            assert_eq!(ApuAlloc(&mut p, &mut apu, size, align, heap), S_OK);
+            (p, apu)
+        };
+        let (a, apu_a) = alloc(0x1000, 0x1000, 2);
+        let (b, apu_b) = alloc(0x300, 4, 2);
+        let (c, _) = alloc(0x100, 4, 2);
+        assert!(apu_a.is_multiple_of(0x1000) && apu_b.is_multiple_of(0x100));
+        let s = state(2);
+        // 0x1000 + its pad, 0x300 and 0x100 + 256 each.
+        assert_eq!((s.used, s.overhead, s.blocks), (0x1400, 0x1000 + 0x200, 3));
+        // Freeing `b` leaves a 0x400 hole; the best fit for 0x200 is that
+        // hole, not the big rest of the heap.
+        ApuFree(b);
+        let (d, apu_d) = alloc(0x200, 4, 2);
+        assert_eq!(apu_d, apu_b);
+        assert_eq!(
+            ApuMapApuAddress(apu_a + 8),
+            a.cast::<u8>().wrapping_add(8).cast()
         );
         assert!(ApuMapApuAddress(0).is_null());
-        assert_eq!(
-            ApuCreateHeap(64 << 20, 0),
-            0x8ACA_0001_u32 as i32,
-            "too late"
-        );
-        ApuFree(b);
-        ApuFree(c);
+        // Out of memory: outputs cleared.
+        let (mut p, mut apu) = (1 as *mut c_void, 1);
+        assert_eq!(ApuAlloc(&mut p, &mut apu, 0x10_0000, 4, 2), E_OUTOFMEMORY);
+        assert!(p.is_null() && apu == 0);
+        for p in [a, c, d] {
+            ApuFree(p);
+        }
+        // Everything back: the device closes and may be sized again.
+        assert_eq!(ApuHeapGetState(&mut HeapState::default(), 2), NO_HEAP);
+        assert_eq!(ApuCreateHeap(CACHED_DEFAULT, 0), S_OK);
+        let (p, _) = alloc(16, 16, 1);
+        ApuFree(p);
+        assert_eq!(ApuHeapGetState(&mut HeapState::default(), 1), NO_HEAP);
+    }
+
+    /// The binary-search map gives the console walk's answer at every
+    /// offset, after allocations of mixed alignment and frees.
+    #[test]
+    fn map_agrees_with_the_console_walk() {
+        let mut a = Arena::new(0x1_0000, 0x4_0000).unwrap();
+        let mut live = Vec::new();
+        let mut seed = 7u32;
+        for round in 0..300 {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            if live.len() > 8 && seed % 3 == 0 {
+                let user = live.swap_remove((seed as usize >> 8) % live.len());
+                assert!(a.give_back(user));
+            } else {
+                let align = [4, 256, 0x400, 0x1000][(seed >> 4) as usize % 4];
+                if let Some(u) = a.take(0x40 + (seed >> 12) % 0x900, align) {
+                    live.push(u);
+                }
+            }
+            if round % 50 == 49 {
+                for offset in (0..0x4_0000).step_by(0x10) {
+                    assert_eq!(a.claims(offset), a.walk(offset), "offset {offset:#x}");
+                }
+            }
+        }
+    }
+
+    /// The interface as AcpHal.dll's methods check it (connect
+    /// 0x1800029a0, disconnect 0x180002e70, submit 0x180003130, pop
+    /// 0x180003060, release via 0x180002854).
+    #[test]
+    fn interface_rules_as_the_console() {
+        let _serial = fresh();
+        let mut acps = [std::ptr::null_mut(); 5];
+        for a in &mut acps {
+            assert_eq!(AcpHalCreate(a), S_OK);
+        }
+        assert_eq!(AcpHalCreate(std::ptr::null_mut()), E_INVALIDARG);
+        let acp = acps[0];
+        // SAFETY: just created.
+        let m = unsafe { (*acp).vtable };
+        let word = 0u32;
+        let data = (&raw const word).cast();
+        assert_eq!((m.disconnect)(acp), NOT_CONNECTED);
+        assert_eq!((m.submit)(acp, REGISTER_MESSAGES, 0, 0, data, 0), SUBMIT_UNCONNECTED);
+        assert_eq!((m.connect)(acp, 0, 4), E_INVALIDARG);
+        assert_eq!((m.connect)(acp, 4, 2), S_OK);
+        assert_eq!((m.connect)(acp, 4, 2), ALREADY_CONNECTED);
+        // Rings in heap 1: 4 x 256, 4 x 12 (raised to 256) and 2 x 256
+        // bytes, after the device's own three blocks.
+        let s = state(1);
+        assert_eq!((s.blocks, s.used - 0x1200), (6, 0x400 + 0x100 + 0x200));
+        // Data rules: only command 4 goes without, kinds 1-27.
+        assert_eq!((m.submit)(acp, REGISTER_MESSAGES, 0, 0, std::ptr::null(), 0), E_INVALIDARG);
+        assert_eq!((m.submit)(acp, NO_DATA_COMMAND, 0, 0, data, 0), E_INVALIDARG);
+        assert_eq!((m.submit)(acp, NO_DATA_COMMAND, 0, 0, std::ptr::null(), 0), S_OK);
+        assert_eq!((m.submit)(acp, 0, 0, 0, data, 0), E_INVALIDARG);
+        assert_eq!((m.submit)(acp, LAST_COMMAND + 1, 0, 0, data, 0), E_INVALIDARG);
+        assert_eq!((m.submit)(acp, LAST_COMMAND, 7, 0, data, 0), S_OK);
+        // A null output pops nothing.
+        let mask = u32::MAX;
+        assert_eq!((m.submit)(acp, REGISTER_MESSAGES, 9, 0, (&raw const mask).cast(), 0), S_OK);
+        assert_eq!((m.message_count)(acp), 1);
+        assert!(!(m.pop_message)(acp, std::ptr::null_mut()));
+        assert_eq!((m.message_count)(acp), 1);
+        // Four interfaces at once, not five.
+        for &other in &acps[1..4] {
+            // SAFETY: created above.
+            assert_eq!(unsafe { ((*other).vtable.connect)(other, 1, 0) }, S_OK);
+        }
+        // SAFETY: as above.
+        assert_eq!(unsafe { ((*acps[4]).vtable.connect)(acps[4], 1, 0) }, E_UNEXPECTED);
+        // Releasing disconnects and gives the rings back; with nothing
+        // left the device closes.
+        for a in acps {
+            // SAFETY: created above, released once.
+            unsafe { ((*a).vtable.release)(a) };
+        }
+        assert_eq!(ApuHeapGetState(&mut HeapState::default(), 1), NO_HEAP);
+    }
+
+    /// Context requests as AcpHalAllocateShapeContexts (0x180003428)
+    /// checks and sizes them.
+    #[test]
+    fn shape_contexts_as_the_console() {
+        let _serial = fresh();
+        let request = |counts| ShapeContexts {
+            counts,
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        for bad in [
+            [0x1001, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0x201, 0],
+            [0, 0, 0, 0, 0, 0xE01],
+            [3, 0, 0, 0, 1, 1],
+            [0, 0, 0, 0, 0, 2],
+        ] {
+            assert_eq!(AcpHalAllocateShapeContexts(&mut request(bad)), E_INVALIDARG);
+        }
+        assert_eq!(AcpHalReleaseShapeContexts(), NO_CONTEXTS);
+        let mut r = request([3, 2, 1, 4, 1, 2]);
+        assert_eq!(AcpHalAllocateShapeContexts(&mut r), S_OK);
+        let (arrays, apu) = (r.arrays, r.apu);
+        assert!(arrays.iter().all(|p| !p.is_null()));
+        // XMA (64 bytes) then PCM (32) in one block; the PCM address is
+        // the XMA one plus the XMA count, as the console writes it.
+        assert_eq!(arrays[5] as usize - arrays[4] as usize, 64);
+        assert_eq!(apu[5], apu[4] + 1);
+        for (i, size) in [96u32, 320, 32, 64].into_iter().enumerate() {
+            assert_eq!(ApuMapVirtualAddress(arrays[i]), apu[i]);
+            let last = arrays[i].cast::<u8>().wrapping_add(size as usize - 1).cast_const().cast();
+            assert_eq!(ApuMapVirtualAddress(last), apu[i] + size - 1);
+        }
+        // A second request frees the first and fails.
+        assert_eq!(AcpHalAllocateShapeContexts(&mut r), CONTEXTS_ALLOCATED);
+        assert_eq!(AcpHalReleaseShapeContexts(), NO_CONTEXTS);
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request([1, 0, 0, 0, 1, 0])), S_OK);
+        // Release refuses while an interface is connected.
+        let mut acp = std::ptr::null_mut();
+        assert_eq!(AcpHalCreate(&mut acp), S_OK);
+        // SAFETY: just created.
+        let m = unsafe { (*acp).vtable };
+        assert_eq!((m.connect)(acp, 4, 4), S_OK);
+        assert_eq!(AcpHalReleaseShapeContexts(), STILL_CONNECTED);
+        assert_eq!((m.disconnect)(acp), S_OK);
+        (m.release)(acp);
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    /// Time per ApuAlloc/ApuFree pair with 2000 blocks live, and per
+    /// ApuMapVirtualAddress of the last. `cargo test --release --
+    /// --ignored bench --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_heap() {
+        let _serial = fresh();
+        assert_eq!(ApuCreateHeap(256 << 20, 0), S_OK);
+        let mut live = Vec::new();
+        for i in 0..2000u32 {
+            let (mut p, mut apu) = (std::ptr::null_mut(), 0);
+            assert_eq!(ApuAlloc(&mut p, &mut apu, 256 + (i % 7) * 512, 256, 1), S_OK);
+            live.push(p);
+        }
+        let rounds = 20_000;
+        let start = std::time::Instant::now();
+        for i in 0..rounds {
+            let (mut p, mut apu) = (std::ptr::null_mut(), 0);
+            assert_eq!(ApuAlloc(&mut p, &mut apu, 1024, 256, 1), S_OK);
+            ApuFree(p);
+            if i % 2 == 0 {
+                let k = i % live.len();
+                ApuFree(live[k]);
+                assert_eq!(ApuAlloc(&mut live[k], &mut apu, 768, 256, 1), S_OK);
+            }
+        }
+        let pair = start.elapsed().as_secs_f64() * 1e9 / rounds as f64;
+        let last = *live.last().unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..rounds {
+            assert_ne!(ApuMapVirtualAddress(last), 0);
+        }
+        let map = start.elapsed().as_secs_f64() * 1e9 / rounds as f64;
+        println!("bench heap: {pair:.0} ns per alloc/free round, {map:.0} ns per map, 2000 blocks live");
+        for p in live {
+            ApuFree(p);
+        }
     }
 
     /// Two packets of three silent mono frames each: a fixed one-subframe
@@ -1046,12 +1763,66 @@ mod tests {
         data
     }
 
+    /// Time per 256-byte output block of the XMA pump on a stream that
+    /// loops forever (empty frames, so this is the layer's own cost: locks,
+    /// context fields, ring writes). `cargo test --release -- --ignored
+    /// bench_ --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_xma_pump() {
+        let _serial = fresh();
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 4, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let context = Context(request.arrays[4].cast::<u32>().wrapping_add(16));
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut output, &mut output_apu, 0x2000, 0x100, 2), S_OK);
+        // Two packets looping forever, a ring of 32 blocks, 48 kHz mono.
+        context.set(0, 2 | 255 << 12 | 1 << 20 | 31 << 22);
+        context.set(1, 1 << 31 | 3 << 27);
+        context.set(2, 32);
+        context.set(3, 32);
+        context.set(4, 2 * xma::PACKET_BYTES as u32 * 8);
+        context.set(5, input_apu);
+        context.set(7, output_apu);
+        let mut acp = std::ptr::null_mut();
+        assert_eq!(AcpHalCreate(&mut acp), S_OK);
+        // SAFETY: just created.
+        let m = unsafe { (*acp).vtable };
+        assert_eq!((m.connect)(acp, 0x1000, 0), S_OK);
+        let submit = |command: u32, words: &[u32]| {
+            assert_eq!((m.submit)(acp, command, 0, u32::MAX, words.as_ptr().cast(), 0), S_OK);
+        };
+        submit(ENABLE_XMA, &[1]);
+        let produced = |x: &Xma| lock(&x.voices[1]).as_ref().map_or(0, |v| v.trace.produced);
+        let before = produced(&xma());
+        let start = std::time::Instant::now();
+        for _ in 0..20_000 {
+            submit(ADVANCE_XMA_READ, &[1, 31]);
+            xma().pump();
+        }
+        let blocks = (produced(&xma()) - before) / SAMPLES_PER_BLOCK;
+        let ns = start.elapsed().as_secs_f64() * 1e9 / blocks.max(1) as f64;
+        println!("bench xma pump: {ns:.0} ns per block ({blocks} blocks)");
+        submit(DISABLE_XMA, &[1]);
+        assert_eq!((m.disconnect)(acp), S_OK);
+        (m.release)(acp);
+    }
+
     /// A read block past the end of the ring (6 on a ring of four) is block
     /// 2 of it: a stream that loops forever fills blocks 0 and 1 and the
     /// pass ends. It used to fill the ring for good, holding the voice.
     #[test]
     fn xma_read_blocks_past_the_ring_end_wrap() {
-        let _serial = lock(&CONTEXT_TESTS);
+        let _serial = fresh();
         let mut request = ShapeContexts {
             counts: [0, 0, 0, 0, 4, 0],
             arrays: [std::ptr::null_mut(); 6],
@@ -1115,6 +1886,7 @@ mod tests {
         let ring = unsafe { std::slice::from_raw_parts(output.cast::<u8>(), 0x400) }.to_vec();
 
         submit(DISABLE_XMA, &[1]);
+        assert_eq!((m.disconnect)(acp), S_OK);
         (m.release)(acp);
         ApuFree(input);
         ApuFree(output);
@@ -1131,7 +1903,7 @@ mod tests {
     /// used to write block 6 first, past the ring's end.
     #[test]
     fn xma_write_blocks_past_the_ring_end_wrap() {
-        let _serial = lock(&CONTEXT_TESTS);
+        let _serial = fresh();
         let mut request = ShapeContexts {
             counts: [0, 0, 0, 0, 4, 0],
             arrays: [std::ptr::null_mut(); 6],
@@ -1196,6 +1968,7 @@ mod tests {
         let ring = unsafe { std::slice::from_raw_parts(output.cast::<u8>(), 0x800) }.to_vec();
 
         submit(DISABLE_XMA, &[1]);
+        assert_eq!((m.disconnect)(acp), S_OK);
         (m.release)(acp);
         ApuFree(input);
         ApuFree(output);
@@ -1212,7 +1985,7 @@ mod tests {
 
     #[test]
     fn xma_contexts_decode_into_their_output_rings() {
-        let _serial = lock(&CONTEXT_TESTS);
+        let _serial = fresh();
         let mut request = ShapeContexts {
             counts: [0, 0, 0, 0, 4, 0],
             arrays: [std::ptr::null_mut(); 6],
@@ -1287,6 +2060,7 @@ mod tests {
 
         submit(DISABLE_XMA, &[1]);
         assert_eq!(produced(&xma()), None);
+        assert_eq!((m.disconnect)(acp), S_OK);
         (m.release)(acp);
         ApuFree(input);
         ApuFree(output);
@@ -1298,7 +2072,7 @@ mod tests {
     /// Each end of the loop is cut in its own frame.
     #[test]
     fn a_loop_skips_subframes_of_its_first_frame() {
-        let _serial = lock(&CONTEXT_TESTS);
+        let _serial = fresh();
         let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
         assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
         let stream = silent_stream();
@@ -1375,8 +2149,10 @@ mod tests {
             ),
             S_OK
         );
+        // Command 12 carries 12 bytes.
+        let payload = [0u32; 3];
         for id in 1..=4 {
-            assert_eq!((m.submit)(acp, 12, id, u32::MAX, std::ptr::null(), 0), S_OK);
+            assert_eq!((m.submit)(acp, 12, id, u32::MAX, payload.as_ptr().cast(), 0), S_OK);
         }
         assert_eq!((m.message_count)(acp), 2);
         let mut message = Message {
@@ -1386,16 +2162,17 @@ mod tests {
             data: [0; 16],
         };
         assert!((m.pop_message)(acp, &mut message) && (m.pop_message)(acp, &mut message));
-        assert_eq!((m.submit)(acp, 12, 5, u32::MAX, std::ptr::null(), 0), S_OK);
+        assert_eq!((m.submit)(acp, 12, 5, u32::MAX, payload.as_ptr().cast(), 0), S_OK);
         assert!((m.pop_message)(acp, &mut message));
         let dropped = message.dropped;
         assert_eq!(dropped, 2);
+        assert_eq!((m.disconnect)(acp), S_OK);
         (m.release)(acp);
     }
 
     #[test]
     fn startup_as_fmod_does_it() {
-        let _serial = lock(&CONTEXT_TESTS);
+        let _serial = fresh();
         // Context arrays: rate conversion, DMA and XMA.
         let mut request = ShapeContexts {
             counts: [0x200, 0, 0, 0x400, 0x200, 0],
