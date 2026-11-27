@@ -123,11 +123,58 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     if !private_whole(at as usize, bytes as usize) {
         return Err(None);
     }
+    // One heap for the whole allocation (`VICTORY_INPLACE_WHOLE`, on by
+    // default): every heap opened on the PC's memory costs every
+    // submission, used or not (uma-probe: +5.7 ms a submission at 64), so
+    // a few big ones, each opened once, and windows placed in them.
+    if whole_on()
+        && let Some((heap, base)) = region_heap(device, at as usize)
+    {
+        let buffer = place(device, &heap, at - base as u64, bytes).map_err(Some)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+        return Ok(Placed { buffer, heap, gpu, bias: start - at });
+    }
     let heap = open(device, From::Part(at as usize, bytes as usize)).map_err(Some)?;
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
     Ok(Placed { buffer, heap, gpu, bias: start - at })
+}
+
+fn whole_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_WHOLE").is_none_or(|v| v != "0"))
+}
+
+/// Heaps opened on whole allocations, by base address (`None`: the host
+/// refused it, or it is not committed whole: windows there are opened part
+/// by part).
+static REGION_HEAPS: std::sync::Mutex<Option<std::collections::HashMap<usize, Option<ID3D12Heap>>>> = std::sync::Mutex::new(None);
+
+/// The heap opened on the whole allocation holding `at`, and its base.
+fn region_heap(device: &ID3D12Device, at: usize) -> Option<(ID3D12Heap, usize)> {
+    // SAFETY: plain data filled in by the query.
+    let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    if unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) } == 0 {
+        return None;
+    }
+    let base = info.AllocationBase as usize;
+    let mut heaps = REGION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps.get_or_insert_with(Default::default);
+    if let Some(known) = heaps.get(&base) {
+        return known.clone().map(|h| (h, base));
+    }
+    let opened = open(device, From::Region(base));
+    match &opened {
+        // SAFETY: a live heap.
+        Ok(heap) => tracing::info!(base = format_args!("{base:#x}"), mb = unsafe { heap.GetDesc() }.SizeInBytes >> 20, "title memory in place: a whole allocation opened as one heap"),
+        Err(e) => tracing::info!(base = format_args!("{base:#x}"), error = %e, "title memory in place: the whole allocation could not be opened; part by part"),
+    }
+    let heap = opened.ok();
+    heaps.insert(base, heap.clone());
+    heap.map(|h| (h, base))
 }
 
 /// Title memory `[start, start + len)` in place, for a window outside
