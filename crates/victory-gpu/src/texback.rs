@@ -105,17 +105,13 @@ pub(crate) fn remapped(at: usize, len: usize) {
 }
 
 /// A texture of a kind copied back whose console layout the layer cannot
-/// address (`Layout::addressable`: the XOR swizzle modes, `SW_*_X` and
-/// `SW_*_T`, and MSAA): its texels could be copied off the card but not
-/// put back where the title's CPU code looks, so no copy is made. Logged
-/// once per kind and mode. Seen on an RX 6600 XT run of the opening under
-/// Proton (2026-11-26, run after): a 256x256 texture of 4-byte texels in
-/// `SW_64KB_R_X` (swizzle 27), the size and texel of the ocean's R32_FLOAT
-/// height map, so the CPU's samples of the sea read what the title last
-/// wrote there itself. Before, a copy was made every time and dropped when
-/// tiling it failed ("a texture copied back could not be tiled").
-/// shortcut: copied back, it needs the XOR modes' pipe and bank bits for
-/// the console's GPU (Series X and S differ), which are not known here.
+/// address (`Layout::addressable`: MSAA, and XOR modes the console's
+/// library refuses): its texels could be copied off the card but not put
+/// back where the title's CPU code looks, so no copy is made. Logged once
+/// per kind and mode. Before the XOR modes had addresses this was the
+/// ocean's 256x256 R32_FLOAT height map in `SW_64KB_R_X` (RX 6600 XT run
+/// of the opening under Proton, 2026-11-26), so the CPU's samples of the sea
+/// read what the title last wrote there itself.
 fn untileable(desc: &victory_formats::texture::Desc) {
     static SAID: Mutex<Vec<(u32, u32, u32, u32)>> = Mutex::new(Vec::new());
     let key = (desc.width, desc.height, desc.element_bytes, desc.swizzle.0);

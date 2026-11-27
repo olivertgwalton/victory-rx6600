@@ -1,0 +1,4 @@
+LIBRARY xmem.dll
+EXPORTS
+XMemAlloc @1
+XMemFree @6
