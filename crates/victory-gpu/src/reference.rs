@@ -466,8 +466,8 @@ const NOT_WRITTEN: &[(&str, usize)] = &[
     ("device", 0xf0), ("device", 0x150), ("device", 0x160), ("device", 0x168), ("device", 0x170), ("device", 0x178), ("device", 0x188), ("device", 0x1d8), ("device", 0x1e0), ("device", 0x1f8), ("device", 0x220), ("device", 0x240), ("device", 0x268), ("device", 0x290), ("device", 0x2a0), ("device", 0x2e0), ("device", 0x2e8), ("device", 0x2f0), ("device", 0x2f8), ("device", 0x328), ("device", 0x330), ("device", 0x368), ("device", 0x370), ("device", 0x378), ("device", 0x380), ("device", 0x388), ("device", 0x390), ("device", 0x398), ("device", 0x3a0), ("device", 0x3b0), ("device", 0x3c0), ("device", 0x3d8), ("device", 0x400), ("device", 0x408), ("device", 0x430), ("device", 0x440), ("device", 0x448), ("device", 0x450),
     // queue: 6
     ("queue", 0x40), ("queue", 0x48), ("queue", 0xc8), ("queue", 0xe8), ("queue", 0xf0), ("queue", 0x128),
-    // list: 58
-    ("list", 0x58), ("list", 0x90), ("list", 0xd8), ("list", 0x188), ("list", 0x1f8), ("list", 0x200), ("list", 0x208), ("list", 0x210), ("list", 0x218), ("list", 0x228), ("list", 0x260), ("list", 0x268), ("list", 0x270), ("list", 0x278), ("list", 0x288), ("list", 0x290), ("list", 0x298), ("list", 0x2a0), ("list", 0x2d0), ("list", 0x2d8), ("list", 0x2e0), ("list", 0x2e8), ("list", 0x2f0), ("list", 0x2f8), ("list", 0x300), ("list", 0x308), ("list", 0x310), ("list", 0x318), ("list", 0x330), ("list", 0x338), ("list", 0x340), ("list", 0x348), ("list", 0x350), ("list", 0x368), ("list", 0x370), ("list", 0x378), ("list", 0x388), ("list", 0x3b8), ("list", 0x3c0), ("list", 0x3c8), ("list", 0x3d0), ("list", 0x3d8), ("list", 0x3e0), ("list", 0x3e8), ("list", 0x3f8), ("list", 0x400), ("list", 0x410), ("list", 0x428), ("list", 0x430), ("list", 0x438), ("list", 0x440), ("list", 0x448), ("list", 0x450), ("list", 0x460), ("list", 0x468), ("list", 0x478), ("list", 0x488), ("list", 0x4a8),
+    // list: 49
+    ("list", 0x58), ("list", 0x90), ("list", 0xd8), ("list", 0x188), ("list", 0x210), ("list", 0x218), ("list", 0x228), ("list", 0x260), ("list", 0x268), ("list", 0x270), ("list", 0x278), ("list", 0x288), ("list", 0x290), ("list", 0x298), ("list", 0x2a0), ("list", 0x2e8), ("list", 0x2f0), ("list", 0x2f8), ("list", 0x300), ("list", 0x308), ("list", 0x310), ("list", 0x318), ("list", 0x330), ("list", 0x338), ("list", 0x340), ("list", 0x348), ("list", 0x350), ("list", 0x368), ("list", 0x370), ("list", 0x378), ("list", 0x3b8), ("list", 0x3c0), ("list", 0x3c8), ("list", 0x3d0), ("list", 0x3d8), ("list", 0x3e0), ("list", 0x3e8), ("list", 0x3f8), ("list", 0x400), ("list", 0x410), ("list", 0x428), ("list", 0x430), ("list", 0x438), ("list", 0x440), ("list", 0x460), ("list", 0x468), ("list", 0x478), ("list", 0x488), ("list", 0x4a8),
     // allocator: 2
     ("allocator", 0x50), ("allocator", 0x58),
     // pipeline: 2
@@ -768,5 +768,82 @@ mod small_methods {
             unsafe { std::mem::transmute(p) }
         };
         assert_eq!(f(), E_NOTIMPL);
+    }
+}
+
+/// The list's value writes and fills (GameOS `xgs12_10.dll`, function in each
+/// test), through the layer's table. Without a host list they are written at
+/// once, so what they write can be read back.
+#[cfg(test)]
+mod list_writes {
+    use crate::list::WriteImmediate;
+    use crate::object::This;
+
+    fn at<F: Copy>(offset: usize) -> F {
+        let f = crate::list::NEWER_LIST_FUNCTIONS.0[offset / 8];
+        // SAFETY: the caller names the slot's signature.
+        unsafe { std::mem::transmute_copy(&f) }
+    }
+    const NONE: This = std::ptr::null();
+
+    /// 0x2d0 (+0x3a3f0), 0x2e0 (+0x3a330), 0x448 (+0x38900): 32-bit values.
+    #[test]
+    fn thirty_two_bit_writes_store_their_value() {
+        let mut m = [0u32; 3];
+        let base = m.as_mut_ptr() as u64;
+        let a = |i: usize| base + 4 * i as u64;
+        let (a0, a1, a2) = (a(0), a(1), a(2));
+        at::<extern "system" fn(This, u64, u32, u32)>(0x2d0)(NONE, a0, 0x1111_1111, 0);
+        at::<extern "system" fn(This, u64, u32, u32)>(0x2e0)(NONE, a1, 0x2222_2222, 4);
+        at::<extern "system" fn(This, u64, u32, u32, u32)>(0x448)(NONE, a2, 0x3333_3333, 0, 0);
+        assert_eq!(m, [0x1111_1111, 0x2222_2222, 0x3333_3333]);
+    }
+
+    /// 0x2d8 (+0x3a590): the value, unless flags 0x4/0x8 make it a copy from
+    /// the address (left out). 0x450 (+0x38a30): data flags 0 the value, 1
+    /// the GPU's clock.
+    #[test]
+    fn sixty_four_bit_writes_store_their_value_or_a_clock() {
+        let mut m = [0u64; 3];
+        let base = m.as_mut_ptr() as u64;
+        let a = |i: usize| base + 8 * i as u64;
+        let (a0, a1, a2) = (a(0), a(1), a(2));
+        at::<extern "system" fn(This, u64, u64, u32)>(0x2d8)(NONE, a0, 0x0123_4567_89ab_cdef, 0);
+        at::<extern "system" fn(This, u64, u64, u32)>(0x2d8)(NONE, a1, 7, 4);
+        at::<extern "system" fn(This, u64, u64, u32, u32, u32)>(0x450)(NONE, a2, 5, 0, 0, 0);
+        assert_eq!(m, [0x0123_4567_89ab_cdef, 0, 5]);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        at::<extern "system" fn(This, u64, u64, u32, u32, u32)>(0x450)(NONE, a2, 5, 0, 0, 1);
+        assert!(m[2] != 5 && m[2] != 0, "a clock value");
+    }
+
+    /// 0x388 WriteBufferImmediate (+0x2e340): each parameter's 32-bit value
+    /// at its address.
+    #[test]
+    fn write_buffer_immediate_writes_each_parameter() {
+        let mut m = [0u32; 2];
+        let p = [
+            WriteImmediate { dest: &mut m[0] as *mut u32 as u64, value: 9 },
+            WriteImmediate { dest: &mut m[1] as *mut u32 as u64, value: 10 },
+        ];
+        at::<extern "system" fn(This, u32, *const WriteImmediate, *const u32)>(0x388)(NONE, 2, p.as_ptr(), std::ptr::null());
+        assert_eq!(m, [9, 10]);
+    }
+
+    /// 0x1f8, 0x200, 0x208 FillMemoryWith{32,64,128}BitValueX (+0x2ef60,
+    /// +0x2f020, +0x2ef30): the pattern over the size, nothing past it.
+    #[test]
+    fn fills_repeat_their_pattern_over_the_size() {
+        let mut m = [0u8; 48];
+        let base = m.as_mut_ptr() as u64;
+        at::<extern "system" fn(This, u64, u64, u32)>(0x1f8)(NONE, base, 8, 0xaabb_ccdd);
+        assert_eq!(&m[..9], &[0xdd, 0xcc, 0xbb, 0xaa, 0xdd, 0xcc, 0xbb, 0xaa, 0]);
+        at::<extern "system" fn(This, u64, u64, u64)>(0x200)(NONE, base + 16, 16, 0x0102_0304_0506_0708);
+        assert_eq!(&m[16..24], &0x0102_0304_0506_0708u64.to_le_bytes());
+        assert_eq!(&m[24..32], &0x0102_0304_0506_0708u64.to_le_bytes());
+        let v: [u8; 16] = std::array::from_fn(|i| i as u8 + 1);
+        at::<extern "system" fn(This, u64, u64, *const [u8; 16])>(0x208)(NONE, base + 32, 16, &v);
+        assert_eq!(&m[32..48], &v);
+        assert_eq!(m[8..16], [0; 8]);
     }
 }

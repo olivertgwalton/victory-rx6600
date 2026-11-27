@@ -446,6 +446,14 @@ plain! {
     EXECUTE_INDIRECT execute_indirect = super::execute_indirect, (signature: This, max: u32, arguments: This, offset: u64, count: This, count_offset: u64);
     WRITE32 write32 = super::write32, (address: u64, value: u32, flush: u32, flags: u32);
     WRITE64 write64 = super::write64, (address: u64, value: u64, flush: u32, flags: u32);
+    WRITE32_TOP write32_top = super::write32_top, (address: u64, value: u32, flags: u32);
+    WRITE64_TOP write64_top = super::write64_top, (address: u64, value: u64, flags: u32);
+    WRITE32_SHADER write32_shader = super::write32_shader, (address: u64, value: u32, mode: u32);
+    WRITE32_BOTTOM2 write32_bottom2 = super::write32_bottom2, (address: u64, value: u32, write: u32, sync: u32);
+    WRITE64_BOTTOM2 write64_bottom2 = super::write64_bottom2, (address: u64, value: u64, write: u32, sync: u32, data: u32);
+    FILL32 fill32 = super::fill32, (dst: u64, size: u64, value: u32);
+    FILL64 fill64 = super::fill64, (dst: u64, size: u64, value: u64);
+    FILL128 fill128_words = fill128_played, (dst: u64, size: u64, lo: u64, hi: u64);
     WAIT_VALUE wait_value = super::wait_value, (address: u64, comparison: u32, reference: u64);
     WAIT_VALUE64 wait_value64 = super::wait_value64, (address: u64, comparison: u32, reference: u64);
     SYNC sync = super::sync, (flags: u32, control: u32, address: u64, size: u64);
@@ -689,6 +697,29 @@ fn record_uav_clear(this: This, cpu: u64, resource: This, values: [u32; 4], floa
         &[bytes_of(view.as_ptr(), RECORD), bytes_of(rects, count as usize)],
     );
 }
+extern "system" fn fill128(this: This, dst: u64, size: u64, value: *const [u8; 16]) {
+    // SAFETY: the title passes 16 bytes.
+    let Some(v) = (unsafe { value.as_ref() }) else { return };
+    let w = |i: usize| u64::from_le_bytes(v[i..i + 8].try_into().unwrap());
+    fill128_words(this, dst, size, w(0), w(8));
+}
+extern "system" fn fill128_played(this: This, dst: u64, size: u64, lo: u64, hi: u64) {
+    let mut p = [0u8; 16];
+    p[..8].copy_from_slice(&lo.to_le_bytes());
+    p[8..].copy_from_slice(&hi.to_le_bytes());
+    super::fill(this, dst, size, p);
+}
+/// WriteBufferImmediate is written down as its 32-bit writes.
+extern "system" fn write_immediate(this: This, count: u32, params: *const super::WriteImmediate, _modes: *const u32) {
+    if params.is_null() {
+        return;
+    }
+    for i in 0..count as usize {
+        // SAFETY: the title passes `count` parameters.
+        let p = unsafe { &*params.add(i) };
+        write32(this, p.dest, p.value, 0, 0);
+    }
+}
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -850,7 +881,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     f
 }
 
-const MINE: [(usize, *const ()); 53] = [
+const MINE: [(usize, *const ()); 62] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
     (12, draw as *const ()),
@@ -887,6 +918,15 @@ const MINE: [(usize, *const ()); 53] = [
     (50, targets as *const ()),
     (51, clear_dsv as *const ()),
     (52, clear_rtv as *const ()),
+    (61, fill32 as *const ()),
+    (62, fill64 as *const ()),
+    (63, fill128 as *const ()),
+    (88, write32_top as *const ()),
+    (89, write64_top as *const ()),
+    (90, write32_shader as *const ()),
+    (111, write_immediate as *const ()),
+    (135, write32_bottom2 as *const ()),
+    (136, write64_bottom2 as *const ()),
     (53, clear_uav_uint as *const ()),
     (54, clear_uav_float as *const ()),
     (59, execute_indirect as *const ()),

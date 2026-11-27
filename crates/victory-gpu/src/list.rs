@@ -2383,6 +2383,127 @@ extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, fl
     }
 }
 
+/// List method 0x2d0, `Write32BitValueTopOfPipeX(address, value, flags)`
+/// (GameOS `xgs12_10.dll` +0x3a3f0).
+/// shortcut: stored when the list has run, as the bottom-of-pipe writes
+/// ([`write32`]), not when the command processor reaches it.
+pub(super) extern "system" fn write32_top(this: This, address: u64, value: u32, _flags: u32) {
+    defer_write(this, address, Written::Value(u64::from(value)), 4);
+    value_written(this, address, u64::from(value));
+}
+
+/// List method 0x2d8, `Write64BitValueTopOfPipeX(address, value, flags)`
+/// (+0x3a590). With flags 0x4 or 0x8 the driver copies from `address`
+/// instead (a COPY_DATA packet), which is left out here.
+pub(super) extern "system" fn write64_top(this: This, address: u64, value: u64, flags: u32) {
+    if flags & 0xc != 0 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(flags, "a top-of-pipe copy (Write64BitValueTopOfPipeX flags 0x4/0x8): left out"));
+        return;
+    }
+    defer_write(this, address, Written::Value(value), 8);
+    value_written(this, address, value);
+}
+
+/// List method 0x2e0, `Write32BitValueBottomOfShaderX(address, value, mode)`
+/// (+0x3a330): stored when the list has run.
+pub(super) extern "system" fn write32_shader(this: This, address: u64, value: u32, _mode: u32) {
+    defer_write(this, address, Written::Value(u64::from(value)), 4);
+    value_written(this, address, u64::from(value));
+}
+
+/// List method 0x448, `Write32BitValueBottomOfPipe2X(address, value, write
+/// flags, sync flags)` (+0x38900).
+pub(super) extern "system" fn write32_bottom2(this: This, address: u64, value: u32, _write: u32, _sync: u32) {
+    defer_write(this, address, Written::Value(u64::from(value)), 4);
+    value_written(this, address, u64::from(value));
+}
+
+/// List method 0x450, `Write64BitValueBottomOfPipe2X(address, value, write
+/// flags, sync flags, data flags)` (+0x38a30): data flags bit 0 the GPU's
+/// clock, bit 1 the system's (RELEASE_MEM data 3 and 4), else the value.
+pub(super) extern "system" fn write64_bottom2(this: This, address: u64, value: u64, _write: u32, _sync: u32, data: u32) {
+    let what = match data & 3 {
+        0 => Written::Value(value),
+        1 => Written::GpuTimestamp,
+        _ => Written::SystemTimestamp,
+    };
+    defer_write(this, address, what, 8);
+    if let Written::Value(value) = what {
+        value_written(this, address, value);
+    }
+}
+
+/// List method 0x388, `WriteBufferImmediate(count, parameters, modes)`
+/// (+0x2e340): each parameter a destination address and a 32-bit value.
+#[repr(C)]
+pub(crate) struct WriteImmediate {
+    pub(crate) dest: u64,
+    pub(crate) value: u32,
+}
+pub(super) extern "system" fn write_immediate(this: This, count: u32, params: *const WriteImmediate, _modes: *const u32) {
+    if params.is_null() {
+        return;
+    }
+    for i in 0..count as usize {
+        // SAFETY: the title passes `count` parameters.
+        let p = unsafe { &*params.add(i) };
+        write32(this, p.dest, p.value, 0, 0);
+    }
+}
+
+/// List methods 0x1f8, 0x200 and 0x208, `FillMemoryWith{32,64,128}BitValueX
+/// (destination, size, value)` (+0x2ef60, +0x2f020, +0x2ef30; the 128-bit
+/// value by address): the pattern over `size` bytes of title memory.
+/// shortcut: written when the list has run, as [`copy_memory`] without a
+/// host copy.
+pub(super) extern "system" fn fill32(this: This, dst: u64, size: u64, value: u32) {
+    let mut p = [0u8; 16];
+    for c in p.chunks_mut(4) {
+        c.copy_from_slice(&value.to_le_bytes());
+    }
+    fill(this, dst, size, p);
+}
+pub(super) extern "system" fn fill64(this: This, dst: u64, size: u64, value: u64) {
+    let mut p = [0u8; 16];
+    for c in p.chunks_mut(8) {
+        c.copy_from_slice(&value.to_le_bytes());
+    }
+    fill(this, dst, size, p);
+}
+pub(super) extern "system" fn fill128(this: This, dst: u64, size: u64, value: *const [u8; 16]) {
+    // SAFETY: the title passes 16 bytes.
+    let Some(&p) = (unsafe { value.as_ref() }) else { return };
+    fill(this, dst, size, p);
+}
+pub(super) fn fill(this: This, dst: u64, size: u64, pattern: [u8; 16]) {
+    if dst == 0 || size == 0 {
+        return;
+    }
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.defer(move || fill_now(dst, size, pattern));
+        return;
+    }
+    // Without a host GPU nothing runs later: write now.
+    let _ = this;
+    fill_now(dst, size, pattern);
+}
+
+/// Writes the pattern if the range is committed title memory.
+pub(crate) fn fill_now(dst: u64, size: u64, pattern: [u8; 16]) {
+    let len = size as usize;
+    #[cfg(windows)]
+    if !crate::texture::committed(dst as *const u8, len) {
+        return;
+    }
+    for at in (0..len).step_by(16) {
+        let n = (len - at).min(16);
+        // SAFETY: committed title memory, `len` bytes from `dst`.
+        unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), (dst as usize + at) as *mut u8, n) };
+    }
+}
+
 /// The title wrote a value at the bottom of the pipe (not a timestamp, not
 /// a query result): listed (diagnostics), and with `VICTORY_CUT_WRITES=1`
 /// the host list is cut right behind it, so that the value is stored when
@@ -2457,7 +2578,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 59] = [
+const METHODS: [(usize, *const ()); 68] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -2511,6 +2632,15 @@ const METHODS: [(usize, *const ()); 59] = [
     (58, object::VOID_STUB),                      // 0x1d0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
+    (61, fill32 as *const ()),                    // 0x1f8 FillMemoryWith32BitValueX
+    (62, fill64 as *const ()),                    // 0x200 FillMemoryWith64BitValueX
+    (63, fill128 as *const ()),                   // 0x208 FillMemoryWith128BitValueX
+    (88, write32_top as *const ()),               // 0x2d0 Write32BitValueTopOfPipeX
+    (89, write64_top as *const ()),               // 0x2d8 Write64BitValueTopOfPipeX
+    (90, write32_shader as *const ()),            // 0x2e0 Write32BitValueBottomOfShaderX
+    (111, write_immediate as *const ()),          // 0x388 WriteBufferImmediate
+    (135, write32_bottom2 as *const ()),          // 0x448 Write32BitValueBottomOfPipe2X
+    (136, write64_bottom2 as *const ()),          // 0x450 Write64BitValueBottomOfPipe2X
     (68, state::depth_bounds as *const ()),       // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
