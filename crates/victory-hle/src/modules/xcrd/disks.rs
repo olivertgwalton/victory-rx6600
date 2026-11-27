@@ -8,7 +8,7 @@ use super::srb::{HEADER, Payload, copy_string, hresult, send};
 use super::sys::{self, Handle, sys};
 use super::{Adapter, E_INVALIDARG, E_OUTOFMEMORY, HRESULT, handle_of, heap_alloc, heap_free, hresult_from_win32, units, wide};
 
-const INVALID: Handle = -1isize as Handle;
+pub(crate) const INVALID: Handle = -1isize as Handle;
 
 /// `SCSI_ADDRESS`: length 8, port, path, target, lun.
 pub type Address = [u8; 8];
@@ -38,7 +38,7 @@ pub(crate) fn content_address(adapter: *const Adapter, path: *const u16, out: &m
     0
 }
 
-fn device_io_control(h: Handle, code: u32, input: &[u8], output: &mut [u8]) -> bool {
+pub(crate) fn device_io_control(h: Handle, code: u32, input: &[u8], output: &mut [u8]) -> bool {
     let mut returned = 0u32;
     let (ip, il) = if input.is_empty() { (std::ptr::null(), 0) } else { (input.as_ptr().cast(), input.len() as u32) };
     let (op, ol) = if output.is_empty() { (std::ptr::null_mut(), 0) } else { (output.as_mut_ptr().cast(), output.len() as u32) };
@@ -46,14 +46,19 @@ fn device_io_control(h: Handle, code: u32, input: &[u8], output: &mut [u8]) -> b
     unsafe { (sys().device_io_control)(h, code, ip, il, op, ol, &mut returned, std::ptr::null_mut()) != 0 }
 }
 
-fn open(name: &str, access: u32, flags: u32) -> Handle {
-    let mut w = units(name);
+pub(crate) fn open(name: &str, access: u32, flags: u32) -> Handle {
+    open_wide(&units(name), access, flags)
+}
+
+/// CreateFileW(name, access, shared both ways, existing, flags).
+pub(crate) fn open_wide(name: &[u16], access: u32, flags: u32) -> Handle {
+    let mut w = name.to_vec();
     w.push(0);
     // SAFETY: a NUL-terminated name.
     unsafe { (sys().create_file_w)(w.as_ptr(), access, 3, std::ptr::null(), 3, flags, std::ptr::null_mut()) }
 }
 
-fn close(h: Handle) {
+pub(crate) fn close(h: Handle) {
     // SAFETY: a handle we opened.
     unsafe { (sys().close_handle)(h) };
 }

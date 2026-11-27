@@ -59,17 +59,17 @@ fn driver() -> MutexGuard<'static, Driver> {
 
 unsafe extern "system" fn fake_create_file_w(
     path: *const u16,
-    _: u32,
-    _: u32,
+    access: u32,
+    share: u32,
     _: *const c_void,
-    _: u32,
-    _: u32,
+    disposition: u32,
+    flags: u32,
     _: Handle,
 ) -> Handle {
     // SAFETY: a NUL-terminated path.
     let name = unsafe { super::wide_str(path) };
     let mut d = driver();
-    d.record.opened.push(name.clone());
+    d.record.opened.push(format!("{name} access {access:#x} share {share} disposition {disposition} flags {flags:#x}"));
     match (d.open)(&name) {
         Ok(h) => h as Handle,
         Err(e) => {
@@ -175,8 +175,12 @@ unsafe extern "system" fn fake_sleep(ms: u32) {
     driver().record.sleeps.push(ms);
 }
 
+static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_000_000);
+static STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The clock: still unless a test sets it moving ([`Session::ticks`]).
 unsafe extern "system" fn fake_tick() -> u64 {
-    1_000_000
+    TICK.fetch_add(STEP.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed)
 }
 
 /// WNF, faked: the state name each call names, the last subscription's
@@ -364,6 +368,8 @@ pub fn session() -> Session {
         d.open = Box::new(|_| Err(2));
         d.reply = Box::new(|_, _| 0xc000_0010_u32 as i32);
     }
+    STEP.store(0, std::sync::atomic::Ordering::Relaxed);
+    TICK.store(1_000_000, std::sync::atomic::Ordering::Relaxed);
     Session { _lock: lock }
 }
 
@@ -376,6 +382,12 @@ impl Session {
     /// How the driver answers.
     pub fn reply(&self, reply: impl FnMut(&Call, &mut [u8]) -> i32 + Send + 'static) {
         driver().reply = Box::new(reply);
+    }
+
+    /// The clock restarts, advancing `step` ms each time it is read.
+    pub fn ticks(&self, step: u64) {
+        TICK.store(1_000_000, std::sync::atomic::Ordering::Relaxed);
+        STEP.store(step, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// What was seen since the last take, and a clean slate.

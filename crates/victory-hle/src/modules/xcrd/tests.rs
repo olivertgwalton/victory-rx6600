@@ -1400,7 +1400,9 @@ fn machine_reply(disk: u32) -> impl FnMut(&reference::Call, &mut [u8]) -> i32 + 
         match call.code {
             srb::IOCTL_SCSI_MINIPORT => {
                 b[0x14..0x18].fill(0);
-                b[0x1c + 0x18..0x1c + 0x1b].copy_from_slice(&[3, 2, 1]);
+                if b.len() >= 0x1c + 0x1b {
+                    b[0x1c + 0x18..0x1c + 0x1b].copy_from_slice(&[3, 2, 1]);
+                }
                 0
             }
             0x2d_1400 => {
@@ -1708,4 +1710,322 @@ fn resize_xvd() {
     }
     same("null adapter", run(&s, |_| {}, |side| if side { r(std::ptr::null(), p.as_ptr(), 1) } else { l(std::ptr::null(), p.as_ptr(), 1) }));
     same("null path", run(&s, |_| {}, |side| if side { r(&a, std::ptr::null(), 1) } else { l(&a, std::ptr::null(), 1) }));
+}
+
+// Mounting and unmounting, against a machine with a mount point manager.
+
+fn units16(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+/// A volume's NT name, `\??\Volume{...k}`.
+fn volume(k: u32) -> String {
+    format!("\\??\\Volume{{12345678-1234-1234-1234-12345678900{k:x}}}")
+}
+
+/// `MOUNTMGR_MOUNT_POINTS` for these (link, device) pairs.
+fn mount_points(entries: &[(String, String)]) -> Vec<u8> {
+    let mut strings = Vec::new();
+    let base = 8 + 24 * entries.len();
+    let mut table = Vec::new();
+    for (link, device) in entries {
+        let (l, d) = (units16(link), units16(device));
+        let mut e = [0u8; 24];
+        e[0..4].copy_from_slice(&((base + strings.len()) as u32).to_le_bytes());
+        e[4..6].copy_from_slice(&((l.len() * 2) as u16).to_le_bytes());
+        strings.extend(l.iter().flat_map(|c| c.to_le_bytes()));
+        e[0x10..0x14].copy_from_slice(&((base + strings.len()) as u32).to_le_bytes());
+        e[0x14..0x16].copy_from_slice(&((d.len() * 2) as u16).to_le_bytes());
+        strings.extend(d.iter().flat_map(|c| c.to_le_bytes()));
+        table.extend(e);
+    }
+    let mut all = Vec::new();
+    all.extend(((base + strings.len()) as u32).to_le_bytes());
+    all.extend((entries.len() as u32).to_le_bytes());
+    all.extend(table);
+    all.extend(strings);
+    all
+}
+
+/// Volume k's handle, and its disk.
+fn volume_handle(k: u32) -> usize {
+    FAKE + 0x800 + 2 * k as usize
+}
+
+fn disk_of(handle: usize) -> u32 {
+    if handle == volume_handle(4) { 5 } else { 3 }
+}
+
+/// Modes: 0 all well; 1 no mount point manager; 2 its query fails; 3 no
+/// volumes; 4 the first open of each volume or partition fails; 5 they all
+/// fail; 6 the reader's query fails; 7 locks fail; 8 dismounts fail; 9 two
+/// extents; 10 two extents, the second query failing; 11 detach fails; 12
+/// no content address; 13 the extents query fails.
+fn unmount_machine(s: &Session, mode: u32) {
+    let mut seen = std::collections::HashMap::<String, u32>::new();
+    s.open(move |name| {
+        if let Some(n) = name.strip_prefix("\\\\.\\PhysicalDrive") {
+            let n: u32 = n.parse().unwrap();
+            return if n < 6 { Ok(FAKE + 0x100 + 2 * n as usize) } else { Err(2) };
+        }
+        if name == "\\\\.\\MountPointManager" {
+            return if mode == 1 { Err(5) } else { Ok(FAKE + 0x600) };
+        }
+        let n = seen.entry(name.to_string()).or_insert(0);
+        *n += 1;
+        if mode == 5 || (mode == 4 && *n == 1) {
+            return Err(5);
+        }
+        if let Some(rest) = name.strip_prefix("\\\\?\\Volume{") {
+            let k = u32::from_str_radix(&rest[rest.len() - 2..rest.len() - 1], 16).unwrap();
+            return Ok(volume_handle(k));
+        }
+        if name.contains("Harddisk") { Ok(FAKE + 0x400) } else { Err(2) }
+    });
+    let entries: Vec<(String, String)> = if mode == 3 {
+        vec![("\\DosDevices\\E:".into(), "\\Device\\HarddiskVolume1".into())]
+    } else {
+        vec![
+            ("\\DosDevices\\E:".into(), "\\Device\\HarddiskVolume1".into()),
+            (volume(1), "\\Device\\HarddiskVolume1".into()),
+            (volume(2), "\\DEVICE\\harddiskvolume1".into()),
+            (format!("{}\\", volume(3).replacen("\\??\\", "\\\\?\\", 1)), "\\Device\\HarddiskVolume3".into()),
+            (volume(4), "\\Device\\HarddiskVolume4".into()),
+            (volume(5), "\\Device\\HarddiskVolume5".into()),
+            (volume(6).replacen("\\??\\", "\\\\?\\", 1), "\\Device\\HarddiskVolume6".into()),
+        ]
+    };
+    let blob = mount_points(&entries);
+    let mut inner = machine_reply(3);
+    let failing = 0xc000_0022_u32 as i32;
+    s.reply(move |call, b| match call.code {
+        srb::IOCTL_SCSI_MINIPORT => {
+            let code = u32::from_le_bytes(b[0x10..0x14].try_into().unwrap());
+            let status: u32 = match code {
+                0x7800_0078 if mode == 12 => 0xc05e_0007,
+                0x7800_0008 if mode == 11 => 0xc05e_0003,
+                _ => 0,
+            };
+            if code == 0x7800_0078 {
+                b[0x1c + 0x18..0x1c + 0x1b].copy_from_slice(&[3, 2, 1]);
+            }
+            b[0x14..0x18].copy_from_slice(&status.to_le_bytes());
+            0
+        }
+        0x6d_0008 => {
+            if mode == 2 {
+                return failing;
+            }
+            if b.len() < blob.len() {
+                b[..8].copy_from_slice(&blob[..8]);
+                return 0x8000_0005_u32 as i32;
+            }
+            b[..blob.len()].copy_from_slice(&blob);
+            0
+        }
+        0x56_0000 => {
+            if mode == 13 || (mode == 6 && b.len() == 0x20 && call.handle != FAKE + 0x400 && !matches!(call.handle, h if h == volume_handle(1))) {
+                return 0xc000_0010_u32 as i32;
+            }
+            if mode == 9 || mode == 10 {
+                b[..4].copy_from_slice(&2u32.to_le_bytes());
+                if b.len() < 0x38 {
+                    return 0x8000_0005_u32 as i32;
+                }
+                if mode == 10 {
+                    return failing;
+                }
+                b[8..12].copy_from_slice(&7u32.to_le_bytes());
+                b[0x20..0x24].copy_from_slice(&disk_of(call.handle).to_le_bytes());
+                return 0;
+            }
+            b[..4].copy_from_slice(&1u32.to_le_bytes());
+            b[8..12].copy_from_slice(&disk_of(call.handle).to_le_bytes());
+            0
+        }
+        0x9_0018 => if mode == 7 { failing } else { 0 },
+        0x9_0020 => if mode == 8 { failing } else { 0 },
+        _ => inner(call, b),
+    });
+}
+
+#[test]
+fn unmount_by_path() {
+    let s = session();
+    trace_all(&s);
+    let (r, l) = both!("XCrdUnmountByPath": extern "system" fn(*const Adapter, *const u16) -> HRESULT);
+    let a = adapter();
+    let p = wz("[XUC:]\\mounted.xvc");
+    for mode in 0..14 {
+        same(&format!("mode {mode}"), run(&s, |s| unmount_machine(s, mode), |side| if side { r(&a, p.as_ptr()) } else { l(&a, p.as_ptr()) }));
+    }
+    for (what, ad, path) in [("null adapter", std::ptr::null(), p.as_ptr()), ("null path", &a as *const Adapter, std::ptr::null())] {
+        same(what, run(&s, |s| unmount_machine(s, 0), |side| if side { r(ad, path) } else { l(ad, path) }));
+    }
+}
+
+/// A device record as the library makes them, on the process heap.
+fn device_record(name: &str, disk: u32) -> *mut super::disks::Device {
+    let w = wz(name);
+    let block = heap_alloc(0x18 + w.len() * 2).cast::<super::disks::Device>();
+    // SAFETY: a new block, the name after the record.
+    unsafe {
+        let text = block.cast::<u8>().add(0x18).cast::<u16>();
+        std::ptr::copy_nonoverlapping(w.as_ptr(), text, w.len());
+        block.write(super::disks::Device { name: text, address: [8, 0, 0, 0, 0, 1, 2, 3], disk, volume: 0x4242 });
+    }
+    block
+}
+
+#[test]
+fn unmount_devices() {
+    let s = session();
+    trace_all(&s);
+    let (r, l) = both!("XCrdUnmountEx": extern "system" fn(*const Adapter, *mut super::disks::Device, *mut u32) -> HRESULT);
+    let (ru, lu) = both!("XCrdUnmount": extern "system" fn(*const Adapter, *mut super::disks::Device) -> HRESULT);
+    let a = adapter();
+    for mode in [0, 4, 5, 6, 7, 8, 9, 10, 11, 13] {
+        for disk in [3u32, 5] {
+            for with_stage in [true, false] {
+                same(&format!("mode {mode} disk {disk} {with_stage}"), run(&s, |s| unmount_machine(s, mode), |side| {
+                    let d = device_record("\\\\?\\GLOBALROOT\\Device\\Harddisk3\\Partition1", disk);
+                    let mut stage = 0xccu32;
+                    let hr = if side { r(&a, d, if with_stage { &mut stage } else { std::ptr::null_mut() }) } else { l(&a, d, if with_stage { &mut stage } else { std::ptr::null_mut() }) };
+                    if hr < 0 {
+                        heap_free(d.cast());
+                    }
+                    (hr, stage)
+                }));
+            }
+            same(&format!("unmount mode {mode} disk {disk}"), run(&s, |s| unmount_machine(s, mode), |side| {
+                let d = device_record("\\\\?\\GLOBALROOT\\Device\\Harddisk3\\Partition1", disk);
+                let hr = if side { ru(&a, d) } else { lu(&a, d) };
+                if hr < 0 {
+                    heap_free(d.cast());
+                }
+                hr
+            }));
+        }
+    }
+    same("null adapter", run(&s, |_| {}, |side| { let mut st = 0xcc; let d = device_record("x", 3); let hr = if side { r(std::ptr::null(), d, &mut st) } else { l(std::ptr::null(), d, &mut st) }; heap_free(d.cast()); (hr, st) }));
+    same("null device", run(&s, |_| {}, |side| { let mut st = 0xcc; if side { (r(&a, std::ptr::null_mut(), &mut st), st) } else { (l(&a, std::ptr::null_mut(), &mut st), st) } }));
+}
+
+/// Mount modes: 0 all well; 1 the driver refuses; 2 the disk never appears;
+/// 3 it appears on the fifth look; 4 the partition is write-protected; 5
+/// it never opens; 6 it fails fatally; 7 it never opens and the clock runs;
+/// 8 it opens on the fourth try; 9 it opens with no last error.
+fn mount_machine(s: &Session, mode: u32) {
+    let mut opens = 0;
+    s.open(move |name| {
+        if let Some(n) = name.strip_prefix("\\\\.\\PhysicalDrive") {
+            let n: u32 = n.parse().unwrap();
+            return if n < 6 { Ok(FAKE + 0x100 + 2 * n as usize) } else { Err(2) };
+        }
+        if name.ends_with("Partition1") {
+            opens += 1;
+            match mode {
+                4 => return Err(0x13),
+                5 | 7 => return Err(5),
+                6 => return Err(0x570),
+                8 if opens < 4 => return Err(5),
+                9 => return Err(0),
+                _ => {}
+            }
+        }
+        if name.contains("Harddisk") { Ok(FAKE + 0x400) } else { Err(2) }
+    });
+    s.ticks(if mode == 7 { 1000 } else { 0 });
+    let mut inner = machine_reply(3);
+    let mut looks = 0;
+    s.reply(move |call, b| {
+        if call.code == srb::IOCTL_SCSI_MINIPORT && u32::from_le_bytes(b[0x10..0x14].try_into().unwrap()) == 0x7800_0004 {
+            b[0x14..0x18].copy_from_slice(&(if mode == 1 { 0xc05e_0005u32 } else { 0 }).to_le_bytes());
+            b[0x1c + 0x20..0x1c + 0x23].copy_from_slice(if mode == 2 { &[9, 9, 9] } else { &[3, 2, 1] });
+            return 0;
+        }
+        if call.code == 0x4_1018 && mode == 3 {
+            looks += 1;
+            if looks < 5 * 6 {
+                b[..8].copy_from_slice(&[8, 0, 0, 0, 0, 7, 7, 7]);
+                return 0;
+            }
+        }
+        inner(call, b)
+    });
+}
+
+#[test]
+fn mount() {
+    let s = session();
+    trace_all(&s);
+    type Mount = extern "system" fn(*mut *mut super::disks::Device, *const Adapter, *const u16, u32) -> HRESULT;
+    type MountKind = extern "system" fn(*mut *mut super::disks::Device, *const Adapter, *const u16, u32, u32) -> HRESULT;
+    let (r, l) = both!("XCrdMount": Mount);
+    let (rk, lk) = both!("XCrdMountContentType": MountKind);
+    let a = adapter();
+    let p = wz("[XUC:]\\content.xvc");
+    let empty = wz("");
+    let read = |hr: HRESULT, d: *mut super::disks::Device| {
+        // SAFETY: a record the call made, or null.
+        let v = (!d.is_null()).then(|| unsafe { (wide_str((*d).name), (*d).address, (*d).disk, (*d).volume) });
+        heap_free(d.cast());
+        (hr, v)
+    };
+    let mut flag_cases: Vec<u32> = (0..32).map(|b| 1u32 << b).collect();
+    flag_cases.extend([0, 0x4001, 0xffff, 0xffff_ffff]);
+    for flags in &flag_cases {
+        same(&format!("flags {flags:#x}"), run(&s, |s| mount_machine(s, 0), |side| {
+            let mut d = std::ptr::null_mut();
+            let hr = if side { r(&mut d, &a, p.as_ptr(), *flags) } else { l(&mut d, &a, p.as_ptr(), *flags) };
+            read(hr, d)
+        }));
+        for kind in [0u32, 7, 0xffff_ffff] {
+            same(&format!("kind {kind} flags {flags:#x}"), run(&s, |s| mount_machine(s, 0), |side| {
+                let mut d = std::ptr::null_mut();
+                let hr = if side { rk(&mut d, &a, p.as_ptr(), kind, *flags) } else { lk(&mut d, &a, p.as_ptr(), kind, *flags) };
+                read(hr, d)
+            }));
+        }
+    }
+    for mode in 1..10 {
+        same(&format!("mode {mode}"), run(&s, |s| mount_machine(s, mode), |side| {
+            let mut d = std::ptr::null_mut();
+            let hr = if side { r(&mut d, &a, p.as_ptr(), 1) } else { l(&mut d, &a, p.as_ptr(), 1) };
+            read(hr, d)
+        }));
+    }
+    same("empty path", run(&s, |s| mount_machine(s, 0), |side| {
+        let mut d = std::ptr::null_mut();
+        let hr = if side { r(&mut d, &a, empty.as_ptr(), 0) } else { l(&mut d, &a, empty.as_ptr(), 0) };
+        read(hr, d)
+    }));
+}
+
+/// The mount tests reach what they mean to: dismounts, waits, the clock.
+#[test]
+fn mount_tests_reach_their_paths() {
+    let s = session();
+    trace_all(&s);
+    let a = adapter();
+    let p = wz("[XUC:]\\mounted.xvc");
+    unmount_machine(&s, 0);
+    assert!(super::mount::XCrdUnmountByPath(&a, p.as_ptr()) >= 0);
+    let rec = s.take();
+    let dismounts: Vec<usize> = rec.calls.iter().filter(|c| c.code == 0x9_0020).map(|c| c.handle).collect();
+    assert_eq!(dismounts, [volume_handle(1), volume_handle(5)], "{:?}", rec.messages);
+    assert!(rec.messages.iter().any(|m| m.starts_with("Successfully dismounted volume \\\\?\\Volume{")));
+    assert!(rec.calls.iter().any(|c| c.code == srb::IOCTL_SCSI_MINIPORT && c.input[0x10..0x14] == 0x7800_0008u32.to_le_bytes()));
+    for (mode, sleeps) in [(2u32, 0x640usize), (5, 0x320), (7, 60)] {
+        mount_machine(&s, mode);
+        let mut d = std::ptr::null_mut();
+        assert!(super::mount::XCrdMount(&mut d, &a, p.as_ptr(), 1) < 0);
+        let rec = s.take();
+        assert_eq!(rec.sleeps.iter().filter(|&&ms| ms == 100).count(), sleeps, "mode {mode}");
+    }
+    mount_machine(&s, 8);
+    let mut d = std::ptr::null_mut();
+    assert_eq!(super::mount::XCrdMount(&mut d, &a, p.as_ptr(), 1), 0);
+    assert!(!d.is_null());
+    heap_free(d.cast());
 }
