@@ -26,7 +26,7 @@ pub(crate) fn headed(code: u32, header: usize, path: &[u16]) -> Result<Payload, 
     p.u32(8, (path.len() * 2) as u32);
     let status = copy_string(p.body(), header, path.len() * 2 + 2, path);
     if status < 0 {
-        return Err(super::srb::hresult(status));
+        return Err(status);
     }
     Ok(p)
 }
@@ -38,7 +38,7 @@ pub(crate) fn bare(code: u32, path: &[u16]) -> Result<Payload, HRESULT> {
     p.u32(4, (path.len() * 2) as u32);
     let status = copy_string(p.body(), 8, path.len() * 2 + 2, path);
     if status < 0 {
-        return Err(super::srb::hresult(status));
+        return Err(status);
     }
     Ok(p)
 }
@@ -70,7 +70,7 @@ pub extern "system" fn XCrdEnableSharedPls(adapter: *const Adapter, path: *const
         p.put(8, unsafe { &*id });
         let status = copy_string(p.body(), 0x18, bytes, path);
         if status < 0 {
-            return Ok(super::srb::hresult(status));
+            return Ok(status);
         }
         Ok(send(handle_of(adapter), &mut p))
     })())
@@ -133,7 +133,7 @@ pub extern "system" fn XCrdQueryCorruptXvc(adapter: *const Adapter, out: *mut *m
         let status = copy_string(dest, 0, bytes, &chars);
         if status < 0 {
             heap_free(buffer.cast());
-            return Ok(super::srb::hresult(status));
+            return Ok(status);
         }
         // SAFETY: as above.
         unsafe { *out = buffer.cast() };
@@ -168,12 +168,12 @@ pub extern "system" fn XCrdXBlobCreate(adapter: *const Adapter, path: *const u16
 fn two_paths(p: &mut Payload, header: usize, a: &[u16], b: &[u16]) -> Result<usize, HRESULT> {
     let status = copy_string(p.body(), header, a.len() * 2 + 2, a);
     if status < 0 {
-        return Err(super::srb::hresult(status));
+        return Err(status);
     }
     let second = header + a.len() * 2 + 2;
     let status = copy_string(p.body(), second, b.len() * 2 + 2, b);
     if status < 0 {
-        return Err(super::srb::hresult(status));
+        return Err(status);
     }
     Ok(second)
 }
@@ -199,7 +199,7 @@ pub extern "system" fn XCrdDefragXvc(adapter: *const Adapter, path: *const u16, 
         p.u32(8, flags & 1);
         let status = copy_string(p.body(), 0x40, path.len() * 2 + 2, path);
         if status < 0 {
-            return Ok(super::srb::hresult(status));
+            return Ok(status);
         }
         let hr = send(handle_of(adapter), &mut p);
         for (out, at) in [(a, 0x10), (b, 0x14), (c, 0x18)] {
@@ -271,7 +271,7 @@ pub extern "system" fn XCrdSetExtendedAttributes(adapter: *const Adapter, path: 
         p.u32(4, (path.len() * 2) as u32);
         let status = copy_string(p.body(), 0x18, path.len() * 2 + 2, path);
         if status < 0 {
-            return Ok(super::srb::hresult(status));
+            return Ok(status);
         }
         Ok(send(handle_of(adapter), &mut p))
     })())
@@ -294,9 +294,94 @@ pub extern "system" fn XCrdSetEncryptedEa(adapter: *const Adapter, path: *const 
     p.u32(4, (path.len() * 2) as u32);
     let status = copy_string(p.body(), 0x40, path.len() * 2 + 2, path);
     if status < 0 {
-        return super::srb::hresult(status);
+        return status;
     }
     send(handle_of(adapter), &mut p)
+}
+
+/// 0x180005f50: a remap test; the driver's answer (a string at +0x10) is
+/// copied into the caller's buffer of `out_bytes`.
+pub extern "system" fn XCrdRemapTest(adapter: *const Adapter, path: *const u16, out: *mut u16, out_bytes: u32) -> HRESULT {
+    result((|| {
+        check(!adapter.is_null(), "Invalid Adapter Handle.\n")?;
+        check(!path.is_null(), "Invalid Input Path.\n")?;
+        check(!out.is_null() && out_bytes != 0, "Invalid output buffer.\n")?;
+        let mut p = headed(0x7800_00f4, 0x428, text(path))?;
+        let hr = send(handle_of(adapter), &mut p);
+        if hr < 0 {
+            return Ok(hr);
+        }
+        let body = &p.bytes[super::srb::HEADER + 0x10..];
+        let answer: Vec<u16> = body.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        // SAFETY: the caller's buffer of `out_bytes`.
+        let dest = unsafe { std::slice::from_raw_parts_mut(out.cast::<u8>(), out_bytes as usize & !1) };
+        Ok((copy_string(dest, 0, out_bytes as usize, &answer)))
+    })())
+}
+
+/// `XCrdRepairXvc`'s request: a kind, the XVC's path, a source path, a
+/// value, flags (bits 0-1).
+#[repr(C)]
+pub struct Repair {
+    pub kind: u32,
+    pub xvc: *const u16,
+    pub source: *const u16,
+    pub value: u32,
+    pub flags: u32,
+}
+
+/// 0x1800060e0: kinds 0-2 and 5 need the XVC's path; kinds 0 and 2 a
+/// source path too unless flag 2 is set.
+pub extern "system" fn XCrdRepairXvc(adapter: *const Adapter, repair: *const Repair) -> HRESULT {
+    result((|| {
+        check(!adapter.is_null(), "Invalid Adapter Handle\n")?;
+        check(!repair.is_null(), "Invalid Repair Information\n")?;
+        // SAFETY: checked non-null.
+        let r = unsafe { &*repair };
+        if r.kind <= 2 || r.kind == 5 {
+            check(!r.xvc.is_null(), "XvcPath must be specified\n")?;
+        }
+        if (r.kind == 0 || r.kind == 2) && r.source.is_null() && r.flags & 2 == 0 {
+            check(false, "SrcPath must be specified\n")?;
+        }
+        check(r.flags & !3 == 0, "Invalid flags\n")?;
+        let xvc = (!r.xvc.is_null()).then(|| text(r.xvc));
+        let source = (!r.source.is_null()).then(|| text(r.source));
+        let mut len = 0x1c;
+        if let Some(x) = xvc {
+            len = x.len() * 2 + 0x1e;
+        }
+        if let Some(s) = source {
+            len += s.len() * 2 + 2;
+        }
+        let mut p = Payload::new(0x7800_0104, len);
+        p.u32(0, r.kind);
+        p.u32(8, r.value);
+        p.u32(4, r.flags & 3);
+        let mut next = 0x1c;
+        if let Some(x) = xvc {
+            p.u32(0xc, 0x1c);
+            p.u32(0x10, (x.len() * 2) as u32);
+            let status = copy_string(p.body(), 0x1c, x.len() * 2 + 2, x);
+            next = x.len() * 2 + 0x1e;
+            if status < 0 {
+                return Ok(status);
+            }
+        } else {
+            p.u64(0xc, 0);
+        }
+        if let Some(s) = source {
+            p.u32(0x14, next as u32);
+            p.u32(0x18, (s.len() * 2) as u32);
+            let status = copy_string(p.body(), next, s.len() * 2 + 2, s);
+            if status < 0 {
+                return Ok(status);
+            }
+        } else {
+            p.u64(0x14, 0);
+        }
+        Ok(send(handle_of(adapter), &mut p))
+    })())
 }
 
 pub(crate) fn exports() -> Vec<crate::HleExport> {
@@ -314,5 +399,7 @@ pub(crate) fn exports() -> Vec<crate::HleExport> {
         hle_export!(XCrdMoveSidecarFiles),
         hle_export!(XCrdSetExtendedAttributes),
         hle_export!(XCrdSetEncryptedEa),
+        hle_export!(XCrdRemapTest),
+        hle_export!(XCrdRepairXvc),
     ]
 }

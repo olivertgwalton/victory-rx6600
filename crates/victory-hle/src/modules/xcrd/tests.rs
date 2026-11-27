@@ -606,9 +606,11 @@ fn fuzz_impl(name: &str, layer_name: &str, kinds: &[Kind], width: Width, keep: &
                     _ => None,
                 };
                 let first: Vec<_> = a.buffers.iter().zip(&b.buffers).map(|(x, y)| diff(x, y)).collect();
+                let calls = |r: &Record| r.calls.iter().map(|c| (c.code, c.input.len())).collect::<Vec<_>>();
+                let first_call = a.record.calls.iter().zip(&b.record.calls).map(|(x, y)| x.input.iter().zip(&y.input).position(|(p, q)| p != q)).collect::<Vec<_>>();
                 panic!(
-                    "{name}, case {n} ({what}): reference result {:#x} layer {:#x}; first differing byte per buffer {first:?}\nreference {:?}\nlayer     {:?}",
-                    a.result, b.result, a.record, b.record
+                    "{name}, case {n} ({what}): reference result {:#x} layer {:#x}; first differing byte per buffer {first:?}; calls {:?} vs {:?}, first differing input byte {first_call:?}; messages {:?} vs {:?}",
+                    a.result, b.result, calls(&a.record), calls(&b.record), a.record.messages, b.record.messages
                 );
             }
         }
@@ -709,4 +711,35 @@ fn fuzz_path_bodies_2() {
     fuzz("XCrdMoveSidecarFiles", &[Adp, Path, Path, Int(FLAG1)], W32);
     fuzz("XCrdSetExtendedAttributes", &[Adp, Path, Int(EA), Int(&[0x55, 0, u64::MAX])], W32);
     fuzz("XCrdSetEncryptedEa", &[Adp, Path, Int(&[0x55, 0]), InOpt(32), InOpt(16)], W32);
+}
+
+#[test]
+fn fuzz_remap_test() {
+    fuzz("XCrdRemapTest", &[Adp, Path, OutOpt(0x100), Int(&[0x40, 0, 1, 2, 0x100])], W32);
+}
+
+#[test]
+fn repair_xvc_every_kind() {
+    let s = session();
+    trace_all(&s);
+    let (r, l) = both!("XCrdRepairXvc": extern "system" fn(*const Adapter, *const super::paths::Repair) -> HRESULT);
+    let a = adapter();
+    let (x, y) = (wz("[XUC:]\\a.xvc"), wz("[XTE:]\\src"));
+    for kind in [0u32, 1, 2, 3, 4, 5, 6, 0xffff_ffff] {
+        for flags in [0u32, 1, 2, 3, 4] {
+            for (xvc, src) in [(true, true), (true, false), (false, true), (false, false)] {
+                let info = super::paths::Repair {
+                    kind,
+                    xvc: if xvc { x.as_ptr() } else { std::ptr::null() },
+                    source: if src { y.as_ptr() } else { std::ptr::null() },
+                    value: 0x77,
+                    flags,
+                };
+                for (what, driver) in drivers(&[]) {
+                    same(&format!("kind {kind} flags {flags} {xvc} {src} {what}"), run(&s, |s| driver(s), |rf| if rf { r(&a, &info) } else { l(&a, &info) }));
+                }
+            }
+        }
+    }
+    same("null info", run(&s, |_| {}, |rf| if rf { r(&a, std::ptr::null()) } else { l(&a, std::ptr::null()) }));
 }

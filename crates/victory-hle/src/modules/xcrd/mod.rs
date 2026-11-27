@@ -416,7 +416,7 @@ fn path_body(code: u32, path: &[u16]) -> Result<Payload, HRESULT> {
     payload.u32(4, (path.len() * 2) as u32);
     let status = copy_string(payload.body(), 8, path.len() * 2 + 2, path);
     if status < 0 {
-        return Err(srb::hresult(status));
+        return Err(status);
     }
     Ok(payload)
 }
@@ -464,7 +464,7 @@ pub extern "system" fn XCrdOpenMetadataHandle(out: *mut *mut Metadata, adapter: 
         payload.u32(4, bytes as u32);
         payload.u32(8, 0);
         let status = copy_string(payload.body(), 0x30, bytes, path);
-        let hr = if status < 0 { srb::hresult(status) } else { send(handle_of(adapter), &mut payload) };
+        let hr = if status < 0 { status } else { send(handle_of(adapter), &mut payload) };
         if hr < 0 {
             heap_free(metadata.cast());
             return Ok(hr);
