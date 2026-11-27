@@ -49,140 +49,43 @@ pub(crate) fn on_wine() -> bool {
 /// Standard memory the title has handed to the system.
 static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
 
-// Console additions to the host's flags.
-/// 2 MiB pages; the host reads this bit as large pages, which need a
-/// privilege.
-const PAGES_2M: u32 = 0x2000_0000;
-/// With `PAGES_2M`: 64 KiB pages; the host reads it as AWE memory.
-const PAGES_64K_BIT: u32 = 0x40_0000;
-const PAGES_64K: u32 = PAGES_2M | PAGES_64K_BIT;
+mod spec;
+pub(crate) mod more;
+#[cfg(test)]
+mod tests;
+
+use spec::{
+    ALIGNMENT_SHIFT, Env, ERROR_INVALID_PARAMETER, KIND_ALLOCATION, PAGES_2M, PAGES_64K,
+    PAGES_64K_BIT, Param, Route, XMEM_CPU, XMEM_MAPPABLE, memory_type,
+};
+
 /// The host's protection constants and `PAGE_GUARD`. Above them the console
 /// adds GPU access bits (0x800-0x40000). Write-combining and uncached are
 /// dropped too: our GPU side reads this memory through the CPU.
 const HOST_PROTECTION: u32 = 0x1ff;
 /// XMem flags of memory both processors reach (CPU and GPU).
 const GRAPHICS: u64 = 3;
-/// XMem flag bit of 32-bit graphics memory.
-const ADDRESS_32BIT: u64 = 4;
 /// The host's write watching (not in windows-sys' memory module).
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
-
-// XMem flags (`XMemVirtualAlloc`'s fourth argument), as `xmem.dll` reads
-// them.
-/// The CPU reaches it: every valid request has it.
-const XMEM_CPU: u64 = 1;
-/// The GPU reaches it too.
-const XMEM_GPU: u64 = 2;
-/// Physical pages are mapped into it later (`XMemMapPhysicalPages`): the
-/// console makes an AWE reservation of it.
-const XMEM_MAPPABLE: u64 = 0x20;
-/// Tools memory: refused on a retail console.
-const XMEM_TOOL: u64 = 0x10;
-/// 2 MiB-aligned (`XMemAllocDefault` asks for it for 128 KiB alignment).
-const XMEM_ALIGN_2M: u64 = 0x40;
-/// A bandwidth class is given (bits 9 on): needs 64 KiB or 2 MiB pages.
-const XMEM_BANDWIDTH: u64 = 0x80;
-/// The tag: the top 24 bits.
-const XMEM_TAG: u64 = 0xffff_ff00_0000_0000;
-/// The console's uncached CPU access, refused for GPU memory.
-const PAGE_NOCACHE: u32 = 0x200;
 /// The console's GPU access bits: memory with one is graphics memory to
 /// `XMemVirtualQuery`.
 const GPU_PROTECTION: u32 = 0x1_f800;
-const MEM_RESET: u32 = 0x8_0000;
-const MEM_RESET_UNDO: u32 = 0x100_0000;
-const MEM_ROTATE: u32 = 0x80_0000;
-const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_NOT_SUPPORTED: u32 = 50;
-const ERROR_NOT_FOUND: u32 = 1168;
 
 fn set_last_error(error: u32) {
     // SAFETY: plain thread state.
     unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
 }
 
-/// `xmem.dll`'s checks of `XMemVirtualAlloc`'s arguments, in its order:
-/// the error a request fails with. (Its other messages, on write-combined
-/// or cached GPU memory, page sizes of GPU memory and the 1 TiB limit,
-/// belong to its debug validation, off on a retail console.)
-fn refused(size: usize, kind: u32, flags: u64, protect: u32) -> Option<u32> {
-    let invalid = Some(ERROR_INVALID_PARAMETER);
-    if kind & (MEM_RESET | MEM_RESET_UNDO | MEM_ROTATE) != 0
-        || size == 0
-        || protect == 0
-        || flags & XMEM_CPU == 0
-        || flags & XMEM_GPU != 0 && protect & PAGE_NOCACHE != 0
-    {
-        return invalid;
-    }
-    if flags & XMEM_MAPPABLE != 0
-        && (kind & (MEM_COMMIT | MEM_RESERVE) != MEM_RESERVE
-            || kind & MEM_RESERVE_PLACEHOLDER != 0
-            || kind & PAGES_2M == 0)
-    {
-        return invalid;
-    }
-    if flags & XMEM_TOOL != 0 {
-        // Without large pages invalid; else the tools partition, which a
-        // retail console's profiling mode leaves out (STATUS_NOT_FOUND).
-        return if kind & PAGES_2M == 0 { invalid } else { Some(ERROR_NOT_FOUND) };
-    }
-    if kind & MEM_COMMIT == 0 && flags & XMEM_TAG != 0 {
-        return invalid;
-    }
-    if flags & XMEM_BANDWIDTH != 0 && kind & PAGES_64K == 0 {
-        return invalid;
-    }
-    None
+/// What `xmem.dll` knows of the system and its options ([`spec::Env`]).
+static ENV: Mutex<Env> = Mutex::new(Env::RETAIL);
+
+pub(crate) fn env() -> Env {
+    *ENV.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The page `kind` asks for: 64 KiB with both page bits, 2 MiB with the
-/// large-page bit alone, else 4 KiB.
-fn page_size(kind: u32) -> usize {
-    if kind & PAGES_64K == PAGES_64K {
-        64 << 10
-    } else if kind & PAGES_2M != 0 {
-        2 * MIB
-    } else {
-        4 << 10
-    }
-}
-
-/// The addresses XMem `flags` allow, first and last, and the alignment of
-/// an allocation at an address of the system's choice, as `xmem.dll` asks
-/// the kernel for them: GPU memory in [2 GiB, 4 GiB) when 32-bit, else in
-/// [4 GiB, 1 TiB); CPU memory with an address field at bit 12 below
-/// 2^(47 - field), from 1 TiB (from 4 GiB for 40 bits). Aligned to 2 MiB
-/// for 2 MiB pages, a placeholder or [`XMEM_ALIGN_2M`], else 64 KiB.
-///
-/// deviation: CPU memory without a field is unconstrained on the console;
-/// here it stays in [4 GiB, 1 TiB) too, where the console's kernel puts title
-/// memory, so the host's own allocations above 1 TiB stay apart (the GPU
-/// side tells title memory by that) and the 32-bit window stays free.
-/// Decision 0001.
-fn address_requirements(kind: u32, flags: u64) -> (usize, usize, usize) {
-    let alignment = if kind & PAGES_64K == PAGES_2M
-        || kind & MEM_RESERVE_PLACEHOLDER != 0
-        || flags & XMEM_ALIGN_2M != 0
-    {
-        2 * MIB
-    } else {
-        64 << 10
-    };
-    const TIB: usize = 1 << 40;
-    let (lowest, highest) = if flags & XMEM_GPU != 0 {
-        if flags & ADDRESS_32BIT != 0 {
-            (1 << 31, u32::MAX as usize)
-        } else {
-            (1 << 32, TIB - 1)
-        }
-    } else {
-        match 47 - (flags >> 12 & 7) as u32 {
-            47 | 40 => (1 << 32, TIB - 1),
-            bits => (TIB, (1 << bits) - 1),
-        }
-    };
-    (lowest, highest, alignment)
+pub(crate) fn env_mut() -> MutexGuard<'static, Env> {
+    ENV.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub extern "system" fn XMemVirtualAlloc(
@@ -192,21 +95,31 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
-    if let Some(error) = refused(size, kind, flags, protect) {
-        note_refused(size, kind, flags, protect, error);
-        set_last_error(error);
-        return std::ptr::null_mut();
-    }
-    // The console's rounding: whole pages of the size asked for, from the
-    // page that holds `base`.
-    let page = page_size(kind);
-    let (base, size) = if base.is_null() {
-        (base, size.next_multiple_of(page))
-    } else {
-        let start = base as usize & !(page - 1);
-        (start as *mut c_void, (base as usize + size).next_multiple_of(page) - start)
+    // What the console asks its kernel for (`spec::virtual_alloc`): its
+    // checks, its rounding to whole pages, its address requirements.
+    let request = match spec::virtual_alloc(&env(), base as u64, size as u64, kind, flags, protect) {
+        Ok(request) => request,
+        Err(error) => {
+            note_refused(size, kind, flags, protect, error);
+            set_last_error(error);
+            return std::ptr::null_mut();
+        }
     };
-    let (lowest, highest, alignment) = address_requirements(kind, flags);
+    let (base, size) = (request.base as usize as *mut c_void, request.size as usize);
+    let (lowest, highest, alignment) = request
+        .params
+        .iter()
+        .find_map(|p| match *p {
+            Param::Address(lo, hi, align) => Some((lo as usize, hi as usize, align as usize)),
+            _ => None,
+        })
+        .unwrap_or((0, 0, 0));
+    // deviation: CPU memory without an address field may lie anywhere on the
+    // console; here it stays in [4 GiB, 1 TiB), where the console's kernel
+    // puts title memory, so the host's own allocations above 1 TiB stay
+    // apart (the GPU side tells title memory by that) and the 32-bit window
+    // stays free. Decision 0001.
+    let (lowest, highest) = if base.is_null() && highest == 0 { (1 << 32, (1 << 40) - 1) } else { (lowest, highest) };
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
@@ -304,11 +217,13 @@ pub extern "system" fn XMemVirtualAlloc(
     // (Grand Theft Auto VI asks for its 32-bit heap with kind 0x42000,
     // without the 64 KiB page bits: not `placeholder` above, though the host
     // makes a placeholder of it all the same.)
-    if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & ADDRESS_32BIT != 0 {
+    if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & spec::XMEM_32BIT != 0 {
         LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
     }
     if !at.is_null() {
         regions().note(at as usize, size, Region { kind: asked_kind, flags, protect: asked });
+        // As the console: success clears the thread's error.
+        set_last_error(0);
     }
     note_protection(asked, asked_kind, flags, at as usize, size);
     at
@@ -373,6 +288,15 @@ impl Regions {
         let end = at.saturating_add(len);
         self.cut(at, end);
         self.0.insert(at, (end, region));
+    }
+
+    /// The XMem flags and length of the tagged allocation at `address`.
+    fn tagged(&self, address: usize) -> Option<(u64, usize)> {
+        self.0
+            .range(..=address)
+            .next_back()
+            .filter(|(_, (end, r))| address < *end && r.flags & spec::XMEM_TAG != 0)
+            .map(|(&start, (end, r))| (r.flags, end - start))
     }
 
     fn at(&self, address: usize) -> Option<Region> {
@@ -495,263 +419,147 @@ pub extern "system" fn XMemVirtualQuery(
                 info.flags |= XMEM_MAPPABLE;
             }
         }
-        info.tag_code = 0;
-        info.tag = [0; 4];
+        // A tag: its code and characters, and the tagged allocation's size
+        // in place of the region's.
+        match regions().tagged(address as usize) {
+            Some((flags, len)) if ours => {
+                (info.tag_code, info.tag) = spec::tag_fields(flags);
+                info.host.RegionSize = len;
+            }
+            _ => {
+                info.tag_code = 0;
+                info.tag = [0; 4];
+            }
+        }
     }
     1
 }
 
-// `XMemAlloc` attributes: alignment as log2 (5 bits at 24, 4 bytes and up
-// from 2), then the memory type, then bit 33: a 32-bit address.
-const ALIGNMENT_SHIFT: u64 = 24;
-const ALLOC_32BIT: u64 = 1 << 33;
-
 type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
 type FreeRoutine = extern "system" fn(*mut c_void, u64);
 
-/// The allocation and free routines the title's exe exports as
-/// `__XMemAllocationHooks__` (the title does): `XMemAlloc` and
-/// `XMemFree` call them, for the title's own calls and its middleware's;
-/// the `…Default` exports do not.
+/// The routines behind `XMemAlloc` and `XMemFree` (`xmem!0x180010948`,
+/// `xmem!0x180010950`): at the start `XMemAllocDefault` and
+/// `XMemFreeDefault`, then the title exe's `__XMemAllocationHooks__` if it
+/// exports both (one null: refused, the defaults stay), then whatever
+/// `XMemSetAllocationHooks` sets (a null one: that default).
+static HOOKS: Mutex<Option<[usize; 2]>> = Mutex::new(None);
+
+fn defaults() -> [usize; 2] {
+    [XMemAllocDefault as *const () as usize, XMemFreeDefault as *const () as usize]
+}
+
 fn hooks() -> [usize; 2] {
-    static AT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let at = match AT.get() {
-        Some(&at) => at,
-        // Looked up once the title is mapped, which is before it runs.
-        None => match crate::runtime::main_image() {
-            Some(base) => *AT.get_or_init(|| {
-                use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
-                // SAFETY: a mapped image and a NUL-terminated name.
-                let at = unsafe {
-                    GetProcAddress(base as _, c"__XMemAllocationHooks__".as_ptr().cast())
-                }
-                .map_or(0, |f| f as usize);
-                tracing::info!(found = at != 0, "xmem allocation hooks");
-                at
-            }),
-            None => 0,
-        },
-    };
-    if at == 0 {
-        return [0; 2];
+    let mut hooks = HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = *hooks {
+        return h;
     }
+    // Looked up once the title is mapped, which is before it runs.
+    let Some(base) = crate::runtime::main_image() else {
+        return defaults();
+    };
+    use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
+    // SAFETY: a mapped image and a NUL-terminated name.
+    let at = unsafe { GetProcAddress(base as _, c"__XMemAllocationHooks__".as_ptr().cast()) }.map_or(0, |f| f as usize);
     // SAFETY: the export is two routine pointers.
-    let routines = unsafe { (at as *const [usize; 2]).read() };
-    // `xmem.dll` takes them only together (else it logs
-    // STATUS_INVALID_PARAMETER and keeps its own).
-    if routines.contains(&0) { [0; 2] } else { routines }
+    let routines = if at == 0 { [0; 2] } else { unsafe { (at as *const [usize; 2]).read() } };
+    tracing::info!(found = at != 0, "xmem allocation hooks");
+    let h = if routines.contains(&0) { defaults() } else { routines };
+    *hooks = Some(h);
+    h
 }
 
-/// The title's general allocator, for middleware too: its hook if it has
-/// one, else [`XMemAllocDefault`].
+/// `XMemSetAllocationHooks` (`xmem!0x180002f70`).
+pub extern "system" fn XMemSetAllocationHooks(alloc: usize, free: usize) {
+    let [a, f] = defaults();
+    *HOOKS.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some([if alloc == 0 { a } else { alloc }, if free == 0 { f } else { free }]);
+}
+
+/// The title's general allocator, for middleware too
+/// (`xmem!0x180001f20`).
 pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
-    match hooks()[0] {
-        0 => XMemAllocDefault(size, attributes),
-        hook => {
-            // SAFETY: the title's own routine of this type.
-            let alloc: AllocRoutine = unsafe { std::mem::transmute(hook) };
-            alloc(size, attributes)
-        }
-    }
+    // SAFETY: a routine of this type (ours or the title's).
+    let alloc: AllocRoutine = unsafe { std::mem::transmute(hooks()[0]) };
+    alloc(size, attributes)
 }
 
-/// See [`XMemAlloc`].
+/// See [`XMemAlloc`] (`xmem!0x180002500`): null too goes to the routine.
 pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
-    match hooks()[1] {
-        0 => XMemFreeDefault(address, attributes),
-        hook => {
-            // SAFETY: the title's own routine of this type.
-            let free: FreeRoutine = unsafe { std::mem::transmute(hook) };
-            free(address, attributes)
-        }
-    }
+    // SAFETY: a routine of this type (ours or the title's).
+    let free: FreeRoutine = unsafe { std::mem::transmute(hooks()[1]) };
+    free(address, attributes)
 }
 
-/// What reaches [`XMemAllocDefault`], by memory type and [`Route`]: said
-/// for the 1st, 2nd, 4th.. call of each, with how much so far.
-fn note_default(size: usize, attributes: u64) {
-    static SEEN: [[AtomicU64; 4]; 16] = [const { [const { AtomicU64::new(0) }; 4] }; 16];
-    static BYTES: [[AtomicU64; 4]; 16] = [const { [const { AtomicU64::new(0) }; 4] }; 16];
+/// What reaches [`XMemAllocDefault`], by memory type and route: said for
+/// the 1st, 2nd, 4th.. call of each, with how much so far.
+fn note_default(route: Route, size: usize, attributes: u64) {
+    static SEEN: [[AtomicU64; 3]; 16] = [const { [const { AtomicU64::new(0) }; 3] }; 16];
+    static BYTES: [[AtomicU64; 3]; 16] = [const { [const { AtomicU64::new(0) }; 3] }; 16];
     let kind = memory_type(attributes);
-    let Some(route) = Route::of(size, attributes) else {
-        return;
+    let r = match route {
+        Route::ProcessHeap => 0,
+        Route::Heap(_) => 1,
+        Route::Virtual => 2,
     };
-    let r = route as usize;
     let n = SEEN[kind][r].fetch_add(1, Ordering::Relaxed) + 1;
-    let bytes = BYTES[kind][r].fetch_add(size as u64, Ordering::Relaxed) + size as u64;
     if n.is_power_of_two() {
+        let bytes = BYTES[kind][r].fetch_add(size as u64, Ordering::Relaxed) + size as u64;
         tracing::info!(
             "XMemAllocDefault: memory type {kind}, {route:?}: {n} calls, {} KB, last {size} bytes, attributes {attributes:#x}",
             bytes >> 10
         );
+    } else {
+        BYTES[kind][r].fetch_add(size as u64, Ordering::Relaxed);
     }
 }
 
-/// `XMemAlloc` memory types (attribute bits 29-32): what `xmem.dll` adds to
-/// the allocation type: `MEM_GRAPHICS` (its bit 28) for memory both
-/// processors reach, 64 KiB pages for the large CPU kinds, nothing for type
-/// 0. 0 for types it refuses.
-const KIND_ALLOCATION: [u32; 16] = [
-    0, GRAPHICS_KIND, GRAPHICS_KIND, GRAPHICS_KIND, GRAPHICS_KIND, GRAPHICS_KIND, GRAPHICS_KIND,
-    LARGE_CPU_KIND, LARGE_CPU_KIND, LARGE_CPU_KIND, GRAPHICS_KIND, GRAPHICS_KIND, GRAPHICS_KIND, 0, 0, 0,
-];
-const GRAPHICS_KIND: u32 = 0x1000_0000;
-const LARGE_CPU_KIND: u32 = 0x40_0000;
-/// The protection of each memory type: CPU read-write, then write-combined
-/// (0x400) or uncached (0x200), then the GPU's (0x800 and up; 0x20000
-/// coherent, 0x40000 GPU-uncached). 0: a type `xmem.dll` refuses.
-const KIND_PROTECTION: [u32; 16] = [
-    0x4, 0x2404, 0x1404, 0x22004, 0x1004, 0x50404, 0x70004, 0x4, 0x404, 0x204, 0x62004, 0x8004,
-    0x10404, 0, 0, 0,
-];
-
-fn memory_type(attributes: u64) -> usize {
-    (attributes >> 29 & 0xf) as usize
+/// One chunk of a [`Blocks`] heap.
+#[derive(Clone, Default)]
+struct Chunk {
+    committed: bool,
+    /// Blocks handed out in it.
+    blocks: u32,
+    /// Its free ranges by offset: their length.
+    free: BTreeMap<u32, u32>,
+    /// The longest free range, for skipping full chunks.
+    longest: u32,
 }
 
-/// Where `xmem.dll`'s `XMemAllocDefault` takes a block from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Route {
-    /// The title partition's process heap (`HeapAlloc`).
-    ProcessHeap = 0,
-    /// The memory type's heap of 256-byte units.
-    SmallBlocks = 1,
-    /// The memory type's heap of 4 KiB units.
-    MediumBlocks = 2,
-    /// An allocation of its own (`XMemVirtualAlloc`).
-    Virtual = 3,
-}
+impl Chunk {
+    fn fresh(len: u32) -> Chunk {
+        Chunk { committed: true, blocks: 0, free: BTreeMap::from([(0, len)]), longest: len }
+    }
 
-impl Route {
-    /// None where the console returns null: no bytes, or a memory type it
-    /// does not know.
-    fn of(size: usize, attributes: u64) -> Option<Route> {
-        let kind = memory_type(attributes);
-        if size == 0 || KIND_PROTECTION[kind] == 0 {
+    fn relongest(&mut self) {
+        self.longest = self.free.values().copied().max().unwrap_or(0);
+    }
+
+    /// A block of `size` at `align` (offsets: the chunk is aligned to at
+    /// least `align` up to its own size).
+    fn take(&mut self, size: u32, align: u32) -> Option<u32> {
+        if self.longest < size {
             return None;
         }
-        let align = attributes >> ALIGNMENT_SHIFT & 0x1f;
-        let pages = attributes >> 14 & 3;
-        let allocation = KIND_ALLOCATION[kind];
-        if allocation == 0 && align <= 4 && pages == 0 {
-            return Some(Route::ProcessHeap);
+        let (at, len, start) = self.free.iter().find_map(|(&at, &len)| {
+            let start = at.next_multiple_of(align);
+            (start as u64 + size as u64 <= at as u64 + len as u64).then_some((at, len, start))
+        })?;
+        self.free.remove(&at);
+        if start > at {
+            self.free.insert(at, start - at);
         }
-        if allocation == LARGE_CPU_KIND {
-            return Some(Route::Virtual);
+        if start + size < at + len {
+            self.free.insert(start + size, at + len - start - size);
         }
-        // Graphics memory comes in 64 KiB pages at least.
-        let pages = if allocation == GRAPHICS_KIND && pages == 0 { 1 } else { pages };
-        if align > 16 || size > 0x2_0000 || attributes & ALLOC_32BIT != 0 || pages == 2 {
-            return Some(Route::Virtual);
+        self.blocks += 1;
+        if len == self.longest {
+            self.relongest();
         }
-        Some(if align > 12 || size > 0xf00 { Route::MediumBlocks } else { Route::SmallBlocks })
-    }
-}
-
-/// The allocation `xmem.dll` makes for a block of its own
-/// ([`Route::Virtual`]): `XMemVirtualAlloc`'s type, XMem flags and
-/// protection, as it derives them from the attributes.
-fn virtual_request(attributes: u64) -> (u32, u64, u32) {
-    let t = memory_type(attributes);
-    let align = attributes >> ALIGNMENT_SHIFT & 0x1f;
-    let allocation = KIND_ALLOCATION[t];
-    let mut pages = attributes >> 14 & 3;
-    if allocation == GRAPHICS_KIND && pages == 0 {
-        pages = 1;
-    }
-    // 128 KiB alignment is asked for as 2 MiB alignment (bit 17, made an
-    // XMem flag below).
-    const ALIGN_2M_KIND: u32 = 0x2_0000;
-    let mut kind = MEM_COMMIT | MEM_RESERVE | if align == 17 { ALIGN_2M_KIND } else { 0 };
-    kind |= match pages {
-        1 => PAGES_64K,
-        2 => PAGES_2M,
-        _ => 0,
-    };
-    // A 32-bit address, marked with bit 23 (made an XMem flag below for
-    // graphics memory; CPU memory keeps it, and `XMemVirtualAlloc` refuses
-    // the request as MEM_ROTATE).
-    if attributes & ALLOC_32BIT != 0 {
-        kind |= MEM_ROTATE;
-    }
-    kind |= allocation;
-    if kind & PAGES_64K_BIT != 0 {
-        kind &= !PAGES_64K_BIT;
-        if pages >= 2 {
-            kind |= PAGES_2M;
-        } else if align <= 16 {
-            kind |= PAGES_64K;
-        }
-    }
-    let protect = KIND_PROTECTION[t];
-    let mut flags = XMEM_CPU;
-    if kind & GRAPHICS_KIND != 0 {
-        kind &= !GRAPHICS_KIND;
-        flags = GRAPHICS;
-        if kind & MEM_ROTATE != 0 {
-            kind &= !MEM_ROTATE;
-            flags |= ADDRESS_32BIT;
-        }
-    }
-    if kind & ALIGN_2M_KIND != 0 {
-        kind &= !ALIGN_2M_KIND;
-        flags |= XMEM_ALIGN_2M;
-    }
-    (kind, flags, protect)
-}
-
-/// One of `xmem.dll`'s heaps of a memory type ([`Route::SmallBlocks`],
-/// [`Route::MediumBlocks`]): blocks of whole units (256 bytes or 4 KiB),
-/// aligned to a unit at least, cut from one reservation of the type's
-/// memory that is committed as it fills (64 MiB at a time for graphics
-/// memory, 8 MiB for CPU memory, as the console grows its heaps).
-/// deviation: the console's own block placement (its free lists by size)
-/// is not reproduced, only what a caller can see: units, alignment and
-/// the memory's kind; first fit here. The reservation is 1 GiB.
-struct Blocks {
-    base: usize,
-    committed: usize,
-    unit: usize,
-    chunk: usize,
-    flags: u64,
-    protect: u32,
-    /// Free ranges by address: their length.
-    free: BTreeMap<usize, usize>,
-    /// Blocks handed out: their length.
-    used: HashMap<usize, usize>,
-}
-
-const BLOCKS_RESERVED: usize = 1 << 30;
-
-impl Blocks {
-    fn new(index: usize) -> Option<Blocks> {
-        let t = index & 0xf;
-        let graphics = KIND_ALLOCATION[t] == GRAPHICS_KIND;
-        let flags = if graphics { GRAPHICS } else { XMEM_CPU };
-        let protect = KIND_PROTECTION[t];
-        // A reservation of 4 KiB pages: one of 64 KiB pages would be made a
-        // placeholder here (see `XMemVirtualAlloc`), which takes no commit.
-        let base = XMemVirtualAlloc(std::ptr::null_mut(), BLOCKS_RESERVED, MEM_RESERVE, flags, protect);
-        if base.is_null() {
-            return None;
-        }
-        Some(Blocks {
-            base: base as usize,
-            committed: 0,
-            unit: if index & 0x10 != 0 { 4 << 10 } else { 256 },
-            chunk: if graphics { 64 * MIB } else { 8 * MIB },
-            flags,
-            protect,
-            free: BTreeMap::new(),
-            used: HashMap::new(),
-        })
+        Some(start)
     }
 
-    fn contains(&self, at: usize) -> bool {
-        (self.base..self.base + BLOCKS_RESERVED).contains(&at)
-    }
-
-    fn release(&mut self, at: usize, len: usize) {
+    fn give_back(&mut self, at: u32, len: u32) {
         let (mut at, mut len) = (at, len);
         if let Some((&before, &n)) = self.free.range(..at).next_back()
             && before + n == at
@@ -764,79 +572,216 @@ impl Blocks {
             len += n;
         }
         self.free.insert(at, len);
+        self.longest = self.longest.max(len);
+        self.blocks -= 1;
+    }
+}
+
+/// One of `xmem.dll`'s heaps of a memory type ([`Route::Heap`],
+/// `xmem!0x1800072d0`): blocks of whole units (256 bytes or 4 KiB), aligned
+/// to a unit at least, in a 2 GiB reservation of the type's memory
+/// committed a chunk (512 KiB, or 2 MiB with option 6) at a time. Chunks
+/// left without blocks stay committed up to the hysteresis
+/// (`XMemSetAllocationHysteresis`) and are decommitted beyond it;
+/// `XMemPreallocateFreeSpace` commits up to it.
+/// deviation: the console's placement inside a heap (its free lists by
+/// size) is not reproduced: first fit, a block within one chunk. The host
+/// reservation is of 4 KiB pages (one of 64 KiB pages would be a
+/// placeholder here, which takes no commit).
+struct Blocks {
+    base: usize,
+    shape: spec::HeapShape,
+    chunks: Vec<Chunk>,
+    /// Blocks handed out: their length.
+    used: HashMap<usize, u32>,
+    hysteresis: u32,
+    /// Chunks committed without blocks (`+0x8c`).
+    free_chunks: u32,
+    /// Bytes committed (`+0x40`).
+    committed: u64,
+    /// Chunk commits and decommits so far (`+0x9c`, `+0xa0`).
+    commits: u32,
+    decommits: u32,
+}
+
+impl Blocks {
+    /// The heap as `xmem.dll` makes it: its reservation waits for the first
+    /// chunk (so a heap of a memory type without memory exists, and only
+    /// its commits fail).
+    fn new(index: usize) -> Option<Blocks> {
+        let shape = spec::heap_shape(&env(), index);
+        Some(Blocks {
+            base: 0,
+            shape,
+            chunks: Vec::new(),
+            used: HashMap::new(),
+            hysteresis: shape.hysteresis_chunks,
+            free_chunks: 0,
+            committed: 0,
+            commits: 0,
+            decommits: 0,
+        })
+    }
+
+    fn contains(&self, at: usize) -> bool {
+        self.base != 0 && (self.base..self.base + self.shape.reserve as usize).contains(&at)
+    }
+
+    fn chunk_len(&self) -> u32 {
+        self.shape.chunk as u32
+    }
+
+    /// Commits a chunk without blocks: the first uncommitted one.
+    fn commit_chunk(&mut self) -> Option<usize> {
+        if self.base == 0 {
+            let s = self.shape;
+            let base = XMemVirtualAlloc(std::ptr::null_mut(), s.reserve as usize, MEM_RESERVE, s.flags, s.protect);
+            if base.is_null() {
+                return None;
+            }
+            self.base = base as usize;
+        }
+        let i = self.chunks.iter().position(|c| !c.committed).unwrap_or(self.chunks.len());
+        if (i + 1) as u64 * self.shape.chunk > self.shape.reserve {
+            return None;
+        }
+        let at = self.base + i * self.chunk_len() as usize;
+        if XMemVirtualAlloc(at as *mut c_void, self.chunk_len() as usize, MEM_COMMIT, self.shape.flags, self.shape.protect)
+            .is_null()
+        {
+            return None;
+        }
+        if i == self.chunks.len() {
+            self.chunks.push(Chunk::default());
+        }
+        self.chunks[i] = Chunk::fresh(self.chunk_len());
+        self.committed += self.shape.chunk;
+        self.commits += 1;
+        self.free_chunks += 1;
+        Some(i)
+    }
+
+    fn decommit_chunk(&mut self, i: usize) {
+        let at = self.base + i * self.chunk_len() as usize;
+        title_virtual_free(at as *mut c_void, self.chunk_len() as usize, windows_sys::Win32::System::Memory::MEM_DECOMMIT);
+        self.chunks[i] = Chunk::default();
+        self.committed -= self.shape.chunk;
+        self.decommits += 1;
+        self.free_chunks -= 1;
+    }
+
+    /// Chunks without blocks beyond the hysteresis go.
+    fn trim(&mut self) {
+        while self.free_chunks > self.hysteresis {
+            let Some(i) = self.chunks.iter().rposition(|c| c.committed && c.blocks == 0) else { break };
+            self.decommit_chunk(i);
+        }
     }
 
     fn take(&mut self, size: usize, align: usize) -> Option<usize> {
-        let size = size.next_multiple_of(self.unit);
-        let align = align.max(self.unit);
-        loop {
-            let found = self.free.iter().find_map(|(&at, &len)| {
-                let start = at.next_multiple_of(align);
-                (start + size <= at + len).then_some((at, len, start))
-            });
-            if let Some((at, len, start)) = found {
-                self.free.remove(&at);
-                if start > at {
-                    self.free.insert(at, start - at);
-                }
-                if start + size < at + len {
-                    self.free.insert(start + size, at + len - start - size);
-                }
-                self.used.insert(start, size);
-                return Some(start);
-            }
-            // Grow: a chunk, or as much as the block needs with its
-            // alignment.
-            let grow = self.chunk.max((size + align).next_multiple_of(self.chunk));
-            if self.committed + grow > BLOCKS_RESERVED {
-                return None;
-            }
-            let at = self.base + self.committed;
-            if XMemVirtualAlloc(at as *mut c_void, grow, MEM_COMMIT, self.flags, self.protect).is_null() {
-                return None;
-            }
-            self.committed += grow;
-            self.release(at, grow);
+        let size = size.next_multiple_of(self.shape.unit as usize) as u32;
+        let align = align.max(self.shape.unit as usize) as u32;
+        if size > self.chunk_len() || align > self.chunk_len() {
+            return None;
         }
+        // Chunks in use first, then committed free ones, then a new one.
+        let mut found = None;
+        for (i, c) in self.chunks.iter_mut().enumerate() {
+            if c.committed && c.blocks > 0 && let Some(at) = c.take(size, align) {
+                found = Some((i, at));
+                break;
+            }
+        }
+        if found.is_none() {
+            let i = match self.chunks.iter().position(|c| c.committed && c.blocks == 0) {
+                Some(i) => i,
+                None => self.commit_chunk()?,
+            };
+            let at = self.chunks[i].take(size, align)?;
+            self.free_chunks -= 1;
+            found = Some((i, at));
+        }
+        let (i, at) = found?;
+        let address = self.base + i * self.chunk_len() as usize + at as usize;
+        self.used.insert(address, size);
+        Some(address)
     }
 
-    fn give_back(&mut self, at: usize) -> bool {
-        match self.used.remove(&at) {
-            Some(len) => {
-                self.release(at, len);
-                true
-            }
-            None => false,
+    fn give_back(&mut self, address: usize) -> bool {
+        let Some(len) = self.used.remove(&address) else {
+            return false;
+        };
+        let i = (address - self.base) / self.chunk_len() as usize;
+        let at = (address - self.base) as u32 % self.chunk_len();
+        self.chunks[i].give_back(at, len);
+        if self.chunks[i].blocks == 0 {
+            self.free_chunks += 1;
+            self.trim();
         }
+        true
+    }
+
+    /// `XMemSetAllocationHysteresis` (`xmem!0x180005b60`): in whole chunks,
+    /// rounded up; chunks without blocks beyond it are decommitted.
+    fn set_hysteresis(&mut self, bytes: u64) {
+        self.hysteresis = bytes.div_ceil(self.shape.chunk) as u32;
+        self.trim();
+    }
+
+    /// `XMemPreallocateFreeSpace` (`xmem!0x180005a70`): chunks without
+    /// blocks committed up to the hysteresis.
+    fn preallocate(&mut self) -> bool {
+        while self.free_chunks < self.hysteresis {
+            if self.commit_chunk().is_none() {
+                return false;
+            }
+        }
+        true
     }
 }
 
 /// The heaps of [`Blocks`] by index: memory type, plus 16 for 4 KiB units.
 static BLOCKS: [Mutex<Option<Blocks>>; 32] = [const { Mutex::new(None) }; 32];
 
+/// The heap of `index`, made at its first use as the console makes it.
+fn with_heap<T>(index: usize, f: impl FnOnce(&mut Blocks) -> T) -> Option<T> {
+    let mut heap = BLOCKS[index].lock().unwrap_or_else(|e| e.into_inner());
+    if heap.is_none() {
+        *heap = Blocks::new(index);
+    }
+    heap.as_mut().map(f)
+}
+
 /// The system allocator behind [`XMemAlloc`], routed as `xmem.dll` routes
-/// it ([`Route`]): null for no bytes or an unknown memory type.
+/// it ([`Route`], `xmem!0x1800055b0`): null for no bytes or an unknown
+/// memory type.
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapAlloc};
-    note_default(size, attributes);
-    let Some(route) = Route::of(size, attributes) else {
+    let env = env();
+    let Some(route) = Route::of(&env, size as u64, attributes) else {
         return std::ptr::null_mut();
     };
+    note_default(route, size, attributes);
     match route {
-        // SAFETY: the process heap, plain allocation.
-        Route::ProcessHeap => unsafe { HeapAlloc(GetProcessHeap(), 0, size) },
+        Route::ProcessHeap => {
+            // SAFETY: the process heap, plain allocation.
+            let (heap, block) = unsafe { (GetProcessHeap(), HeapAlloc(GetProcessHeap(), 0, size)) };
+            // `xmem!0x180004680`: the tracking hook sees it.
+            let hook = more::TRACKING.lock().unwrap_or_else(|e| e.into_inner())[0];
+            if hook != 0 {
+                // SAFETY: the title's routine of this type.
+                let f: extern "system" fn(HANDLE, u32, usize, *mut c_void) = unsafe { std::mem::transmute(hook) };
+                f(heap, 0, size, block);
+            }
+            block
+        }
         Route::Virtual => {
-            let (kind, flags, protect) = virtual_request(attributes);
+            let (kind, flags, protect) = spec::virtual_request(&env, attributes);
             XMemVirtualAlloc(std::ptr::null_mut(), size, kind, flags, protect)
         }
-        Route::SmallBlocks | Route::MediumBlocks => {
-            let index = memory_type(attributes) | if route == Route::MediumBlocks { 0x10 } else { 0 };
+        Route::Heap(index) => {
             let align = 1usize << (attributes >> ALIGNMENT_SHIFT & 0x1f);
-            let mut heap = BLOCKS[index].lock().unwrap_or_else(|e| e.into_inner());
-            if heap.is_none() {
-                *heap = Blocks::new(index);
-            }
-            let block = heap.as_mut().and_then(|h| h.take(size, align));
+            let block = with_heap(index, |h| h.take(size, align)).flatten();
             if block.is_none() {
                 tracing::warn!(size, attributes = format_args!("{attributes:#x}"), "XMemAllocDefault: out of memory");
             }
@@ -845,19 +790,25 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     }
 }
 
-/// Frees what [`XMemAllocDefault`] returned, as `xmem.dll` does: by the
-/// attributes the process heap's; else a block of the type's heaps if the
-/// address lies in one; else an allocation of its own, released.
+/// Frees what [`XMemAllocDefault`] returned, as `xmem.dll` does
+/// (`xmem!0x180005820`): by the attributes the process heap's; else a
+/// block of the type's heaps if the address lies in one; else an
+/// allocation of its own, released (null too: the host's error).
 pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
-    if address.is_null() {
-        return;
-    }
     let t = memory_type(attributes);
     let align = attributes >> ALIGNMENT_SHIFT & 0x1f;
     if KIND_ALLOCATION[t] == 0 && align <= 4 && attributes >> 14 & 3 == 0 {
         // SAFETY: a block of the process heap, by the caller's attributes.
-        unsafe { HeapFree(GetProcessHeap(), 0, address) };
+        let heap = unsafe { GetProcessHeap() };
+        // SAFETY: as above.
+        unsafe { HeapFree(heap, 0, address) };
+        let hook = more::TRACKING.lock().unwrap_or_else(|e| e.into_inner())[2];
+        if hook != 0 {
+            // SAFETY: the title's routine of this type.
+            let f: extern "system" fn(HANDLE, u32, *mut c_void) = unsafe { std::mem::transmute(hook) };
+            f(heap, 0, address);
+        }
         return;
     }
     for index in [t, t | 0x10] {
@@ -876,7 +827,8 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
 
 /// A retail console has no tools memory.
 pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
-    0
+    // `xmem!0x180002b60`: profiling mode.
+    env().profiling(false).into()
 }
 
 // Physical pages: on the console, 64 KiB frames a title maps into its own
@@ -1144,16 +1096,18 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    // 2 MiB pages come as 32 of 64 KiB (STATUS_INVALID_PARAMETER_2).
+    // 2 MiB pages come as 32 of 64 KiB (STATUS_INVALID_PARAMETER_2; the
+    // count is left as it was).
     if flags as u32 & PAGES_64K == PAGES_2M && n % 32 != 0 {
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
         set_last_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
+    // No pages: a success that asks the kernel for nothing.
+    if n == 0 {
+        return 1;
+    }
+    let Some(size) = n.checked_mul(PAGE) else {
+        set_last_error(ERROR_INVALID_PARAMETER);
         return 0;
     };
     // A pagefile-backed section of `size` bytes, its pages committed when
@@ -1707,6 +1661,22 @@ pub extern "system" fn XMemMapPhysicalPages(
     if n == 0 {
         return address;
     }
+    // Success leaves the thread's error as it was (the host calls below set
+    // it).
+    let error = last_error();
+    let at = map_pages(address, n, pages);
+    if !at.is_null() {
+        set_last_error(error);
+    }
+    at
+}
+
+fn last_error() -> u32 {
+    // SAFETY: plain thread state.
+    unsafe { windows_sys::Win32::Foundation::GetLastError() }
+}
+
+fn map_pages(address: *mut c_void, n: usize, pages: *const usize) -> *mut c_void {
     let base = address as usize;
     // Read before any lock is taken: a fault in title memory may wait for
     // the mapping call that holds them.
@@ -1742,6 +1712,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     while i < n {
         let Some(first) = slices[i].clone() else {
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
+            set_last_error(ERROR_INVALID_PARAMETER);
             return std::ptr::null_mut();
         };
         // One view per run of consecutive slices of one section.
@@ -1776,6 +1747,15 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if n == 0 {
         return 1;
     }
+    let error = last_error();
+    let ok = scatter_pages(addresses, n, pages);
+    if ok != 0 {
+        set_last_error(error);
+    }
+    ok
+}
+
+fn scatter_pages(addresses: *const *mut c_void, n: usize, pages: *const usize) -> BOOL {
     lift_thread();
     if side_by_side() > 1 && n > 1 {
         // Read before any lock is taken, as in `XMemMapPhysicalPages`.
@@ -2543,18 +2523,32 @@ pub extern "system" fn XMemGetWorkingSetStatistics(which: u32, out: *mut Working
 /// others are invalid (also with no bytes, though no bytes is otherwise a
 /// success).
 pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
-    const TITLE_TO_SYSTEM: u32 = 0;
+    // Success leaves the thread's error alone (the log line may not).
+    let error = last_error();
     tracing::info!(kind, size, "XMemTransferMemory");
-    if kind == 1 || kind == 2 {
+    set_last_error(error);
+    transfer(kind, size)
+}
+
+fn transfer(kind: u32, size: usize) -> BOOL {
+    const TITLE_TO_SYSTEM: u32 = 0;
+    let env = env();
+    // `xmem!0x1800031b0`: tools transfers need profiling mode, and the Series
+    // S takes no tools memory into the title.
+    if (kind == 1 || kind == 2) && !env.profiling(false) || env.mode == 0x60 && kind == 2 {
         set_last_error(ERROR_NOT_SUPPORTED);
         return 0;
     }
     if size == 0 {
         return 1;
     }
-    if kind != TITLE_TO_SYSTEM {
+    if kind > 2 {
         set_last_error(ERROR_INVALID_PARAMETER);
         return 0;
+    }
+    if kind != TITLE_TO_SYSTEM {
+        // Tools memory: a devkit's, which the layer has none of to move.
+        return 1;
     }
     let Some(size) = size.checked_next_multiple_of(2 * MIB) else {
         set_last_error(ERROR_INVALID_PARAMETER);
@@ -2604,12 +2598,16 @@ pub(crate) fn module() -> HleModule {
             hle_export!(XMemVirtualQuery),
             hle_export!(XMemGetWorkingSetStatistics),
             hle_export!(XMemTransferMemory),
-        ],
+            hle_export!(XMemSetAllocationHooks),
+        ]
+        .into_iter()
+        .chain(more::exports())
+        .collect(),
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod unit_tests {
     use super::*;
 
     fn query(address: *const c_void) -> BasicInformation {
@@ -2633,64 +2631,9 @@ mod tests {
             XMemFree(p, attributes);
         }
         // 32-bit graphics memory: [2 GiB, 4 GiB) where the host has room.
-        let p = XMemAlloc(4096, ALLOC_32BIT | 1 << 29);
+        let p = XMemAlloc(4096, spec::ALLOC_32BIT | 1 << 29);
         assert!(!p.is_null() && (p as usize) < 1 << 32);
-        XMemFree(p, ALLOC_32BIT | 1 << 29);
-    }
-
-    #[test]
-    fn alloc_default_routes_as_the_console() {
-        assert!(XMemAllocDefault(0, 1 << 29).is_null(), "no bytes");
-        assert!(XMemAllocDefault(64, 13 << 29).is_null(), "an unknown memory type");
-        // CPU memory with a 32-bit address goes to XMemVirtualAlloc with
-        // bit 23 kept, which it refuses as MEM_ROTATE.
-        assert!(XMemAllocDefault(1 << 20, ALLOC_32BIT | 5 << ALIGNMENT_SHIFT).is_null());
-        assert_eq!(Route::of(64, 0), Some(Route::ProcessHeap));
-        assert_eq!(Route::of(64, 1 << 29), Some(Route::SmallBlocks));
-        assert_eq!(Route::of(0x1000, 1 << 29), Some(Route::MediumBlocks));
-        assert_eq!(Route::of(0x2_0001, 1 << 29), Some(Route::Virtual));
-        assert_eq!(Route::of(64, 7 << 29), Some(Route::Virtual));
-        // The title's 64 MiB of type 1 in 2 MiB pages.
-        assert_eq!(virtual_request(0x3080_8000), (MEM_COMMIT | MEM_RESERVE | PAGES_2M, GRAPHICS, 0x2404));
-        // Its type 7 in 64 KiB pages.
-        assert_eq!(virtual_request(0xf081_4000), (MEM_COMMIT | MEM_RESERVE | PAGES_64K, XMEM_CPU, 4));
-        // Graphics blocks lie in graphics memory below 1 TiB.
-        let p = XMemAllocDefault(0x1_0000, 0x7080_4000);
-        assert!(!p.is_null() && (p as usize) < 1 << 40 && p as usize % 4096 == 0);
-        let mut info: BasicInformation = unsafe { std::mem::zeroed() };
-        // SAFETY: a pseudo handle needs no closing.
-        assert_eq!(XMemVirtualQuery(unsafe { GetCurrentProcess() }, p, &mut info), 1);
-        assert_eq!(info.flags, GRAPHICS);
-        assert_eq!(info.host.Protect, 0x22004);
-        XMemFreeDefault(p, 0x7080_4000);
-    }
-
-    #[test]
-    fn virtual_alloc_checks_as_the_console() {
-        let refused = |size, kind, flags, protect| {
-            XMemVirtualAlloc(std::ptr::null_mut(), size, kind, flags, protect).is_null()
-                && std::io::Error::last_os_error().raw_os_error() == Some(87)
-        };
-        assert!(refused(0, MEM_RESERVE, XMEM_CPU, PAGE_READWRITE), "no bytes");
-        assert!(refused(MIB, MEM_RESERVE, XMEM_CPU, 0), "no protection");
-        assert!(refused(MIB, MEM_RESERVE, XMEM_GPU, PAGE_READWRITE), "no CPU flag");
-        assert!(refused(MIB, MEM_RESERVE | MEM_RESET, XMEM_CPU, PAGE_READWRITE), "reset");
-        assert!(refused(MIB, MEM_RESERVE, GRAPHICS, PAGE_READWRITE | PAGE_NOCACHE), "uncached GPU memory");
-        assert!(refused(MIB, MEM_RESERVE | MEM_COMMIT | PAGES_64K, XMEM_CPU | XMEM_MAPPABLE, PAGE_READWRITE), "mappable commit");
-        assert!(refused(MIB, MEM_RESERVE, XMEM_CPU | XMEM_MAPPABLE, PAGE_READWRITE), "mappable 4 KiB pages");
-        assert!(refused(MIB, MEM_RESERVE, XMEM_CPU | 1 << 40, PAGE_READWRITE), "a tag on a reservation");
-        assert!(refused(MIB, MEM_RESERVE, XMEM_CPU | XMEM_BANDWIDTH, PAGE_READWRITE), "bandwidth in 4 KiB pages");
-        // Sizes in whole pages.
-        let p = XMemVirtualAlloc(std::ptr::null_mut(), 100, MEM_RESERVE | MEM_COMMIT | PAGES_64K, GRAPHICS, PAGE_READWRITE | 0x2000);
-        assert!(!p.is_null() && p as usize % (64 << 10) == 0);
-        // SAFETY: the whole 64 KiB page is committed.
-        unsafe { p.cast::<u8>().add((64 << 10) - 1).write(1) };
-        title_virtual_free(p, 0, MEM_RELEASE);
-        // A placeholder: 2 MiB-aligned.
-        let p = XMemVirtualAlloc(std::ptr::null_mut(), 3 * MIB, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, GRAPHICS, PAGE_NOACCESS);
-        assert!(!p.is_null() && p as usize % (2 * MIB) == 0, "{p:p}");
-        // SAFETY: our own reservation.
-        unsafe { VirtualFree(p, 0, MEM_RELEASE) };
+        XMemFree(p, spec::ALLOC_32BIT | 1 << 29);
     }
 
     #[test]
@@ -2791,7 +2734,7 @@ mod tests {
         // As the title's heap: a 32-bit reservation of 64 KiB pages, all of
         // its pages from one call, mapped piece by piece in another order.
         // The title's own kind: reserve and 0x40000, no 64 KiB page bits.
-        let base = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, GRAPHICS | ADDRESS_32BIT, PAGE_NOACCESS);
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, GRAPHICS | spec::XMEM_32BIT, PAGE_NOACCESS);
         assert!(!base.is_null() && (base as usize) < 1 << 32);
         assert!(LOW_RESERVATIONS.lock().unwrap().iter().any(|r| r.0 == base as usize), "the reservation is known");
         let pages = allocate(4);

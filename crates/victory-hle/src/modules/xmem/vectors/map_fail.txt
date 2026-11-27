@@ -1,0 +1,2 @@
+XMemMapPhysicalPages 10000000 1 buf:8 -> 0 57 buf2=0000000000000000 | NtMapUserPhysicalPages(va=0x10000000,n=0x1,pages=0000000000000000)
+XMemMapPhysicalPagesScatter buf:8 1 buf:8 -> 0 57 buf0=0000000000000000 buf2=0000000000000000 | NtMapUserPhysicalPagesScatter(n=0x1,pages=True)

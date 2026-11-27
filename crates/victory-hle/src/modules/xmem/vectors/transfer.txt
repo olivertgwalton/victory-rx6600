@@ -1,0 +1,36 @@
+XMemTransferMemory 0 0 -> 1 dead  |
+XMemTransferMemory 0 1 -> 1 dead  | NtDeviceIoControlFile(code=0x1500e0,in=00000000070000000000000000000000010000000000000000020000000000000000000040000000,outlen=40)
+XMemTransferMemory 0 1fffff -> 1 dead  | NtDeviceIoControlFile(code=0x1500e0,in=00000000070000000000000000000000010000000000000000020000000000000000000040000000,outlen=40)
+XMemTransferMemory 0 200000 -> 1 dead  | NtDeviceIoControlFile(code=0x1500e0,in=00000000070000000000000000000000010000000000000000020000000000000000000040000000,outlen=40)
+XMemTransferMemory 0 200001 -> 1 dead  | NtDeviceIoControlFile(code=0x1500e0,in=00000000070000000000000000000000010000000000000000040000000000000000000040000000,outlen=40)
+XMemTransferMemory 0 12345678 -> 1 dead  | NtDeviceIoControlFile(code=0x1500e0,in=00000000070000000000000000000000010000000000000000240100000000000000000040000000,outlen=40)
+XMemTransferMemory 1 0 -> 0 32  |
+XMemTransferMemory 1 1 -> 0 32  |
+XMemTransferMemory 1 1fffff -> 0 32  |
+XMemTransferMemory 1 200000 -> 0 32  |
+XMemTransferMemory 1 200001 -> 0 32  |
+XMemTransferMemory 1 12345678 -> 0 32  |
+XMemTransferMemory 2 0 -> 0 32  |
+XMemTransferMemory 2 1 -> 0 32  |
+XMemTransferMemory 2 1fffff -> 0 32  |
+XMemTransferMemory 2 200000 -> 0 32  |
+XMemTransferMemory 2 200001 -> 0 32  |
+XMemTransferMemory 2 12345678 -> 0 32  |
+XMemTransferMemory 3 0 -> 1 dead  |
+XMemTransferMemory 3 1 -> 0 57  |
+XMemTransferMemory 3 1fffff -> 0 57  |
+XMemTransferMemory 3 200000 -> 0 57  |
+XMemTransferMemory 3 200001 -> 0 57  |
+XMemTransferMemory 3 12345678 -> 0 57  |
+XMemTransferMemory 4 0 -> 1 dead  |
+XMemTransferMemory 4 1 -> 0 57  |
+XMemTransferMemory 4 1fffff -> 0 57  |
+XMemTransferMemory 4 200000 -> 0 57  |
+XMemTransferMemory 4 200001 -> 0 57  |
+XMemTransferMemory 4 12345678 -> 0 57  |
+XMemTransferMemory 5 0 -> 1 dead  |
+XMemTransferMemory 5 1 -> 0 57  |
+XMemTransferMemory 5 1fffff -> 0 57  |
+XMemTransferMemory 5 200000 -> 0 57  |
+XMemTransferMemory 5 200001 -> 0 57  |
+XMemTransferMemory 5 12345678 -> 0 57  |
