@@ -45,6 +45,8 @@ walkdir = "2.5.1"
 tempfile = "3.27.0"
 # Opus decoding for the console's audio decoder (BSD-3-Clause, pure Rust).
 opus-pure = "0.2.4"
+# Benchmarks only (Apache-2.0/MIT); no plots, no rayon.
+criterion = { version = "0.5.1", default-features = false, features = ["cargo_bench_support"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
