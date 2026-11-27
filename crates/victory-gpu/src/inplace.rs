@@ -142,6 +142,42 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     Ok(Placed { buffer, heap, gpu, bias: start - at })
 }
 
+fn views_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_VIEWS").is_some_and(|v| v == "1"))
+}
+
+/// Heaps opened on views so far, and their bytes (each pins its pages until
+/// the copy that holds it goes).
+static VIEW_OPENS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Title memory `[start, start + len)` that views show whole, as one dma-buf
+/// of their pieces in the order the title sees them, and a buffer over all
+/// of it; `None` if a part is in no view or the host refuses.
+fn place_in_views(device: &ID3D12Device, start: u64, len: u64) -> Option<Placed> {
+    let at = start & !(K64 as u64 - 1);
+    let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
+    let pieces = pieces(at as usize, bytes as usize)?;
+    let heap = match crate::dmabuf::open_heap_list(device, &pieces) {
+        Ok(heap) => heap,
+        Err(e) => {
+            if VIEW_OPENS[2].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(start = format_args!("{start:#x}"), bytes, pieces = pieces.len(), error = %e, "title memory in views: not opened as a dma-buf; a copy instead");
+            }
+            return None;
+        }
+    };
+    let buffer = place_with(device, &heap, 0, bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS).ok()?;
+    let n = VIEW_OPENS[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let total = VIEW_OPENS[1].fetch_add(bytes, Ordering::Relaxed) + bytes;
+    if n.is_power_of_two() || n.is_multiple_of(256) {
+        tracing::info!(opened = n, mb = total >> 20, refused = VIEW_OPENS[2].load(Ordering::Relaxed), pieces = pieces.len(), "title memory in views opened as dma-bufs so far (each let go when the title remaps it)");
+    }
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+    Some(Placed { buffer, heap, gpu, bias: start - at })
+}
+
 fn hostptr_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_HOSTPTR").is_some_and(|v| v == "1"))
@@ -245,6 +281,20 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if crate::dmabuf::on()
         && let Some(host) = crate::host::host()
         && let Some(placed) = place_in_section(&host.device, start, len)
+    {
+        let at = if window { 0 } else { 2 };
+        STATS[at].fetch_add(1, Ordering::Relaxed);
+        STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+        return Some(placed);
+    }
+    // In views of the title's physical pages (the page pool, the tiled
+    // range): one dma-buf of the pages as the title sees them
+    // (`VICTORY_INPLACE_VIEWS=1`). A remap there lets it go
+    // (`title_memory_freeing`), and the next use opens it anew.
+    if crate::dmabuf::on()
+        && views_on()
+        && let Some(host) = crate::host::host()
+        && let Some(placed) = place_in_views(&host.device, start, len)
     {
         let at = if window { 0 } else { 2 };
         STATS[at].fetch_add(1, Ordering::Relaxed);
