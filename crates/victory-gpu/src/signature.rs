@@ -85,8 +85,8 @@ extern "system" fn release(this: This) -> u32 {
 }
 
 /// IUnknown 3, object 4, device child 1.
-static FUNCTIONS: Table<24> = {
-    let mut f = object::d3d12_object(object::missing_table::<COMMAND_SIGNATURE, 24>());
+pub(crate) static FUNCTIONS: Table<24> = {
+    let mut f = object::d3d12_object(object::reference_stubs(object::missing_table::<COMMAND_SIGNATURE, 24>(), &crate::reference::COMMAND_SIGNATURE));
     f[0] = query as *const ();
     f[2] = release as *const ();
     f[7] = object::parent_device as *const (); // 0x38

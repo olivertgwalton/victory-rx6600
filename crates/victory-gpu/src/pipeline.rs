@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
-const PIPELINE_IIDS: [Iid; 4] = [
+pub(crate) const PIPELINE_IIDS: [Iid; 4] = [
     guid(
         0x765a30f3,
         0xf624,
@@ -472,7 +472,7 @@ pub(crate) fn note_targets(formats: &[DXGI_FORMAT], depth: DXGI_FORMAT, samples:
 /// Stage names, in description order.
 const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geometry"];
 
-fn pipeline<'a>(this: This) -> &'a Pipeline {
+pub(crate) fn pipeline<'a>(this: This) -> &'a Pipeline {
     // SAFETY: the title passes one of our pipelines.
     unsafe { &*this.cast::<Pipeline>() }
 }
@@ -935,8 +935,8 @@ extern "system" fn release(this: This) -> u32 {
 }
 
 /// IUnknown 3, object 4, device child 1, pipeline 3.
-static FUNCTIONS: Table<24> = {
-    let mut f = object::d3d12_object(object::missing_table::<PIPELINE, 24>());
+pub(crate) static FUNCTIONS: Table<24> = {
+    let mut f = object::d3d12_object(object::reference_stubs(object::missing_table::<PIPELINE, 24>(), &crate::reference::PIPELINE));
     f[0] = query as *const ();
     f[2] = release as *const ();
     f[7] = object::parent_device as *const (); // 0x38

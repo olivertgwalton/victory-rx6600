@@ -191,8 +191,8 @@ extern "system" fn gpu_address(this: This) -> u64 {
 
 /// IUnknown 3, object 4, device child 1, fence 3, fence 1 (2, a console
 /// one among them).
-static FUNCTIONS: Table<24> = {
-    let mut f = object::d3d12_object(object::missing_table::<FENCE, 24>());
+pub(crate) static FUNCTIONS: Table<24> = {
+    let mut f = object::d3d12_object(object::reference_stubs(object::missing_table::<FENCE, 24>(), &crate::reference::FENCE));
     f[0] = query as *const ();
     f[2] = release as *const ();
     f[7] = object::parent_device as *const (); // 0x38

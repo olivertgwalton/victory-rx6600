@@ -242,3 +242,46 @@ mod tests {
         assert_eq!(regs, before);
     }
 }
+
+/// Device 0x1b8 on a pipeline from 0x1c8: a new pipeline, one reference,
+/// the base's stages and layout, its register image with the records
+/// written (`apply`), the base untouched (+0x493e0 copies the image).
+#[cfg(all(test, windows))]
+mod made {
+    use super::*;
+    use crate::object::{S_OK, This};
+
+    #[test]
+    fn a_variant_is_its_base_with_the_records_written() {
+        let regs: Vec<u8> = {
+            let mut w = vec![0u32; 48];
+            w[4] = 0x00cc_0010;
+            w.iter().flat_map(|x| x.to_le_bytes()).collect()
+        };
+        let mut base: This = std::ptr::null();
+        let iid = crate::pipeline::PIPELINE_IIDS[0];
+        assert_eq!(crate::pipeline::hand_out_native_graphics(Vec::new(), regs.clone(), vec![1, 2, 3], &iid, &mut base), S_OK);
+        // Rasterizer: cull front (2), clockwise.
+        let mut record = vec![0u8; RECORD];
+        record[0..4].copy_from_slice(&1u32.to_le_bytes());
+        record[4..8].copy_from_slice(&3u32.to_le_bytes());
+        record[8..12].copy_from_slice(&2u32.to_le_bytes());
+        let mut variant: This = std::ptr::null();
+        let d = crate::device::device();
+        let f: extern "system" fn(This, This, u32, *const u8, *const crate::object::Iid, *mut This) -> crate::object::HRESULT =
+            crate::object::slot(d, 0x1b8);
+        assert_eq!(f(d, base, 1, record.as_ptr(), std::ptr::null(), &mut variant), S_OK);
+        assert!(!variant.is_null() && variant != base);
+        let (b, v) = (crate::pipeline::pipeline(base), crate::pipeline::pipeline(variant));
+        let (bn, vn) = (b.native.as_ref().unwrap(), v.native.as_ref().unwrap());
+        assert_eq!(bn.regs, regs);
+        let mut expected = regs.clone();
+        apply(&mut expected, &record).unwrap();
+        assert_eq!(vn.regs, expected);
+        assert_eq!(vn.layout, vec![1, 2, 3]);
+        let release: extern "system" fn(This) -> u32 = crate::object::slot(variant, 0x10);
+        assert_eq!(release(variant), 0);
+        let release: extern "system" fn(This) -> u32 = crate::object::slot(base, 0x10);
+        assert_eq!(release(base), 0);
+    }
+}

@@ -515,8 +515,8 @@ extern "system" fn removed_reason(_: This) -> HRESULT {
 /// 1, 2, 9 (0x298-0x3a0, the console's own among them), then those of
 /// `ID3D12Device9` to `ID3D12Device11`, whose console layout is unknown.
 /// Every slot exists so that a call to one we have not written logs it.
-static FUNCTIONS: Table<160> = {
-    let mut f = object::d3d12_object(object::missing_table::<{ object::DEVICE }, 160>());
+pub(crate) static FUNCTIONS: Table<160> = {
+    let mut f = object::d3d12_object(object::reference_stubs(object::missing_table::<{ object::DEVICE }, 160>(), &crate::reference::DEVICE));
     f[0] = query_interface as *const (); // 0x00
     f[7] = node_count as *const (); // 0x38
     f[8] = queue::create as *const (); // 0x40

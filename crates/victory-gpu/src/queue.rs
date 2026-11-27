@@ -1316,8 +1316,12 @@ const fn newer_slot(slot: usize) -> usize {
     if slot >= 14 { slot + 2 } else { slot }
 }
 
-const fn queue_table(newer: bool) -> [*const (); 36] {
-    let mut f = object::d3d12_object(object::missing_table::<QUEUE, 36>());
+const fn queue_table(newer: bool) -> [*const (); 40] {
+    let mut f = object::missing_table::<QUEUE, 40>();
+    if newer {
+        f = object::reference_stubs(f, &crate::reference::QUEUE);
+    }
+    let mut f = object::d3d12_object(f);
     let mut i = 0;
     while i < METHODS.len() {
         let (slot, method) = METHODS[i];
@@ -1351,8 +1355,8 @@ extern "system" fn resume(_: This) -> HRESULT {
     S_OK
 }
 
-static FUNCTIONS: Table<36> = Table(queue_table(false));
-static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
+static FUNCTIONS: Table<40> = Table(queue_table(false));
+pub(crate) static NEWER_FUNCTIONS: Table<40> = Table(queue_table(true));
 
 #[cfg(test)]
 mod tests {

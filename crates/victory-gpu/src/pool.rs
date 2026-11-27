@@ -1099,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_block_is_not_retried_for_each_small_upload() {
+    fn a_failed_block_is_not_retried_for_each_small_upload_again() {
         let mut pool: Pool<u32> = Pool::new(2);
         let calls = std::cell::Cell::new(0);
         let refuse = || { calls.set(calls.get() + 1); None };
@@ -1125,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn budget_tick_reclaims_idle_blocks_without_reusing_live_or_resting_pieces() {
+    fn budget_tick_reclaims_idle_blocks_without_reusing_live_or_resting_pieces_again() {
         let mut pool = Pool::new(STAGING_KEPT);
         let (held, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
         let (resting, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(2)).unwrap();

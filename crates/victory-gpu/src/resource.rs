@@ -3405,8 +3405,8 @@ extern "system" fn heap_properties(
 }
 
 /// IUnknown 3, object 4, device child 1, heap 1.
-static HEAP_FUNCTIONS: Table<24> = {
-    let mut f = object::d3d12_object(object::missing_table::<HEAP, 24>());
+pub(crate) static HEAP_FUNCTIONS: Table<24> = {
+    let mut f = object::d3d12_object(object::reference_stubs(object::missing_table::<HEAP, 24>(), &crate::reference::HEAP));
     f[0] = heap_query as *const ();
     f[2] = heap_release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
@@ -3416,8 +3416,8 @@ static HEAP_FUNCTIONS: Table<24> = {
 
 /// IUnknown 3, object 4, device child 1, resource 10 (7 as on PC, then 3
 /// console ones).
-static RESOURCE_FUNCTIONS: Table<32> = {
-    let mut f = object::d3d12_object(object::missing_table::<RESOURCE, 32>());
+pub(crate) static RESOURCE_FUNCTIONS: Table<32> = {
+    let mut f = object::d3d12_object(object::reference_stubs(object::missing_table::<RESOURCE, 32>(), &crate::reference::RESOURCE));
     f[0] = resource_query as *const ();
     f[2] = resource_release as *const ();
     f[7] = object::parent_device as *const (); // 0x38

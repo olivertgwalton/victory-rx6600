@@ -1549,8 +1549,8 @@ extern "system" fn resolve_queries(
 }
 
 /// IUnknown 3, object 4, device child 1, allocator 2.
-static ALLOCATOR_FUNCTIONS: Table<24> = {
-    let mut f = object::d3d12_object(object::missing_table::<ALLOCATOR, 24>());
+pub(crate) static ALLOCATOR_FUNCTIONS: Table<24> = {
+    let mut f = object::d3d12_object(object::reference_stubs(object::missing_table::<ALLOCATOR, 24>(), &crate::reference::ALLOCATOR));
     f[0] = allocator_query as *const ();
     f[2] = allocator_release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
@@ -2367,7 +2367,11 @@ const NEWER_METHODS: [(usize, *const ()); 3] = [
 ];
 
 const fn list_table(newer: bool) -> [*const (); 160] {
-    let mut f = object::d3d12_object(object::missing_table::<LIST, 160>());
+    let mut f = object::missing_table::<LIST, 160>();
+    if newer {
+        f = object::reference_stubs(f, &crate::reference::LIST);
+    }
+    let mut f = object::d3d12_object(f);
     let mut i = 0;
     while i < METHODS.len() + MORE_METHODS.len() {
         let (slot, method) = if i < METHODS.len() {
@@ -2389,7 +2393,7 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// Every slot up to the limit exists and logs, for the methods newer
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
-static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+pub(crate) static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 /// Of lists whose calls are written down.
 #[cfg(windows)]
 static THIN_FUNCTIONS: Table<160> = Table(thin::table(false));

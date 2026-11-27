@@ -138,13 +138,20 @@ pub(crate) fn release_boxed<T>(this: This) -> u32 {
         Ok(1) => {
             let address = this as usize;
             let keys = (address, [u8::MIN; 16])..=(address, [u8::MAX; 16]);
+            let mut gone = Vec::new();
             {
                 let mut data = private_data();
                 // An object's IDs are contiguous in key order. Seek directly to
                 // them so releases don't visit private data held by other objects.
                 while let Some((&key, _)) = data.range(keys.clone()).next() {
-                    data.remove(&key);
+                    if let Some(old) = data.remove(&key) {
+                        gone.push((key, old));
+                    }
                 }
+            }
+            // Outside the lock: a release may free another of our objects.
+            for (key, old) in gone {
+                drop_interface(&key, &old);
             }
             // SAFETY: that was the last reference to a `Box<T>`.
             drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });
@@ -152,6 +159,42 @@ pub(crate) fn release_boxed<T>(this: This) -> u32 {
         }
         Ok(n) => n - 1,
         Err(_) => 0,
+    }
+}
+
+/// Which private data entries are interfaces (set with
+/// `SetPrivateDataInterface`): their 8 bytes are a pointer we hold a
+/// reference to.
+static INTERFACES: Mutex<std::collections::BTreeSet<(usize, Iid)>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// How many entries [`INTERFACES`] holds: while none, nothing looks there.
+static INTERFACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+fn interfaces() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<(usize, Iid)>> {
+    INTERFACES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Calls IUnknown's AddRef (`slot` 1) or Release (2) of a COM object.
+fn count(object: usize, slot: usize) {
+    if object == 0 {
+        return;
+    }
+    // SAFETY: a COM object the title gave us: its first word is its table,
+    // whose slots 1 and 2 count references.
+    unsafe {
+        let table = *(object as *const *const extern "system" fn(usize) -> u32);
+        (*table.add(slot))(object);
+    }
+}
+
+/// An entry going: the reference it held, if it was an interface.
+fn drop_interface(key: &(usize, Iid), value: &[u8]) {
+    if INTERFACE_COUNT.load(Ordering::Acquire) != 0
+        && interfaces().remove(key)
+        && { INTERFACE_COUNT.fetch_sub(1, Ordering::AcqRel); true }
+        && let Ok(bytes) = <[u8; 8]>::try_from(value)
+    {
+        count(usize::from_le_bytes(bytes), 2);
     }
 }
 
@@ -187,6 +230,14 @@ extern "system" fn get_private_data(
     }
     // SAFETY: the buffer holds `room` >= `len` bytes.
     unsafe { data.copy_from_nonoverlapping(value.as_ptr(), value.len()) };
+    if let Ok(bytes) = <[u8; 8]>::try_from(value.as_slice())
+        && INTERFACE_COUNT.load(Ordering::Acquire) != 0
+        && interfaces().contains(&(this as usize, *id))
+    {
+        drop(map);
+        // An interface comes out with a reference of the caller's.
+        count(usize::from_le_bytes(bytes), 1);
+    }
     S_OK
 }
 
@@ -201,13 +252,47 @@ extern "system" fn set_private_data(
     let Some(&id) = (unsafe { id.as_ref() }) else {
         return E_INVALIDARG;
     };
-    let mut map = private_data();
-    if data.is_null() {
-        map.remove(&(this as usize, id));
-    } else {
-        // SAFETY: the title passes `size` bytes.
-        let value = unsafe { std::slice::from_raw_parts(data, size as usize) };
-        map.insert((this as usize, id), value.to_vec());
+    let old = {
+        let mut map = private_data();
+        if data.is_null() {
+            map.remove(&(this as usize, id))
+        } else {
+            // SAFETY: the title passes `size` bytes.
+            let value = unsafe { std::slice::from_raw_parts(data, size as usize) };
+            map.insert((this as usize, id), value.to_vec())
+        }
+    };
+    if let Some(old) = old {
+        drop_interface(&(this as usize, id), &old);
+    }
+    S_OK
+}
+
+/// `SetPrivateDataInterface(id, unknown)`: the driver (GameOS
+/// `xgs12_10.dll` +0x41e80) keeps the interface under `id` (+0xa4e80),
+/// or with none removes the entry (+0xa5390). The object holds a reference
+/// until the entry is replaced or removed or the object goes;
+/// `GetPrivateData` hands the pointer out with a new reference.
+extern "system" fn set_private_data_interface(this: This, id: *const Iid, unknown: usize) -> HRESULT {
+    // SAFETY: the title passes an id (null is tolerated).
+    let Some(&id) = (unsafe { id.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    let key = (this as usize, id);
+    let old = {
+        let mut map = private_data();
+        if unknown == 0 {
+            map.remove(&key)
+        } else {
+            count(unknown, 1);
+            map.insert(key, unknown.to_le_bytes().to_vec())
+        }
+    };
+    if let Some(old) = old {
+        drop_interface(&key, &old);
+    }
+    if unknown != 0 && interfaces().insert(key) {
+        INTERFACE_COUNT.fetch_add(1, Ordering::AcqRel);
     }
     S_OK
 }
@@ -217,6 +302,7 @@ extern "system" fn set_private_data(
 pub(crate) const fn d3d12_object<const N: usize>(mut f: [*const (); N]) -> [*const (); N] {
     f[3] = get_private_data as *const (); // 0x18
     f[4] = set_private_data as *const (); // 0x20
+    f[5] = set_private_data_interface as *const (); // 0x28
     f[6] = set_name as *const (); // 0x30
     f
 }
@@ -346,6 +432,79 @@ pub(crate) extern "system" fn ignore() -> HRESULT {
 /// log of a slot we have not written.
 pub(crate) extern "system" fn not_implemented() -> HRESULT {
     E_NOTIMPL
+}
+
+// The driver's other stubs (`crate::reference`).
+extern "system" fn stub_ok() -> HRESULT {
+    S_OK
+}
+extern "system" fn stub_fail() -> HRESULT {
+    0x8000_4005_u32 as i32
+}
+extern "system" fn stub_access_denied() -> HRESULT {
+    0x8007_0005_u32 as i32
+}
+extern "system" fn stub_one() -> u32 {
+    1
+}
+extern "system" fn stub_minus_one() -> u32 {
+    u32::MAX
+}
+extern "system" fn stub_unsupported() -> HRESULT {
+    0x887A_0004_u32 as i32
+}
+extern "system" fn stub_no_interface() -> HRESULT {
+    E_NOINTERFACE
+}
+extern "system" fn stub_void() {}
+
+/// The stub that returns `value` as the driver's stubs do, if there is one.
+pub(crate) const fn stub_for(value: u32) -> Option<*const ()> {
+    Some(match value {
+        0 => stub_ok as *const (),
+        0x8000_4001 => not_implemented as *const (),
+        0x8000_4005 => stub_fail as *const (),
+        0x8007_0005 => stub_access_denied as *const (),
+        1 => stub_one as *const (),
+        0xffff_ffff => stub_minus_one as *const (),
+        0x887A_0004 => stub_unsupported as *const (),
+        0x8000_4002 => stub_no_interface as *const (),
+        _ => return None,
+    })
+}
+
+/// The void stub (the driver's +0xa880).
+pub(crate) const VOID_STUB: *const () = stub_void as *const ();
+
+/// Writes the driver's constant and void methods of `spec` into `table`:
+/// those slots answer as the console's do. Real methods written after
+/// replace them.
+pub(crate) const fn reference_stubs<const N: usize>(
+    mut table: [*const (); N],
+    spec: &[crate::reference::Slot],
+) -> [*const (); N] {
+    let mut i = 0;
+    while i < spec.len() && i < N {
+        match spec[i].kind {
+            crate::reference::Kind::Const(v) => {
+                if let Some(f) = stub_for(v) {
+                    table[i] = f;
+                }
+            }
+            crate::reference::Kind::Void => table[i] = VOID_STUB,
+            _ => {}
+        }
+        i += 1;
+    }
+    table
+}
+
+/// Whether `f` is the logging placeholder of slot `slot` of an object of
+/// kind `KIND` (a method not written).
+#[cfg(test)]
+pub(crate) fn is_missing<const KIND: usize>(f: *const (), slot: usize) -> bool {
+    // IUnknown's counting, which every table has, is not a placeholder.
+    slot > 2 && missing_table::<KIND, MAX_SLOTS>()[slot] == f
 }
 
 macro_rules! missing {

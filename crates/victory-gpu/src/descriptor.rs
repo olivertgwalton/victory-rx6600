@@ -1896,8 +1896,8 @@ extern "system" fn start(this: This) -> u64 {
 }
 
 /// IUnknown 3, object 4, device child 1, heap 3.
-static FUNCTIONS: Table<24> = {
-    let mut f = object::d3d12_object(object::missing_table::<DESCRIPTOR_HEAP, 24>());
+pub(crate) static FUNCTIONS: Table<24> = {
+    let mut f = object::d3d12_object(object::reference_stubs(object::missing_table::<DESCRIPTOR_HEAP, 24>(), &crate::reference::DESCRIPTOR_HEAP));
     f[0] = query as *const ();
     f[2] = release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
