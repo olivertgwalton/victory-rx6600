@@ -81,8 +81,12 @@ unsafe extern "system" fn fake_create_file_w(
 }
 
 fn answer(handle: Handle, code: u32, input: *const c_void, input_len: u32, output: *mut c_void, output_len: u32) -> i32 {
-    // SAFETY: the caller's buffers.
-    let bytes = unsafe { std::slice::from_raw_parts(input.cast::<u8>(), input_len as usize) }.to_vec();
+    let bytes = if input.is_null() {
+        Vec::new()
+    } else {
+        // SAFETY: the caller's buffers.
+        unsafe { std::slice::from_raw_parts(input.cast::<u8>(), input_len as usize) }.to_vec()
+    };
     let call = Call { handle: handle as usize, code, input: bytes.clone() };
     let mut d = driver();
     d.record.calls.push(call.clone());

@@ -1374,3 +1374,74 @@ fn create_xvd_pointer() {
         }
     }
 }
+
+/// A fake machine: physical drives 0-5 open (drive 4 is USB, drive 2's
+/// descriptor query fails), and drive `disk`'s SCSI address matches the
+/// content's (port 0, path 1, target 2, lun 3); partitions open unless
+/// `refuse` names one.
+fn machine(s: &Session, disk: u32, refuse: &'static str) {
+    s.open(move |name| {
+        if name.starts_with("\\\\.\\PhysicalDrive") {
+            let n: u32 = name.trim_start_matches("\\\\.\\PhysicalDrive").parse().unwrap();
+            return if n < 6 { Ok(FAKE + 0x100 + 2 * n as usize) } else { Err(2) };
+        }
+        if !refuse.is_empty() && name.contains(refuse) {
+            return Err(5);
+        }
+        if name.contains("Harddisk") { Ok(FAKE + 0x400) } else { Err(2) }
+    });
+    s.reply(move |call, b| {
+        let drive = (call.handle.wrapping_sub(FAKE + 0x100) / 2) as u32;
+        match call.code {
+            srb::IOCTL_SCSI_MINIPORT => {
+                b[0x14..0x18].fill(0);
+                b[0x1c + 0x18..0x1c + 0x1b].copy_from_slice(&[3, 2, 1]);
+                0
+            }
+            0x2d_1400 => {
+                if drive == 2 { return 0xc000_0001_u32 as i32 }
+                b[0x1c..0x20].copy_from_slice(&(if drive == 4 { 7u32 } else { 0x11 }).to_le_bytes());
+                0
+            }
+            0x4_1018 => {
+                let addr = if drive == disk { [8, 0, 0, 0, 0, 1, 2, 3] } else { [8, 0, 0, 0, 0, 1, 2, 9] };
+                b[..8].copy_from_slice(&addr);
+                0
+            }
+            0x7_0024 => 0,
+            0x56_001c => { b[..4].copy_from_slice(&0x4242u32.to_le_bytes()); 0 }
+            _ => 0xc000_0010_u32 as i32,
+        }
+    });
+}
+
+#[test]
+fn device_paths() {
+    let s = session();
+    trace_all(&s);
+    let (r, l) = both!("XCrdQueryDevicePathByPath": extern "system" fn(*const Adapter, *const u16, *mut *mut u16) -> HRESULT);
+    let a = adapter();
+    let p = wz("[XUC:]\\mounted");
+    for (disk, refuse) in [(3u32, ""), (1, ""), (4, ""), (2, ""), (9, ""), (3, "Partition1\\"), (3, "Partition1")] {
+        same(&format!("disk {disk} refuse {refuse}"), run(&s, |s| machine(s, disk, refuse), |side| {
+            let mut out = std::ptr::null_mut();
+            let hr = if side { r(&a, p.as_ptr(), &mut out) } else { l(&a, p.as_ptr(), &mut out) };
+            // SAFETY: a heap string or null.
+            let text = (!out.is_null()).then(|| unsafe { wide_str(out) });
+            heap_free(out.cast());
+            (hr, text)
+        }));
+    }
+    same("null path", run(&s, |_| {}, |side| { let mut o = std::ptr::null_mut(); if side { r(&a, std::ptr::null(), &mut o) } else { l(&a, std::ptr::null(), &mut o) } }));
+    let (rq, lq) = both!("XCrdQueryDevicePath": extern "system" fn(*mut *mut u16, *const super::disks::Device) -> HRESULT);
+    let name = wz("\\\\?\\GLOBALROOT\\Device\\Harddisk7\\Partition1");
+    let dev = super::disks::Device { name: name.as_ptr(), address: [0; 8], disk: 7, volume: 0 };
+    same("device path", run(&s, |_| {}, |side| {
+        let mut out = std::ptr::null_mut();
+        let hr = if side { rq(&mut out, &dev) } else { lq(&mut out, &dev) };
+        let text = (!out.is_null()).then(|| unsafe { wide_str(out) });
+        heap_free(out.cast());
+        (hr, text)
+    }));
+    same("null device", run(&s, |_| {}, |side| { let mut o = std::ptr::null_mut(); if side { rq(&mut o, std::ptr::null()) } else { lq(&mut o, std::ptr::null()) } }));
+}

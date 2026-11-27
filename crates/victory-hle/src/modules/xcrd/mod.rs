@@ -15,6 +15,7 @@
 pub mod ops;
 pub mod paths;
 pub mod blobs;
+pub mod disks;
 pub mod headers;
 pub mod info;
 pub mod regions;
@@ -68,7 +69,7 @@ pub unsafe fn wide<'a>(text: *const u16) -> &'a [u16] {
     }
 }
 
-fn units(text: &str) -> Vec<u16> {
+pub(crate) fn units(text: &str) -> Vec<u16> {
     text.encode_utf16().collect()
 }
 
@@ -514,6 +515,7 @@ pub(crate) fn exports() -> Vec<HleExport> {
     all.extend(blobs::exports());
     all.extend(headers::exports());
     all.extend(info::exports());
+    all.extend(disks::exports());
     all.extend([
         hle_export!(XCrdSetTraceFlags),
         hle_export!(XCrdBuildPath),
