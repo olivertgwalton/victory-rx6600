@@ -49,8 +49,10 @@ pub(crate) fn on_wine() -> bool {
 /// Standard memory the title has handed to the system.
 static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
 
-mod spec;
-pub(crate) mod more;
+#[doc(hidden)]
+pub mod spec;
+#[doc(hidden)]
+pub mod more;
 #[cfg(test)]
 mod tests;
 
@@ -1838,7 +1840,8 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
         let _busy = Busy::begin();
         let mut physical = physical();
         let mut ops: Vec<Op> = Vec::new();
-        let mut touched = std::collections::HashSet::new();
+        // At most a group's pages: a short list beats hashing here.
+        let mut touched: Vec<usize> = Vec::with_capacity(GROUP);
         for &(to, from) in &pages[at..] {
             // A page the group changes already, or one it would be mapped
             // from: after it.
@@ -1847,7 +1850,7 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
             }
             let slice = from.map(|from| physical.slice_at(from));
             ok &= !matches!(slice, Some(None));
-            touched.insert(to);
+            touched.push(to);
             ops.push(Op::new(to, slice.flatten()));
             at += 1;
         }
@@ -1873,11 +1876,12 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
         }
         {
             let table = page_table();
-            let mut touched = std::collections::HashSet::new();
+            let mut touched: Vec<usize> = Vec::with_capacity(GROUP);
             for &(to, page) in &wanted[at..] {
-                if ops.len() == GROUP || !touched.insert(to) {
+                if ops.len() == GROUP || touched.contains(&to) {
                     break;
                 }
+                touched.push(to);
                 let slice = table.pages.get(&page).cloned();
                 if page != 0 && slice.is_none() {
                     tracing::warn!(page, "XMemMapPhysicalPagesScatter: unknown page");
@@ -2216,7 +2220,15 @@ mod pool {
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     let own = physical.holes.remove(&base) == Some(len) && lean();
     if !show(base, len, &slice, own) {
+        set_last_error(ERROR_INVALID_PARAMETER);
         return false;
+    }
+    // Placeholders inside are part of this view now (`show` may have joined
+    // them).
+    if len > PAGE {
+        for k in 1..len / PAGE {
+            physical.holes.remove(&(base + k * PAGE));
+        }
     }
     // Noted before the GPU side is told: bytes DirectStorage put in earlier,
     // without notice at these addresses ([`pages_written`]), are there by
@@ -2266,6 +2278,15 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
     if view.Value as usize != base {
         split(base, len);
         view = map_view();
+    }
+    if view.Value as usize != base && len > PAGE {
+        // Several placeholders (the single pages a scatter left, say): one
+        // of them first.
+        const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+        // SAFETY: acts only on placeholders.
+        if unsafe { VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) } != 0 {
+            view = map_view();
+        }
     }
     if view.Value as usize != base {
         tracing::warn!(
@@ -2562,6 +2583,12 @@ fn transfer(kind: u32, size: usize) -> BOOL {
         set_last_error(windows_sys::Win32::Foundation::ERROR_NOT_ENOUGH_MEMORY);
     }
     moved.into()
+}
+
+/// [`title_virtual_free`] of a whole allocation, for the benches.
+#[doc(hidden)]
+pub fn title_virtual_free_for_bench(address: *mut c_void) {
+    title_virtual_free(address, 0, MEM_RELEASE);
 }
 
 /// The title's own `VirtualFree`. What the GPU side noted of the memory goes
@@ -3080,6 +3107,20 @@ mod unit_tests {
     /// What a title that maps and unmaps pages all the time costs the
     /// workers that write others: 24 threads look pages up, fill one and
     /// tell of it, as a request does, while one maps.
+    #[test]
+    fn a_run_maps_where_single_pages_were_scattered() {
+        let pages = allocate(64);
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 64 * PAGE, MEM_RESERVE | PAGES_64K, XMEM_CPU | XMEM_MAPPABLE, PAGE_READWRITE) as usize;
+        let at: Vec<*mut c_void> = (0..64).map(|i| (base + i * PAGE) as *mut c_void).collect();
+        assert_eq!(XMemMapPhysicalPagesScatter(at.as_ptr(), 64, pages.as_ptr()), 1);
+        assert_eq!(XMemMapPhysicalPagesScatter(at.as_ptr(), 64, std::ptr::null()), 1);
+        let mapped = XMemMapPhysicalPages(base as *mut c_void, 64, pages.as_ptr());
+        assert!(!mapped.is_null(), "error {}", std::io::Error::last_os_error());
+        // SAFETY: mapped and committed.
+        unsafe { (base as *mut u8).add(63 * PAGE).write(7) };
+        assert!(!XMemMapPhysicalPages(base as *mut c_void, 64, std::ptr::null()).is_null());
+    }
+
     /// `cargo test --release -p victory-hle --lib map_bench -- --ignored --nocapture`
     #[test]
     #[ignore = "a benchmark"]
