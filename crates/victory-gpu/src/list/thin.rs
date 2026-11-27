@@ -438,6 +438,7 @@ plain! {
     DISPATCH_MESH_X dispatch_mesh_x = state::dispatch_mesh_x, (x: u32, flags: u64, indirect: u64, payload: u64);
     COPY_BUFFER copy_buffer_region = super::copy_buffer_region, (dst: This, dst_offset: u64, src: This, src_offset: u64, len: u64);
     COPY_RESOURCE copy_resource = super::copy_resource, (dst: This, src: This);
+    SET_PREDICATION set_predication = super::set_predication, (buffer: This, offset: u64, op: u32);
     COPY_RESOURCE_X copy_resource_x = super::copy_resource_x, (dst: This, src: This, flags: u32);
     COPY_MEMORY copy_memory = super::copy_memory, (dst: u64, src: u64, len: u64, flags: u32);
     RESOLVE resolve = super::resolve, (dst: This, dst_sub: u32, src: This, src_sub: u32, format: u32);
@@ -849,7 +850,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     f
 }
 
-const MINE: [(usize, *const ()); 52] = [
+const MINE: [(usize, *const ()); 53] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
     (12, draw as *const ()),
@@ -858,6 +859,7 @@ const MINE: [(usize, *const ()); 52] = [
     (15, copy_buffer_region as *const ()),
     (16, copy_texture_region as *const ()),
     (17, copy_resource as *const ()),
+    (31, set_predication as *const ()),
     (19, resolve as *const ()),
     (20, topology as *const ()),
     (21, viewports as *const ()),

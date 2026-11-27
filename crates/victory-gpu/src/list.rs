@@ -1614,6 +1614,29 @@ fn uav_ring() -> Option<&'static UavRing> {
     .as_ref()
 }
 
+/// List method 0xf8, `SetPredication(buffer, offset, op)` (GameOS
+/// `xgs12_10.dll` +0x4f740; no buffer ends predication): the host's, on
+/// the buffer's host copy.
+pub(super) extern "system" fn set_predication(this: This, buffer: This, offset: u64, op: u32) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Direct3D12::D3D12_PREDICATION_OP;
+        let Some(list) = host_list(this) else { return };
+        if buffer.is_null() {
+            // SAFETY: an open list; no buffer ends predication.
+            unsafe { list.list.SetPredication(None, 0, D3D12_PREDICATION_OP(0)) };
+            return;
+        }
+        let Some(host) = crate::resource::host_resource(buffer) else { return };
+        const PREDICATION: u32 = 0x200;
+        ensure_state(list, buffer, PREDICATION);
+        // SAFETY: an open list and a live buffer.
+        unsafe { list.list.SetPredication(host, offset, D3D12_PREDICATION_OP(op as i32 & 1)) };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, buffer, offset, op);
+}
+
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
@@ -2434,7 +2457,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 58] = [
+const METHODS: [(usize, *const ()); 59] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -2455,6 +2478,7 @@ const METHODS: [(usize, *const ()); 58] = [
     (24, state::stencil_ref as *const ()),        // 0xc0
     (25, set_pipeline as *const ()),              // 0xc8
     (26, barrier as *const ()),                   // 0xd0
+    (31, set_predication as *const ()),           // 0xf8
     (32, state::heaps as *const ()),              // 0x100
     (33, ignored_state as *const ()),             // 0x108 compute root signature
     (34, ignored_state as *const ()),             // 0x110 graphics root signature

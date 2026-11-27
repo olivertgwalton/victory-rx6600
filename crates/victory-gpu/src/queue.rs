@@ -1333,6 +1333,7 @@ const fn queue_table(newer: bool) -> [*const (); 40] {
         f[14] = marker as *const ();
         f[19] = object::stub_s_ok() as *const (); // 0x98: S_OK (+0x19460; its kernel notification is not modelled)
         f[23] = suspend as *const (); // 0xb8
+        f[27] = flush as *const (); // 0xd8
         f[24] = resume as *const (); // 0xc0
     }
     f
@@ -1350,6 +1351,14 @@ extern "system" fn suspend(_: This, _flags: u32) -> HRESULT {
         release_held(false);
     }
     S_OK
+}
+
+/// Queue method 0xd8: the driver (+0x1b5f0) kicks the queue's ring
+/// (+0x4570), sending what it holds to the GPU. Here: what the title gave
+/// its queues goes to the card.
+extern "system" fn flush(_: This) {
+    #[cfg(windows)]
+    before_sync();
 }
 
 /// Queue method 0xc0, `ResumeX()`: the driver (+0x67d00) asks the kernel to
