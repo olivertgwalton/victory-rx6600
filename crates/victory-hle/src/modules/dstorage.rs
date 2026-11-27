@@ -2414,7 +2414,7 @@ mod tests {
             std::ptr::null_mut(),
             2 * PAGE,
             0x2000 | 0x2040_0000, // reserve, 64 KiB pages
-            0,
+            0x21,                  // CPU, mappable: as the title asks
             0x04,
         );
         assert!(!mapped.is_null());
@@ -2480,7 +2480,7 @@ mod tests {
                 std::ptr::null_mut(),
                 3 * PAGE,
                 0x2000 | 0x2040_0000, // reserve, 64 KiB pages
-                0,
+                0x21,                  // CPU, mappable: as the title asks
                 0x04,
             );
             assert!(!mapped.is_null());
