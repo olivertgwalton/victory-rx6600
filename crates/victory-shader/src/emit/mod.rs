@@ -125,6 +125,8 @@ pub use shader::{
     SLOT_MARKS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    RT_NEGATIVE, RT_NOTES, RT_TABLE_SLOTS, SLOT_RT, SLOT_RT_NOTES, rt_hash, rt_views, set_rt_views,
+    SLOT_WALK, WALK_BYTES, WALK_DWORDS, walk_trace, walk_traced,
 };
 
 /// The stack for threads that make host pipelines from translated shaders.
@@ -1887,7 +1889,11 @@ mod tests {
         host.pipeline(&vs, &ps).unwrap();
         // The runtime checks the container hash: no hash or a wrong one is
         // refused. (Recent runtimes also take sixteen 0x01 bytes, a bypass
-        // value; ours works with older ones too.)
+        // value; ours works with older ones too.) vkd3d-proton, under Wine,
+        // checks none: nothing to see there.
+        if super::on_wine() {
+            return;
+        }
         let mut wrong = ps.dxil[4..20].to_vec();
         wrong[0] ^= 1;
         for digest in [&[0u8; 16][..], &wrong] {

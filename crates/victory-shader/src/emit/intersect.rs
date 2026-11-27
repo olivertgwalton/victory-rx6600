@@ -135,6 +135,7 @@ impl<'a> Lower<'a> {
             inverse: [f[7], f[8], f[9]],
         };
         let c = self.cur;
+        let mut structure_base = None;
         let at = match nodes {
             BvhNodes::Resource => {
                 let src = self
@@ -161,6 +162,16 @@ impl<'a> Lower<'a> {
                     *w = self.i32_of(v)?;
                 }
                 let (low, high) = self.bvh_address(words[0], words[1], pointer, pointer_high);
+                // The descriptor's base: dword 0 and the low byte of dword 1,
+                // in 256-byte units.
+                let cc = self.cur;
+                let (k8, k24, kff) = (self.s.m.i32(8), self.s.m.i32(24), self.s.m.i32(0xff));
+                let base_low = self.s.m.bin(cc, Bin::Shl, words[0], k8);
+                let top = self.s.m.bin(cc, Bin::LShr, words[0], k24);
+                let byte4 = self.s.m.bin(cc, Bin::And, words[1], kff);
+                let byte4 = self.s.m.bin(cc, Bin::Shl, byte4, k8);
+                let base_high = self.s.m.bin(cc, Bin::Or, byte4, top);
+                structure_base = Some((base_low, base_high));
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
                 // 64 KiB page whatever its kind.
@@ -191,7 +202,11 @@ impl<'a> Lower<'a> {
             .m
             .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));
         self.cur = box_block;
-        let boxes = self.bvh_boxes(at, kind, &ray, sort);
+        let boxes = if matches!(at, NodeAt::Memory { .. }) && crate::emit::rt_views() != 0 {
+            self.bvh_lifted(at, kind, &ray, sort, pointer, wide, structure_base)
+        } else {
+            self.bvh_boxes(at, kind, &ray, sort)
+        };
         let box_end = self.cur;
         self.s.m.terminate(box_end, Term::Br(join));
         self.cur = triangle_block;
@@ -217,10 +232,282 @@ impl<'a> Lower<'a> {
             results.push((phi, zero));
         }
         let results = self.end_guarded(gate, &results);
+        self.walk_record(guard, pointer, pointer_high, &results, &ray, site, at, sort);
         for (k, &r) in results.iter().enumerate() {
             self.write(inst, Reg::V(dst + k as u8), r, guard);
         }
         Ok(())
+    }
+
+    /// Diagnostics: a record of this node test in `u<SLOT_WALK>` when this
+    /// program is the one traced (`crate::emit::walk_trace`).
+    #[allow(clippy::too_many_arguments)]
+    fn walk_record(&mut self, guard: Option<V>, pointer: V, pointer_high: Option<V>, results: &[V], ray: &Ray, site: (usize, usize), at_node: NodeAt, sort: bool) {
+        use crate::emit::{SLOT_WALK, WALK_BYTES, WALK_DWORDS, walk_trace};
+        let Some(tag) = walk_trace() else { return };
+        let code = &self.x.native.code;
+        let key = code[..code.len().min(256)]
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+        if key as u32 != tag {
+            return;
+        }
+        let i32t = self.s.t.i32;
+        let e = self.s.entry;
+        let zero = self.s.m.i32(0);
+        let group = self.s.op(e, "groupId.i32", Attr::ReadNone, i32t, 94, &[zero]);
+        let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+        let c = self.cur;
+        let (k8, k63) = (self.s.m.i32(8), self.s.m.i32(63));
+        let few = self.s.m.cmp(c, pred::IULT, flat, k8);
+        let g = self.s.m.bin(c, Bin::And, group, k63);
+        let every = self.s.m.cmp(c, pred::EQ, g, zero);
+        let mut on = self.s.m.bin(c, Bin::And, few, every);
+        if let Some(gd) = guard {
+            on = self.s.m.bin(c, Bin::And, on, gd);
+        }
+        let gate = self.begin_guarded(Some(on));
+        let c = self.cur;
+        let h = self.s.root_uav_handle(SLOT_WALK);
+        let one = self.s.m.i32(1);
+        let undef = self.s.m.undef(i32t);
+        let n = self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, zero, zero, undef, undef, one]);
+        let most = self.s.m.i32((WALK_BYTES / 4 - 16) / WALK_DWORDS - 1);
+        let fits = self.s.m.cmp(c, pred::IULT, n, most);
+        let inner = self.begin_guarded(Some(fits));
+        let c = self.cur;
+        let size = self.s.m.i32(WALK_DWORDS * 4);
+        let start = self.s.m.i32(64);
+        let at = self.s.m.bin(c, Bin::Mul, n, size);
+        let at = self.s.m.bin(c, Bin::Add, at, start);
+        let place = self.s.m.i32(((site.0 as u32) << 16) | site.1 as u32);
+        let high = pointer_high.unwrap_or(zero);
+        let (ox, dx, ext) = (self.as_int(ray.origin[0]), self.as_int(ray.direction[0]), self.as_int(ray.extent));
+        let (oy, oz) = (self.as_int(ray.origin[1]), self.as_int(ray.origin[2]));
+        let (dy, dz) = (self.as_int(ray.direction[1]), self.as_int(ray.direction[2]));
+        let sorted = self.s.m.i32(u32::from(sort));
+        let mut words = vec![group, flat, pointer, high, results[0], results[1], results[2], results[3], ox, oy, oz, dx, dy, dz, ext, place];
+        let _ = sorted;
+        words[15] = place;
+        // The node as read: 16 dwords, then 12 of the next 64 bytes.
+        let first = self.bvh_node_words(at_node, None, 0, 16);
+        let second_at = self.bvh_second_half(at_node);
+        let second = self.bvh_node_words(second_at, None, 0, 12);
+        let c = self.cur;
+        words.extend(first);
+        words.extend(second);
+        words.extend([sorted, zero, zero, zero]);
+        let (mask, align, void) = (self.s.m.i8(0xf), self.s.m.i32(4), self.s.t.void);
+        for (k, chunk) in words.chunks(4).enumerate() {
+            let off = self.s.m.i32(16 * k as u32);
+            let byte = self.s.m.bin(c, Bin::Add, at, off);
+            self.s.op(c, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[h, byte, undef, chunk[0], chunk[1], chunk[2], chunk[3], mask, align]);
+        }
+        self.end_guarded(inner, &[]);
+        self.end_guarded(gate, &[]);
+    }
+
+    /// A box node that may be the root of a structure the host keeps an
+    /// acceleration structure for ([`super::shader::SLOT_RT`]): there, a
+    /// ray query over it in place of the walk below the root, whose result
+    /// is the node pointers of the nearest four triangles it meets before
+    /// the ray's extent, nearest first, as the box's children. The title's
+    /// own code tests those triangles next and keeps or drops them as it
+    /// would have: the query only finds them. Elsewhere [`Self::bvh_boxes`];
+    /// a root-shaped node the table does not know is noted for the host.
+    ///
+    /// Root-shaped: at byte 128 of its structure, where the title's
+    /// structures keep their root (behind a 128-byte header). The 32-bit
+    /// form's pointers count from the structure's base; the 64-bit form's
+    /// from 0, the structure's base being a multiple of 256.
+    fn bvh_lifted(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: bool, pointer: V, wide: bool, structure_base: Option<(V, V)>) -> [V; 4] {
+        use crate::emit::{RT_NEGATIVE, RT_NOTES, RT_TABLE_SLOTS, SLOT_RT, SLOT_RT_NOTES};
+        let NodeAt::Memory { low, high, .. } = at else { unreachable!() };
+        let i32t = self.s.t.i32;
+        let (look, plain, note, rq) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+        let maybe_note = self.s.m.new_block();
+        let c = self.cur;
+        if wide {
+            // The 64-bit form: the root 128 bytes into a structure on 256.
+            let (mask, want) = (self.s.m.i32(0x1e), self.s.m.i32(0x14));
+            let shape = self.s.m.bin(c, Bin::And, pointer, mask);
+            let rooted = self.s.m.cmp(c, pred::EQ, shape, want);
+            self.s.m.terminate(c, Term::CondBr(rooted, look, plain));
+        } else {
+            // The 32-bit form: the node its structure's header names as the
+            // root (the pointer at byte 48), looked at for nodes in the
+            // structure's first KiB only.
+            let (base_low, base_high) = structure_base.expect("a structure in title memory");
+            let header = self.s.m.new_block();
+            let (k3, k16) = (self.s.m.i32(3), self.s.m.i32(16));
+            let unit = self.s.m.bin(c, Bin::LShr, pointer, k3);
+            let near = self.s.m.cmp(c, pred::IULT, unit, k16);
+            self.s.m.terminate(c, Term::CondBr(near, header, plain));
+            self.cur = header;
+            let (hl, hh) = self.address_plus(base_low, base_high, 48);
+            let (handle, byte, _) = self.bvh_memory(hl, hh, None);
+            let c = self.cur;
+            let (undef, align, one) = (self.s.m.undef(i32t), self.s.m.i32(4), self.s.m.i8(1));
+            let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[handle, byte, undef, one, align]);
+            let f = self.s.m.extract(c, r, 0);
+            let named = self.as_int(f);
+            let k30 = self.s.m.i32(0x3fff_ffff);
+            let named = self.s.m.bin(c, Bin::And, named, k30);
+            let rooted = self.s.m.cmp(c, pred::EQ, named, pointer);
+            self.s.m.terminate(c, Term::CondBr(rooted, look, plain));
+        }
+        // The table: two entries, the hashed slot and the next.
+        let c = look;
+        self.cur = look;
+        let table = self.s.root_uav_handle(SLOT_RT);
+        let (k6, k26) = (self.s.m.i32(6), self.s.m.i32(26));
+        let a = self.s.m.bin(c, Bin::LShr, low, k6);
+        let b = self.s.m.bin(c, Bin::Shl, high, k26);
+        let h = self.s.m.bin(c, Bin::Xor, a, b);
+        let golden = self.s.m.i32(0x9E37_79B1);
+        let h = self.s.m.bin(c, Bin::Mul, h, golden);
+        let shift = self.s.m.i32(32 - RT_TABLE_SLOTS.trailing_zeros());
+        let h = self.s.m.bin(c, Bin::LShr, h, shift);
+        let (one, slots_mask, k4) = (self.s.m.i32(1), self.s.m.i32(RT_TABLE_SLOTS - 1), self.s.m.i32(4));
+        let next = self.s.m.bin(c, Bin::Add, h, one);
+        let next = self.s.m.bin(c, Bin::And, next, slots_mask);
+        let (undef, align, all) = (self.s.m.undef(i32t), self.s.m.i32(4), self.s.m.i8(0xf));
+        let mut entries = Vec::new();
+        for slot in [h, next] {
+            let byte = self.s.m.bin(c, Bin::Shl, slot, k4);
+            let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[table, byte, undef, all, align]);
+            let words: Vec<V> = (0..3).map(|k| {
+                let f = self.s.m.extract(c, r, k);
+                self.as_int(f)
+            }).collect();
+            let lo = self.s.m.cmp(c, pred::EQ, words[0], low);
+            let hi = self.s.m.cmp(c, pred::EQ, words[1], high);
+            entries.push((self.s.m.bin(c, Bin::And, lo, hi), words[2]));
+        }
+        let found = self.s.m.bin(c, Bin::Or, entries[0].0, entries[1].0);
+        let view = self.s.m.select(c, entries[0].0, entries[0].1, entries[1].1);
+        let negative = self.s.m.i32(RT_NEGATIVE);
+        let kept = self.s.m.cmp(c, pred::NE, view, negative);
+        let go = self.s.m.bin(c, Bin::And, found, kept);
+        self.s.m.terminate(c, Term::CondBr(go, rq, maybe_note));
+        // Only the 32-bit form notes: its root-shaped nodes are roots (the
+        // 64-bit form's test passes one node in four), and the top-level
+        // structures it notes name every bottom-level one.
+        if wide {
+            self.s.m.terminate(maybe_note, Term::Br(plain));
+        } else {
+            self.s.m.terminate(maybe_note, Term::CondBr(found, plain, note));
+        }
+        // Unknown: the address, for the host (a slot by the same hash; a
+        // later note there takes its place, and the host hears of it again).
+        let c = note;
+        if wide {
+            // (Not reached; a block must end.)
+            self.s.m.terminate(c, Term::Br(plain));
+        } else {
+        let notes = self.s.root_uav_handle(SLOT_RT_NOTES);
+        let notes_mask = self.s.m.i32(RT_NOTES - 1);
+        let k4n = self.s.m.i32(4);
+        let place = self.s.m.bin(c, Bin::And, h, notes_mask);
+        let place = self.s.m.bin(c, Bin::Shl, place, k4n);
+        let two = self.s.m.i8(0xf);
+        let (base_low, base_high) = structure_base.expect("a structure in title memory");
+        let void = self.s.t.void;
+        // (The node is 64 bytes on 64: its kind goes in the low bits.)
+        let k7 = self.s.m.i32(7);
+        let node_kind = self.s.m.bin(c, Bin::And, pointer, k7);
+        let noted = self.s.m.bin(c, Bin::Or, low, node_kind);
+        self.s.op(c, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[notes, place, undef, noted, high, base_low, base_high, two, align]);
+        self.s.m.terminate(c, Term::Br(plain));
+        }
+        // The query.
+        let c = rq;
+        let void = self.s.t.void;
+        let f32t = self.s.t.f32;
+        let structure = self.s.heap_handle_at(c, view, false, true, (16, 0), true);
+        let side_view = self.s.m.bin(c, Bin::Add, view, one);
+        let side = self.s.heap_handle_at(c, side_view, false, true, (11, 0), true);
+        // RAY_FLAG_FORCE_NON_OPAQUE: every triangle comes to the shader.
+        let flags_const = self.s.m.i32(2);
+        let q = self.s.op(c, "allocateRayQuery", Attr::NoUnwind, i32t, 178, &[flags_const]);
+        let (zero, all_masks, zero_f) = (self.s.m.i32(0), self.s.m.i32(0xff), self.s.m.f32(0));
+        self.s.op(c, "rayQuery_TraceRayInline", Attr::NoUnwind, void, 179, &[
+            q, structure, zero, all_masks,
+            ray.origin[0], ray.origin[1], ray.origin[2], zero_f,
+            ray.direction[0], ray.direction[1], ray.direction[2], ray.extent,
+        ]);
+        self.s.flags |= flags::RAYTRACING;
+        let (head, body, commit, body_end, done) =
+            (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(c, Term::Br(head));
+        let inf = self.s.m.f32(f32::INFINITY.to_bits());
+        let ts: Vec<V> = (0..4).map(|_| self.s.m.phi(head, f32t)).collect();
+        let ps: Vec<V> = (0..4).map(|_| self.s.m.phi(head, i32t)).collect();
+        let i1t = self.s.t.i1;
+        let more = self.s.op(head, "rayQuery_Proceed.i1", Attr::NoUnwind, i1t, 180, &[q]);
+        self.s.m.terminate(head, Term::CondBr(more, body, done));
+        let c = body;
+        let t = self.s.op(c, "rayQuery_StateScalar.f32", Attr::ReadOnly, f32t, 199, &[q]);
+        let p = self.s.op(c, "rayQuery_StateScalar.i32", Attr::ReadOnly, i32t, 204, &[q]);
+        let nearer: Vec<V> = ts.iter().map(|&tk| self.s.m.cmp(c, pred::OLT, t, tk)).collect();
+        // Insert in order: slot k takes the one before it when the new one
+        // is nearer than that, the new one when it is nearer than slot k only.
+        let mut nt = Vec::with_capacity(4);
+        let mut np = Vec::with_capacity(4);
+        for k in 0..4 {
+            let (mut tv, mut pv) = (
+                self.s.m.select(c, nearer[k], t, ts[k]),
+                self.s.m.select(c, nearer[k], p, ps[k]),
+            );
+            if k > 0 {
+                tv = self.s.m.select(c, nearer[k - 1], ts[k - 1], tv);
+                pv = self.s.m.select(c, nearer[k - 1], ps[k - 1], pv);
+            }
+            nt.push(tv);
+            np.push(pv);
+        }
+        // Taken as the fourth: the query need look no farther than it.
+        let yes = self.s.m.bool(true);
+        let not_third = self.s.m.bin(c, Bin::Xor, nearer[2], yes);
+        let fourth = self.s.m.bin(c, Bin::And, nearer[3], not_third);
+        self.s.m.terminate(c, Term::CondBr(fourth, commit, body_end));
+        self.s.op(commit, "rayQuery_CommitNonOpaqueTriangleHit", Attr::NoUnwind, void, 182, &[q]);
+        self.s.m.terminate(commit, Term::Br(body_end));
+        self.s.m.terminate(body_end, Term::Br(head));
+        let zero_p = self.s.m.i32(0);
+        for k in 0..4 {
+            self.s.m.set_phi(ts[k], vec![(inf, rq), (nt[k], body_end)]);
+            self.s.m.set_phi(ps[k], vec![(zero_p, rq), (np[k], body_end)]);
+        }
+        let c = done;
+        self.cur = done;
+        let none = self.s.m.i32(bvh::NONE);
+        let one_mask = self.s.m.i8(1);
+        let mut found_ptrs = [none; 4];
+        let k2 = self.s.m.i32(2);
+        for k in 0..4 {
+            let byte = self.s.m.bin(c, Bin::Shl, ps[k], k2);
+            let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[side, byte, undef, one_mask, align]);
+            let f = self.s.m.extract(c, r, 0);
+            let ptr = self.as_int(f);
+            let valid = self.s.m.cmp(c, pred::OLT, ts[k], inf);
+            found_ptrs[k] = self.s.m.select(c, valid, ptr, none);
+        }
+        let join = self.s.m.new_block();
+        self.s.m.terminate(done, Term::Br(join));
+        // The walk, for the rest.
+        self.cur = plain;
+        let boxes = self.bvh_boxes(at, kind, ray, sort);
+        let plain_end = self.cur;
+        self.s.m.terminate(plain_end, Term::Br(join));
+        self.cur = join;
+        let mut out = [none; 4];
+        for k in 0..4 {
+            let phi = self.s.m.phi(join, i32t);
+            self.s.m.set_phi(phi, vec![(found_ptrs[k], done), (boxes[k], plain_end)]);
+            out[k] = phi;
+        }
+        out
     }
 
     /// Title memory at `low`/`high` for a node's bytes: the raw view of the

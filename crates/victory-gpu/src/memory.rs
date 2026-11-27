@@ -39,8 +39,9 @@
 //! - 4 MiB from each unordered access view outside buffers (structures built);
 //! - the page of each pair of root constants that is a title address and of
 //!   each root constant that is one in 256-byte units;
-//! - the first page of every structure a list's upload memory names
-//!   (a top-level build's instances).
+//! - every page of every structure a list's upload memory names (a
+//!   top-level build's instances), as far as its header says it reaches
+//!   (the first page only, of one whose header is not there).
 //!
 //! **What comes back to title memory**: what the builder stores in title
 //! buffers of at most [`BACK`] bytes it names (the sizes the title reads to
@@ -103,7 +104,10 @@ const BUILT: u64 = 4 << 20;
 const BACK: u64 = 256 << 10;
 /// Pages taken from the faults, of one frame and in all, at most: a ray in a
 /// structure that is not right goes anywhere, and 2,048 a frame took all the
-/// pages there are in the first seconds (run light-4).
+/// pages there are in the first seconds (run light-4). Without the cap in
+/// all (run rq4) faults took every page there is within minutes, half of
+/// them at addresses no structure lies at (0x10000, 0x200000: rays in
+/// structures that are not right), and as many pages as before had no copy.
 const FAULTS: usize = 128;
 const FAULTS_ALL: usize = 2048;
 /// Frames over which every page is looked at once.
@@ -141,6 +145,8 @@ struct Packed {
     len: u64,
     /// Its first two dwords in title memory.
     header: u64,
+    /// Times it went up whole (for `crate::rt`'s check).
+    lands: u32,
 }
 
 struct Memory {
@@ -178,6 +184,14 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// Structures a top-level build's instances named: address, bytes.
+    named: HashMap<u64, u64>,
+    /// What the pages faults named lie in (`VICTORY_FAULT_CLASSES=1`): count
+    /// by kind, an example of each, and per page the frames it faulted in.
+    classes: HashMap<&'static str, (u64, Vec<u64>)>,
+    recurring: HashMap<u64, u32>,
+    /// By program tag: faults at real data, and wild ones.
+    by_program: HashMap<u32, [u64; 2]>,
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -234,6 +248,41 @@ pub(crate) fn retained() -> Option<[u64; 4]> {
     Some(out)
 }
 
+/// The packed structures the builder came to (unpacked on the card since):
+/// address and bytes. For `crate::rt`'s check (`VICTORY_BVH_CHECK`).
+pub(crate) fn packed_structures() -> Vec<(u64, u64)> {
+    let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = guard.as_ref() else { return Vec::new() };
+    m.packed.iter().map(|(&a, p)| (a, p.len)).collect()
+}
+
+/// How many times the packed structure at `address` went up whole, and the
+/// first two dwords title memory has there now.
+pub(crate) fn packed_lands(address: u64) -> Option<(u32, u64)> {
+    let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let p = guard.as_ref()?.packed.get(&address)?;
+    let mut now = [0u8; 8];
+    crate::host::copy_mapped(now.as_mut_ptr(), address as *const u8, 8, false);
+    Some((p.lands, u64::from_le_bytes(now)))
+}
+
+/// The card's copies of title pages `first..first + count`: for each page
+/// that has one, the page, the copy's buffer and the page's byte in it
+/// (`crate::rt` reads the title's ray-tracing structures back from them:
+/// the builder makes and unpacks them on the card only).
+pub(crate) fn card_pages(first: u64, count: u64) -> Vec<(u64, ID3D12Resource, u64)> {
+    let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = guard.as_ref() else { return Vec::new() };
+    (first..first + count)
+        .filter_map(|page| {
+            let n = m.copy_of(page)?;
+            // SAFETY: an entry of the directory (`copy_of` checked the page).
+            let byte = unsafe { m.entry(page).add(1).read() };
+            Some((page, m.copies.get(n)?.buffer.clone(), u64::from(byte)))
+        })
+        .collect()
+}
+
 /// Host view heap `heap` is let go: its run leaves the map. Kept, a heap
 /// made later at the same address took the old one's run, slots it never
 /// set aside and that other writers fill: the directory's numbers then
@@ -260,10 +309,11 @@ impl Memory {
         let entries = crate::upload::reserve(bytes as usize)?;
         let directory = crate::shadow::by_address(entries as u64, bytes)?;
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());
-        let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
+        // (Twice: the second half says which program noted each page.)
+        let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 8)?;
         crate::host::name(&faults, || "title memory by address: faults".into());
         // SAFETY: a fresh mapping of at least that many bytes.
-        unsafe { std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 4) };
+        unsafe { std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 8) };
         // SAFETY: a live buffer.
         let gpu = unsafe { faults.GetGPUVirtualAddress() };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
@@ -286,6 +336,10 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            named: HashMap::new(),
+            classes: HashMap::new(),
+            recurring: HashMap::new(),
+            by_program: HashMap::new(),
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
@@ -578,6 +632,17 @@ impl Memory {
         self.stats.micros += started.elapsed().as_micros() as u64;
     }
 
+    /// The bytes of a structure, packed or not, whose header title memory
+    /// has at `address` (the version, 6, and its nodes of 64 bytes but one).
+    fn structure_len(&self, address: u64) -> Option<u64> {
+        let mut header = [0u8; 8];
+        crate::host::copy_mapped(header.as_mut_ptr(), address as *const u8, 8, false);
+        let header = u64::from_le_bytes(header);
+        let (version, nodes) = (header as u32, header >> 32);
+        let len = (nodes + 1) * 64;
+        (version & 0xFFFF == 6 && nodes > 0 && len <= PACKED).then_some(len)
+    }
+
     /// The bytes of a packed structure title memory has at `address` by now,
     /// and its first two dwords.
     fn packed_at(&self, address: u64) -> Option<(u64, u64)> {
@@ -621,7 +686,7 @@ impl Memory {
         }
         let last = (address + len - 1) / PAGE;
         if !self.packed.contains_key(&address) {
-            self.packed.insert(address, Packed { frame: self.frame, len, header });
+            self.packed.insert(address, Packed { frame: self.frame, len, header, lands: 0 });
             self.packed_order.push(address);
             for page in page..=last {
                 let new = self.copy_of(page).is_none();
@@ -639,6 +704,9 @@ impl Memory {
             let from = address.max(page * PAGE) - page * PAGE;
             let to = (address + len).min((page + 1) * PAGE) - page * PAGE;
             self.take(page, from as usize, to as usize, true);
+        }
+        if let Some(p) = self.packed.get_mut(&address) {
+            p.lands += 1;
         }
         self.stats.packed += 1;
     }
@@ -691,6 +759,7 @@ impl Memory {
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
         let mut pages = Vec::new();
+        let mut tagged = Vec::new();
         for i in 1..MEMORY_FAULTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
             // a number missed now is written again next frame.
@@ -699,6 +768,9 @@ impl Memory {
             let page = unsafe { at.read_volatile() };
             if page != 0 {
                 pages.push(u64::from(page));
+                // SAFETY: as above (the second half, the program's tag).
+                let tag = unsafe { self.faults.1.add(i + MEMORY_FAULTS as usize).read_volatile() };
+                tagged.push((u64::from(page), tag));
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
             }
@@ -716,6 +788,9 @@ impl Memory {
             }
         }
         self.stats.faults += pages.len() as u64;
+        if fault_classes() {
+            self.classify(&tagged);
+        }
         // Each is an access that read 0 or was dropped.
         static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let said = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -736,9 +811,71 @@ impl Memory {
         }
     }
 
+    /// Diagnostics: what each faulting page lies in, summed, with the pages
+    /// that fault again and again; a line every 64 frames.
+    fn classify(&mut self, pages: &[(u64, u32)]) {
+        for &(page, tag) in pages {
+            let (lo, hi) = (page * PAGE, (page + 1) * PAGE);
+            let within = |a: u64, len: u64| lo < a + len && hi > a;
+            let class = if page < 0x1_0000 {
+                "below 4 GiB"
+            } else if self.copy_of(page).is_some() {
+                "has a copy now"
+            } else if self.named.iter().any(|(&a, &len)| within(a, len)) {
+                "a structure an instance names"
+            } else if self.packed.iter().any(|(&a, p)| within(a, p.len)) {
+                "a packed structure"
+            } else if crate::shadow::in_buffer(lo, PAGE).is_some() {
+                "a title buffer"
+            } else if !crate::texture::committed(lo as *const u8, PAGE as usize) {
+                "not committed"
+            } else {
+                "other committed memory"
+            };
+            let e = self.classes.entry(class).or_insert((0, Vec::new()));
+            e.0 += 1;
+            if e.1.len() < 6 && !e.1.contains(&lo) {
+                e.1.push(lo);
+            }
+            *self.recurring.entry(page).or_insert(0) += 1;
+            let wild = matches!(class, "below 4 GiB" | "not committed" | "other committed memory");
+            let t = self.by_program.entry(tag).or_insert([0; 2]);
+            t[usize::from(wild)] += 1;
+        }
+        if self.frame.is_multiple_of(64) && !self.classes.is_empty() {
+            let mut classes: Vec<_> = self.classes.iter().map(|(k, (n, ex))| (*n, *k, ex.clone())).collect();
+            classes.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            let text: Vec<String> = classes
+                .iter()
+                .map(|(n, k, ex)| format!("{n} {k} (e.g. {})", ex.iter().map(|a| format!("{a:#x}")).collect::<Vec<_>>().join(" ")))
+                .collect();
+            let pages = self.recurring.len();
+            let again = self.recurring.values().filter(|&&n| n > 8).count();
+            let mut top: Vec<_> = self.recurring.iter().map(|(&p, &n)| (n, p)).collect();
+            top.sort_unstable_by(|a, b| b.cmp(a));
+            let top: Vec<String> = top.iter().take(8).map(|(n, p)| format!("{:#x}x{n}", p * PAGE)).collect();
+            let mut programs: Vec<_> = self.by_program.iter().map(|(&t, &[real, wild])| (wild, real, t)).collect();
+            programs.sort_unstable_by(|a, b| b.cmp(a));
+            let programs: Vec<String> = programs.iter().take(12).map(|(wild, real, t)| format!("{t:08x}: {wild} wild, {real} real")).collect();
+            tracing::info!(frame = self.frame, programs = programs.join("; "), "title memory by address: faults by the program that noted them");
+            tracing::info!(
+                frame = self.frame,
+                pages,
+                again,
+                top = top.join(" "),
+                classes = text.join("; "),
+                "title memory by address: what the faulting pages lie in since the start"
+            );
+        }
+    }
+
     /// The structures named in a list's upload memory around `address`
     /// (instances of a top-level build: a structure's address is their last
-    /// 8 bytes): the first page of each.
+    /// 8 bytes): every page of each, as far as its header says. (The first
+    /// page only, as before, left the rest of every structure bigger than
+    /// 64 KiB to the faults: rays read zeros there, followed them to
+    /// addresses no structure lies at, and the faults' pages ran out in
+    /// minutes, the rooms the walks light black: runs rq3, rq4.)
     fn named_in_upload(&mut self, address: u64) {
         let Some((from, len)) = crate::upload::block(address as usize) else {
             return;
@@ -751,6 +888,15 @@ impl Memory {
             if word & 0xFF == 0 && (1 << 32..1 << 37).contains(&word) && seen.insert(word / PAGE) && self.map(word / PAGE) {
                 let page = word / PAGE;
                 self.bring(page, page + 1);
+                // The rest of it: pages that have no copy yet (those that do
+                // hold what the card made of them).
+                let len = self.structure_len(word).unwrap_or(PAGE);
+                self.named.insert(word, len);
+                for page in page + 1..=(word + len - 1) / PAGE {
+                    if self.copy_of(page).is_none() && self.map(page) {
+                        self.bring(page, page + 1);
+                    }
+                }
             }
         }
     }
@@ -887,6 +1033,12 @@ fn fill(entry: *mut u32, n: usize, offset: u64) {
         entry.add(1).write_volatile(offset as u32);
         entry.write_volatile(n as u32 + 1);
     }
+}
+
+/// Whether faults are sorted by what they lie in (`VICTORY_FAULT_CLASSES=1`).
+fn fault_classes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAULT_CLASSES").is_some_and(|v| v == "1"))
 }
 
 /// The bytes of a packed structure whose first two dwords these are: the

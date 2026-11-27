@@ -660,6 +660,58 @@ fn tools() -> Option<(PathBuf, PathBuf)> {
     (console.exists() && pc.exists()).then_some((console, pc))
 }
 
+/// Whether the console compiler is the GameOS's own (`dxcompiler_xs.dll`
+/// behind a PC `dxc.exe`, `VICTORY_CONSOLE_DXC_GAMEOS=1`): it is told the
+/// target (`__XBOX_SCARLETT`) and keeps its precompiled native program only
+/// in the embedded debug part (`ILDB`, a `DXIL` part with the `XDAT` index
+/// of [`crate::native`]), which [`as_shipped`] moves to where shipped titles
+/// have it.
+fn gameos_compiler() -> bool {
+    std::env::var_os("VICTORY_CONSOLE_DXC_GAMEOS").is_some_and(|v| v == "1")
+}
+
+/// A container as the GameOS compiler writes it, made like a shipped one:
+/// the `ILDB` part's program (bitcode and precompiled native code) as the
+/// `DXIL` part; the debug parts (`ILDB`, `ILDN`, `STAT`) left out.
+fn as_shipped(bytes: &[u8]) -> Vec<u8> {
+    let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+    let count = u32_at(28) as usize;
+    let mut parts: Vec<([u8; 4], Vec<u8>)> = (0..count)
+        .map(|k| {
+            let o = u32_at(32 + 4 * k) as usize;
+            let len = u32_at(o + 4) as usize;
+            (bytes[o..o + 4].try_into().unwrap(), bytes[o + 8..o + 8 + len].to_vec())
+        })
+        .collect();
+    let Some(ildb) = parts.iter().find(|p| &p.0 == b"ILDB").map(|p| p.1.clone()) else {
+        return bytes.to_vec();
+    };
+    parts.retain(|p| !matches!(&p.0, b"ILDB" | b"ILDN" | b"STAT"));
+    for p in &mut parts {
+        if &p.0 == b"DXIL" {
+            p.1 = ildb.clone();
+        }
+    }
+    let head = 32 + 4 * parts.len();
+    let mut out = Vec::new();
+    out.extend_from_slice(&bytes[..24]);
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+    let mut at = head;
+    for p in &parts {
+        out.extend_from_slice(&(at as u32).to_le_bytes());
+        at += 8 + p.1.len();
+    }
+    for p in &parts {
+        out.extend_from_slice(&p.0);
+        out.extend_from_slice(&(p.1.len() as u32).to_le_bytes());
+        out.extend_from_slice(&p.1);
+    }
+    let total = out.len() as u32;
+    out[24..28].copy_from_slice(&total.to_le_bytes());
+    out
+}
+
 fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec<u8> {
     let input = dir.join("t.hlsl");
     let output = dir.join(format!("{entry}.bin"));
@@ -683,14 +735,50 @@ fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec
                 .is_some_and(|c| Path::new(&c) == dxc)
                 .then_some("-DCONSOLE"),
         )
+        // The GameOS compiler: the Series target, and its native program
+        // kept (in the embedded debug part).
+        .args(
+            (gameos_compiler() && std::env::var_os("VICTORY_CONSOLE_DXC").is_some_and(|c| Path::new(&c) == dxc))
+                .then_some(["-D__XBOX_SCARLETT=1", "-Zi", "-Qembed_debug"])
+                .into_iter()
+                .flatten(),
+        )
         .output()
         .unwrap();
+    // The PC compiler's loop optimizer can make an arithmetic series'
+    // closed form in an `i33` and then refuse it in validation ("Int type
+    // 'i33' has an invalid width"): the reference, unoptimized, instead.
+    let out = if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("invalid width") {
+        std::process::Command::new(dxc)
+            .args(["-T", profile, "-E", entry, "-Od", "-Fo"])
+            .arg(&output)
+            .arg(&input)
+            .args(src.contains("half").then_some("-enable-16bit-types"))
+            .output()
+            .unwrap()
+    } else {
+        out
+    };
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    std::fs::read(output).unwrap()
+    let bytes = std::fs::read(&output).unwrap();
+    // `VICTORY_DIFF_KEEP=<dir>`: each console container kept, by entry and
+    // a hash of the source, for disassembly (examples/native_dump.rs).
+    if let Some(keep) = std::env::var_os("VICTORY_DIFF_KEEP")
+        && std::env::var_os("VICTORY_CONSOLE_DXC").is_some_and(|c| Path::new(&c) == dxc)
+    {
+        let h = src.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+        let _ = std::fs::create_dir_all(&keep);
+        let _ = std::fs::write(Path::new(&keep).join(format!("{entry}-{h:016x}.cso")), &bytes);
+    }
+    if gameos_compiler() && std::env::var_os("VICTORY_CONSOLE_DXC").is_some_and(|c| Path::new(&c) == dxc) {
+        as_shipped(&bytes)
+    } else {
+        bytes
+    }
 }
 
 /// Root arguments for a translated stage: user data from the root values.

@@ -17,6 +17,115 @@ pub struct Host {
     pub device: ID3D12Device,
 }
 
+/// The layer's own root UAVs a translated shader may declare (write marks,
+/// faults, the ray-query table and notes, the walk records), with the bytes
+/// a buffer bound there needs. Tests that do not supply one get a zeroed
+/// buffer of that size: unbound, the root view's address is 0, and a store
+/// through it is a GPU page fault that loses the device for every test
+/// after it (the write marks' epoch is read at byte 0x800000).
+fn own_slot_bytes(slot: u8) -> Option<u64> {
+    use super::shader::*;
+    Some(match slot {
+        SLOT_MEMORY => u64::from(MEMORY_PAGES) * 8,
+        SLOT_STRIDES | SLOT_TABLE_STRIDES => u64::from(SLOT_STRIDES_BYTES),
+        SLOT_MARKS => u64::from(MARKS_DWORDS) * 4,
+        SLOT_FAULTS => u64::from(MEMORY_FAULTS) * 8,
+        SLOT_RT => u64::from(RT_TABLE_SLOTS) * 16,
+        SLOT_RT_NOTES => u64::from(RT_NOTES) * 16,
+        SLOT_WALK => u64::from(WALK_BYTES),
+        _ => return None,
+    })
+}
+
+/// Per root signature (by its pointer): its layer-owned root UAVs, as root
+/// parameter index and slot.
+static OWNED: std::sync::Mutex<std::collections::BTreeMap<usize, Vec<(u32, u8, u8)>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Zeroed buffers for the layer-owned root UAVs of `root` that `given` (the
+/// root parameters a test supplies) leaves out, bound on `list`.
+#[cfg_attr(not(test), allow(dead_code))] // tests only (draw, dispatch)
+fn bind_owned(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    root: &ID3D12RootSignature,
+    given: &[u32],
+    compute: bool,
+    keep: &mut Vec<ID3D12Resource>,
+) -> Result<(), String> {
+    let owned = OWNED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(root.as_raw() as usize))
+        .cloned()
+        .unwrap_or_default();
+    for (param, slot, kind) in owned {
+        if given.contains(&param) {
+            continue;
+        }
+        let bytes = own_slot_bytes(slot).unwrap_or(4);
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut b: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a buffer (committed resources start zeroed).
+        unsafe {
+            device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut b)
+                .map_err(err)?;
+        }
+        let b = b.ok_or("no scratch buffer")?;
+        // SAFETY: an open list; the buffer is kept until the list has run.
+        unsafe {
+            let va = b.GetGPUVirtualAddress();
+            match (compute, kind == 1) {
+                (true, false) => list.SetComputeRootUnorderedAccessView(param, va),
+                (false, false) => list.SetGraphicsRootUnorderedAccessView(param, va),
+                (true, true) => list.SetComputeRootShaderResourceView(param, va),
+                (false, true) => list.SetGraphicsRootShaderResourceView(param, va),
+            }
+        }
+        keep.push(b);
+    }
+    Ok(())
+}
+
+/// The root views of a signature for `stages`, in parameter order (after one
+/// constants parameter per stage): by slot, then kind (0 CBV, 1 SRV, 2 UAV).
+fn root_views<'a>(stages: impl Iterator<Item = &'a HostShader>) -> Vec<(u8, u8)> {
+    let mut views: Vec<(u8, u8)> = stages
+        .flat_map(|s| {
+            let cbvs = s.root_cbvs.iter().map(|&r| (r, 0));
+            let srvs = s.root_srvs.iter().map(|&r| (r, 1));
+            cbvs.chain(srvs).chain(s.root_uavs.iter().map(|&r| (r, 2)))
+        })
+        .collect();
+    views.sort_unstable();
+    views.dedup();
+    views
+}
+
+/// The root parameter index of the root view at `slot` (`kind` 0 CBV, 1 SRV,
+/// 2 UAV) in the signature [`Host::root_signature_for`] makes for `stages`:
+/// what a test binds it at. Layer-owned views (write marks, faults, the
+/// memory directory) sort among the others, so no index is fixed.
+pub fn root_view_param(stages: &[&HostShader], slot: u8, kind: u8) -> u32 {
+    let k = root_views(stages.iter().copied())
+        .iter()
+        .position(|&v| v == (slot, kind))
+        .unwrap_or_else(|| panic!("no root view {kind} at slot {slot}"));
+    (stages.len() + k) as u32
+}
+
 /// What the stage declares that a pipeline must match.
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;
@@ -269,17 +378,14 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        // By slot, then kind: 0 CBV, 1 SRV, 2 UAV.
-        let mut views: Vec<(u8, u8)> = stages
+        let views = root_views(stages.iter().map(|s| s.0));
+        let first_view = params.len() as u32;
+        let owned: Vec<(u32, u8, u8)> = views
             .iter()
-            .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, 0));
-                let srvs = s.root_srvs.iter().map(|&r| (r, 1));
-                cbvs.chain(srvs).chain(s.root_uavs.iter().map(|&r| (r, 2)))
-            })
+            .enumerate()
+            .filter(|&(_, &(slot, kind))| kind != 0 && own_slot_bytes(slot).is_some())
+            .map(|(k, &(slot, kind))| (first_view + k as u32, slot, kind))
             .collect();
-        views.sort_unstable();
-        views.dedup();
         for (slot, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
@@ -355,7 +461,12 @@ impl Host {
                 blob.GetBufferPointer().cast::<u8>(),
                 blob.GetBufferSize(),
             );
-            self.device.CreateRootSignature(0, bytes).map_err(err)
+            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes).map_err(err)?;
+            OWNED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(root.as_raw() as usize, owned);
+            Ok(root)
         }
     }
 
@@ -982,6 +1093,8 @@ impl Host {
                     Root::View { .. } => return Err("root views in a draw".into()),
                 }
             }
+            let given: Vec<u32> = d.roots.iter().map(|r| r.0).collect();
+            bind_owned(dev, &list, root, &given, false, &mut keep)?;
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: w as f32,
@@ -1566,6 +1679,8 @@ impl Host {
                     }
                 }
             }
+            let given: Vec<u32> = d.roots.iter().map(|r| r.0).collect();
+            bind_owned(dev, &list, root, &given, true, &mut keep)?;
             let [x, y, z] = d.groups;
             list.Dispatch(x, y, z);
             for (r, size, n, rb) in &uavs {

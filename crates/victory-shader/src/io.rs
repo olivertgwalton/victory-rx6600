@@ -225,6 +225,16 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     loaded.push((Reg::V(i.vgpr + channel), input));
                 }
             }
+            // The fetch shader loads attributes into the VGPRs after the
+            // system values the stage enables: where an attribute names a
+            // register, it holds that attribute (with fewer system values
+            // enabled, v2 or v3 is the first attribute).
+            let fetched: Vec<Reg> = loaded[3..].iter().map(|l| l.0).collect();
+            let mut k = 0;
+            loaded.retain(|l| {
+                k += 1;
+                k > 3 || !fetched.contains(&l.0)
+            });
             (loaded, &[][..], &outputs[..])
         }
         // Compute: thread ids in v0-v2, group ids and the group info in the

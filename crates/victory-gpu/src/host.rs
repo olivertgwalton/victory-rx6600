@@ -6337,6 +6337,17 @@ impl Host {
             }
             firsts.iter_mut().for_each(|first| *first += 1);
         }
+        // The host's acceleration structures made since the last
+        // submission, and their table entries (`crate::rt`).
+        if let Some(rt) = crate::rt::list(&self.device, this_submission, *submitted + 1, done) {
+            lists.insert(0, Some(rt));
+            #[cfg(feature = "diagnostics")]
+            {
+                marks.iter_mut().for_each(|m| m.0 += 1);
+                marks.insert(0, (0, crate::copystat::Timed::Other));
+            }
+            firsts.iter_mut().for_each(|first| *first += 1);
+        }
         // When it runs on the card, for the timeline.
         #[cfg(feature = "diagnostics")]
         let stamp = stamps::take();

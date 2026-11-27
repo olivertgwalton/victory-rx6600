@@ -286,6 +286,9 @@ struct Lower<'a> {
     /// In the instruction being lowered: the host copy its root view's bytes
     /// are in ([`Lower::root_memory`]).
     root_copy: Option<V>,
+    /// The machine offset of the instruction being lowered (diagnostics:
+    /// the traced program's fault notes carry it).
+    inst_offset: usize,
     /// Whether the page [`Lower::memory`] last looked for has a copy.
     page_there: Option<V>,
     mask_phis: HashMap<Value, V>,
@@ -549,69 +552,180 @@ fn need(block: usize) {
     });
 }
 
-/// VGPR values that are the same in every lane holding them (`all` is [`all_lane_blocks`]):
-/// written by an instruction every arriving lane runs (no guard), lane by lane, from scalars,
-/// constants and such values; or loaded from an address made of them. The compiler keeps
-/// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
-/// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
-/// run (no lane branch can have split the arriving lanes); loop-carried values never do.
-fn lane_uniform(p: &Program, st: &Structured, all: &[bool], ordered_lds: bool) -> HashSet<Value> {
+/// VGPR values that are the same in every lane of a console wave holding them (`all` is
+/// [`all_lane_blocks`]): written lane by lane from scalars, constants and such values, by an
+/// instruction that either every arriving lane runs or that runs under a condition itself the
+/// same in every lane of the console wave (then only over an old value that is such a value
+/// too: a wave the condition leaves out keeps that); loaded from LDS at such an address; or
+/// the thread id's x shifted right past the console wave (`wave_tid`, ids `>> 6` or more,
+/// where a console wave is one run of 64 ids along x). The compiler keeps wave-uniform data
+/// in VGPRs and fetches it with `v_readfirstlane`. LDS reads count only with `ordered_lds`
+/// (the group's LDS accesses ordered by barriers the host keeps).
+/// A value joined by a phi counts where every predecessor is a block every lane of the console
+/// wave reaches together: no branch on a lane-dependent condition can have split them (a
+/// branch on such alike values does not). Loop-carried values count only when what the loop
+/// carries is made of such values; the analysis runs to a fixed point from nothing, so a value
+/// that needs itself to be alike never is.
+fn lane_uniform(
+    p: &Program,
+    st: &Structured,
+    all: &[bool],
+    wave_tid: Option<Value>,
+    ordered_lds: bool,
+) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let mut same: HashSet<Value> = HashSet::new();
-    for b in crate::ir::reverse_postorder(&p.blocks) {
-        let block = &p.blocks[b];
-        let whole = block.preds.iter().all(|&q| all.get(q).copied().unwrap_or(false));
-        for phi in &block.phis {
-            if matches!(phi.reg, Reg::V(_)) && whole && phi.args.iter().all(|a| same.contains(a)) {
-                same.insert(phi.value);
-            }
-        }
-        for (i, inst) in block.insts.iter().enumerate() {
-            let name = inst.name();
-            if st.guards[b][i].is_some() {
-                continue; // lanes outside EXEC keep another value
-            }
-            let ops: Vec<Operand> = match &inst.fields {
-                Fields::Valu(v)
-                    if v.dpp.is_none()
-                        && v.sdwa.is_none()
-                        && !name.starts_with("v_mbcnt")
-                        && !name.starts_with("v_cmpx")
-                        && !name.contains("lane") =>
-                {
-                    v.src.clone()
+    loop {
+        // An atom of a lane condition that every lane of a console wave holds alike.
+        let alike_atom = |same: &HashSet<Value>, a: &Atom| match *a {
+            Atom::Uniform(_) => true,
+            Atom::Lane(v) => same.contains(&v),
+            _ => false,
+        };
+        let alike_bool = |same: &HashSet<Value>, b: Bool| {
+            st.bools.support(b).iter().all(|a| alike_atom(same, a))
+        };
+        // Blocks every lane of a console wave reaches together: `all`, or reached only past
+        // branches on alike conditions.
+        let wave_all: Vec<bool> = match lane_regions(st) {
+            Some(regions) => {
+                let mut w = vec![true; st.exits.len()];
+                for (d, region) in regions {
+                    let LaneExit::Branch { when, .. } = st.exits[d] else {
+                        continue;
+                    };
+                    if alike_bool(&same, when) {
+                        continue;
+                    }
+                    for (b, r) in region.iter().enumerate() {
+                        if *r {
+                            w[b] = false;
+                        }
+                    }
                 }
-                Fields::Ds {
-                    addr: Some(Operand::Vector { reg, dwords: 1 }),
-                    gds: false,
+                w
+            }
+            None => all.to_vec(),
+        };
+        let mut next: HashSet<Value> = HashSet::new();
+        for b in crate::ir::reverse_postorder(&p.blocks) {
+            let block = &p.blocks[b];
+            let whole = block
+                .preds
+                .iter()
+                .all(|&q| wave_all.get(q).copied().unwrap_or(false));
+            for phi in &block.phis {
+                if matches!(phi.reg, Reg::V(_))
+                    && whole
+                    && phi
+                        .args
+                        .iter()
+                        .all(|a| next.contains(a) || same.contains(a))
+                {
+                    next.insert(phi.value);
+                }
+            }
+            let known = |next: &HashSet<Value>, x: &Value| next.contains(x) || same.contains(x);
+            for (i, inst) in block.insts.iter().enumerate() {
+                let name = inst.name();
+                // under a condition: only one every lane of the console wave holds alike, and
+                // over an old value that is alike too
+                if let Some(g) = st.guards[b][i] {
+                    if !alike_bool(&same, g) {
+                        continue;
+                    }
+                    let old_alike = inst
+                        .writes
+                        .iter()
+                        .filter(|w| matches!(w.0, Reg::V(_)))
+                        .all(|w| inst.read(w.0).is_none_or(|old| known(&next, &old)));
+                    if !old_alike {
+                        continue;
+                    }
+                }
+                // an LDS read at an alike address reads one value in every lane
+                if let Fields::Ds {
+                    addr: Some(Operand::Vector { reg, .. }),
+                    dst: Some(_),
+                    data,
                     ..
-                } if ordered_lds && name == "ds_read_b32" => {
-                    if inst.read(Reg::V(*reg)).is_some_and(|a| same.contains(&a)) {
-                        same.extend(inst.writes.iter().map(|w| w.1));
+                } = &inst.fields
+                    && name.starts_with("ds_read")
+                    && data.is_empty()
+                    && ordered_lds
+                {
+                    if inst.read(Reg::V(*reg)).is_some_and(|a| known(&next, &a)) {
+                        next.extend(
+                            inst.writes
+                                .iter()
+                                .filter(|w| matches!(w.0, Reg::V(_)))
+                                .map(|w| w.1),
+                        );
                     }
                     continue;
                 }
-                _ => continue,
-            };
-            let alike = ops.iter().all(|op| match *op {
-                Operand::Vector { reg, .. } => {
-                    // every dword of the operand the instruction reads from that register on
-                    let read: Vec<Value> =
-                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
-                    !read.is_empty() && read.iter().all(|x| same.contains(x))
+                let ops: Vec<Operand> = match &inst.fields {
+                    Fields::Valu(v)
+                        if v.dpp.is_none()
+                            && v.sdwa.is_none()
+                            && !name.starts_with("v_mbcnt")
+                            && !name.starts_with("v_cmpx")
+                            && !name.contains("lane") =>
+                    {
+                        v.src.clone()
+                    }
+                    _ => continue,
+                };
+                // the thread id's x shifted past the console wave: one value per console wave
+                // (an inline constant 0..64, operand codes 128..192, taken mod 32 as the
+                // hardware does: 6..31 and 38..63)
+                if let (
+                    Some(tid),
+                    "v_lshrrev_b32",
+                    [Operand::Const(k), Operand::Vector { reg, .. }, ..],
+                ) = (wave_tid, name, ops.as_slice())
+                    && (128..=192).contains(k)
+                    && (k - 128) & 31 >= 6
+                    && inst.read(Reg::V(*reg)) == Some(tid)
+                {
+                    next.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
+                    continue;
                 }
-                // a scalar is one value; a lane mask is not, unless a compare of such values made it
-                Operand::Scalar { code, .. } if code != NULL => {
-                    inst.read(Reg::S(code)).is_none_or(|x| !is_mask(x) || same.contains(&x))
+                let alike = ops.iter().all(|op| match *op {
+                    Operand::Vector { reg, .. } => {
+                        // every dword of the operand the instruction reads from that register on
+                        let read: Vec<Value> = inst
+                            .reads
+                            .iter()
+                            .filter(|r| matches!(r.0, Reg::V(x) if x >= reg))
+                            .map(|r| r.1)
+                            .collect();
+                        !read.is_empty() && read.iter().all(|x| known(&next, x))
+                    }
+                    // a scalar is one value; a lane mask is not, unless a compare of such values made it
+                    Operand::Scalar { code, .. } if code != NULL => inst
+                        .read(Reg::S(code))
+                        .is_none_or(|x| !is_mask(x) || known(&next, &x)),
+                    _ => true,
+                });
+                // a swap also moves its destination's old value
+                let alike = alike
+                    && (!name.starts_with("v_swap")
+                        || inst
+                            .reads
+                            .iter()
+                            .filter(|r| matches!(r.0, Reg::V(_)))
+                            .all(|r| known(&next, &r.1)));
+                if alike {
+                    next.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
                 }
-                _ => true,
-            });
-            if alike {
-                same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
             }
         }
+        if next.is_subset(&same) {
+            return same;
+        }
+        same.extend(next);
     }
-    same
 }
 
 /// The thread id's x (`v0` on entry) of a console wave64 compute program whose console waves are
@@ -1400,8 +1514,8 @@ fn own_bits_on() -> bool {
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+pub fn host_settings() -> [u32; 5] {
+    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna(), super::shader::rt_views()]
 }
 
 /// Whether a compute program that stores to UAVs and synchronises its group
@@ -1927,7 +2041,13 @@ impl<'a> Lower<'a> {
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
-            s.threads = Some([ms.threads, 1, 1]);
+            // The console's wave runs max(threads, vertices, primitives)
+            // lanes, and lane n exports vertex n and primitive n: past the
+            // group's threads the code still runs (a vertex loop of 36
+            // over 32 threads starts lanes 32-35 too) and exports. The host
+            // gets as many threads (up to its limit, 128).
+            let lanes = ms.threads.max(ms.max_vertices).max(ms.max_primitives).min(128).max(ms.threads);
+            s.threads = Some([lanes, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
             s.mesh = Some(super::shader::Mesh {
                 max_vertices: ms.max_vertices,
@@ -1988,6 +2108,7 @@ impl<'a> Lower<'a> {
             stale: HashSet::new(),
             coherent: HashSet::new(),
             root_copy: None,
+            inst_offset: 0,
             page_there: None,
             ordered: if x.native.stage == HwStage::Ps {
                 ordered_section(p)
@@ -2042,7 +2163,7 @@ impl<'a> Lower<'a> {
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
                 Some((_, false, all)) if !LOCAL_WAVES.get() => {
-                    lane_uniform(p, x.st, all, split_lds && super::group_sync() != 0)
+                    lane_uniform(p, x.st, all, wave_tid(p, x), split_lds && super::group_sync() != 0)
                 }
                 _ => HashSet::new(),
             },
@@ -2906,7 +3027,12 @@ impl<'a> Lower<'a> {
                 };
             }
             Input::Barycentric { kind, index } => return self.barycentric(kind, index),
-            Input::PrimitiveId => return Val::Missing("the primitive id"),
+            // HLSL gives a vertex shader no primitive id: a read of v2 is
+            // the old value under a partial write (`v_fma_mixlo_f16 v2`
+            // keeps the high half, which the program then masks off), and
+            // the console leaves VGT_PRIMITIVEID_EN off, so v2 holds
+            // nothing there either.
+            Input::PrimitiveId => return Val::I32(self.s.m.i32(0)),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
             Input::FrontFace => (13, 0),
@@ -3635,6 +3761,30 @@ impl<'a> Lower<'a> {
             void,
             140,
             &[faults, place, iu, page, iu, iu, iu, mask, align],
+        );
+        // Which program noted it, in the faults' second half (the low dword
+        // of the key the native index lists programs by: FNV-1a of the
+        // code's first 256 bytes), for the host's diagnostics.
+        let code = &self.x.native.code;
+        let key = code[..code.len().min(256)]
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+        // The traced program (`VICTORY_WALK_TRACE`): the instruction's
+        // offset instead, with the top bit set.
+        let tag = if let Some(at) = super::walk_traced().iter().position(|&t| t == key as u32) {
+            k(self, 0x8000_0000 | (at as u32) << 24 | self.inst_offset as u32)
+        } else {
+            k(self, key as u32)
+        };
+        let second = k(self, MEMORY_FAULTS * 4);
+        let tag_place = self.s.m.bin(c, Bin::Add, place, second);
+        self.s.op(
+            c,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[faults, tag_place, iu, tag, iu, iu, iu, mask, align],
         );
         self.end_guarded(noting, &[]);
         if store {
@@ -5895,6 +6045,7 @@ impl<'a> Lower<'a> {
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
+        self.inst_offset = offset;
         let name = inst.name();
         self.local_ok = name.starts_with("s_bcnt1_i32_")
             || name.starts_with("s_ff1_i32_")
@@ -13566,7 +13717,7 @@ mod tests {
             let inst = &p.blocks[0].insts[0];
             let tid = inst.read(Reg::V(0)).unwrap();
             let shifted = inst.writes.iter().find(|w| w.0 == Reg::V(7)).unwrap().1;
-            let uniform = super::lane_uniform(&p, &st, &[true], Some(tid));
+            let uniform = super::lane_uniform(&p, &st, &[true], Some(tid), false);
             let expected = (0..64u32).all(|lane| lane.wrapping_shr(shift) == 0);
             assert_eq!(uniform.contains(&shifted), expected, "inline shift {shift}");
         }
@@ -13587,7 +13738,7 @@ mod tests {
         assert_eq!(swap.name(), "v_swap_b32");
         let old_v0 = swap.read(Reg::V(0)).unwrap();
         let new_v1 = swap.write(Reg::V(1)).unwrap();
-        let uniform = super::lane_uniform(&p, &st, &[true], Some(old_v0));
+        let uniform = super::lane_uniform(&p, &st, &[true], Some(old_v0), false);
         assert!(!uniform.contains(&new_v1));
     }
 
@@ -14245,8 +14396,9 @@ mod tests {
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
     }
 
-    /// A d16 typed buffer load through a table asks the host's table by heap
-    /// slot for its view's format kind, as one through the heap does (the
+    /// A d16 typed buffer load through a table asks the host's table of the
+    /// table's views (`SLOT_TABLE_STRIDES`, by slot from the table's first)
+    /// for its view's format kind, as one through the heap does (the
     /// face network's compute_graph_ops programs, e.g. 0aa7934094794dbf,
     /// load R16G16B16A16_UINT data this way and compute with it as
     /// integers); a 32-bit load does not.
@@ -14282,7 +14434,7 @@ mod tests {
         };
         let asks_for_kind = |d16| {
             let l = lower_with(&words(d16), layout.clone(), used.clone()).unwrap();
-            l.root_srvs.contains(&super::super::shader::SLOT_STRIDES)
+            l.root_srvs.contains(&super::super::shader::SLOT_TABLE_STRIDES)
         };
         assert!(asks_for_kind(true), "d16");
         assert!(!asks_for_kind(false), "32-bit");

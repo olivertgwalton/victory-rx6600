@@ -2428,7 +2428,10 @@ fn typed_d16_table_uav_roundtrip_uint_sint_and_float() {
                     &Dispatch {
                         roots: vec![
                             (0, Root::Constants(ud)),
-                            (1, Root::View { srv: true, data: strides }),
+                            (
+                                super::host::root_view_param(&[&shader], super::SLOT_TABLE_STRIDES, 1),
+                                Root::View { srv: true, data: strides },
+                            ),
                         ],
                         views: &views,
                         samplers: &[],

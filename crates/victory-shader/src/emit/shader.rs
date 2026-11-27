@@ -82,6 +82,80 @@ pub const SLOT_FAULTS: u8 = 253;
 /// not written by the shaders of that submission or any after it: the host
 /// need not look for their writes there.
 pub const SLOT_MARKS: u8 = 251;
+/// The host's acceleration structures for the title's ray-tracing
+/// structures (`victory_gpu::rt`): the root UAV `u<SLOT_RT>` in
+/// [`ROOT_CBV_SPACE`] is a table of [`RT_TABLE_SLOTS`] entries of four
+/// dwords, by the title address of a structure's root node (hashed,
+/// [`rt_hash`]; an entry is in its slot or the next): the address's low and
+/// high dword, then the view-heap slot of the host structure's view
+/// ([`RT_NEGATIVE`]: the host keeps none for it; the slot after it views the
+/// structure's raw node pointers by primitive), then 0. A shader that tests
+/// a root-shaped node the table does not know notes its address in
+/// `u<SLOT_RT_NOTES>` ([`RT_NOTES`] entries of four dwords: the address
+/// with the node's kind in its low three bits, its high dword, and the
+/// structure's start, low and high) for the host.
+pub const SLOT_RT: u8 = 250;
+/// See [`SLOT_RT`].
+pub const SLOT_RT_NOTES: u8 = 249;
+/// Diagnostics (`VICTORY_WALK_TRACE=<tag>`): the root UAV `u<SLOT_WALK>` in
+/// [`ROOT_CBV_SPACE`] takes a record of [`WALK_DWORDS`] dwords for each node
+/// test of the program whose tag (the low dword of its native index key)
+/// that is, by threads 0-7 of every 64th group: group, thread, the node
+/// pointer's two dwords, the four results, the ray's origin and direction
+/// (x y z each), extent, the test's place (block << 16 | instruction) and
+/// whether boxes are sorted, then the 28 dwords of the node as read, then
+/// 4 of nothing. Dword 0 counts them; records from dword 16 on.
+pub const SLOT_WALK: u8 = 248;
+/// See [`SLOT_WALK`].
+pub const WALK_DWORDS: u32 = 48;
+/// See [`SLOT_WALK`]: bytes of the buffer.
+pub const WALK_BYTES: u32 = 64 << 20;
+
+/// See [`SLOT_WALK`]: the program traced, if any.
+pub fn walk_trace() -> Option<u32> {
+    walk_traced().first().copied()
+}
+
+/// See [`SLOT_WALK`]: every program named (comma-separated tags); the
+/// first is the one whose node tests are recorded, and each one's fault
+/// notes carry the instruction's offset with its place in this list.
+pub fn walk_traced() -> &'static [u32] {
+    static TAGS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    TAGS.get_or_init(|| {
+        std::env::var("VICTORY_WALK_TRACE")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|v| u32::from_str_radix(v.trim(), 16).ok())
+            .collect()
+    })
+}
+/// See [`SLOT_RT`]: entries of the table (a power of two).
+pub const RT_TABLE_SLOTS: u32 = 1 << 14;
+/// See [`SLOT_RT`]: entries of the notes (a power of two).
+pub const RT_NOTES: u32 = 1 << 12;
+/// See [`SLOT_RT`]: a known structure the host keeps nothing for.
+pub const RT_NEGATIVE: u32 = 0xffff_ffff;
+
+/// See [`SLOT_RT`]: the table slot of a root node's title address.
+pub fn rt_hash(low: u32, high: u32) -> u32 {
+    ((low >> 6) ^ (high << 26)).wrapping_mul(0x9E37_79B1) >> (32 - RT_TABLE_SLOTS.trailing_zeros())
+}
+
+/// The view-heap slot of the first of the host's acceleration-structure
+/// views; 0: shaders translated now test the title's nodes themselves
+/// (`victory_gpu::rt` sets it before the first shader is translated).
+static RT_VIEWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// See [`RT_VIEWS`].
+pub fn set_rt_views(first: u32) {
+    RT_VIEWS.store(first, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`RT_VIEWS`].
+pub fn rt_views() -> u32 {
+    RT_VIEWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// See [`SLOT_MARKS`]: the dword of stores of no known address (also that of
 /// pages past the directory's end, as there).
 pub const MARKS_UNKNOWN: u32 = MEMORY_PAGES - 1;
@@ -144,6 +218,8 @@ pub(crate) mod flags {
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
+    /// Inline ray queries (DXR 1.1).
+    pub const RAYTRACING: u64 = 1 << 25;
 }
 
 pub(crate) struct Types {
@@ -977,6 +1053,9 @@ impl Shader {
         }
         if self.flags & flags::SAMPLER_HEAP != 0 {
             features |= 0x400_0000;
+        }
+        if self.flags & flags::RAYTRACING != 0 {
+            features |= 0x10_0000;
         }
         if self.flags & flags::ATOMIC_TYPED64 != 0 {
             features |= 0x40_0000;

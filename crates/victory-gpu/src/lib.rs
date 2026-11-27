@@ -26,6 +26,8 @@ mod uffd;
 #[cfg(windows)]
 pub(crate) mod marks;
 #[cfg(windows)]
+pub(crate) mod rt;
+#[cfg(windows)]
 mod unixlib;
 #[cfg(windows)]
 pub(crate) mod dmabuf;

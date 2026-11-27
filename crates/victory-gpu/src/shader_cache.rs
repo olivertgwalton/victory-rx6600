@@ -151,11 +151,20 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::raw_typed_loads() {
             bytes.extend_from_slice(b"raw typed loads");
         }
+        // A traced program's translation differs (diagnostics).
+        for tag in victory_shader::emit::walk_traced() {
+            bytes.extend_from_slice(format!("walk trace {tag:08x}").as_bytes());
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
     hash.update(fixed);
-    for value in victory_shader::emit::host_settings() {
+    for (i, value) in victory_shader::emit::host_settings().into_iter().enumerate() {
+        // (The ray queries' views only when there are: the keys of
+        // translations without them stay as they were.)
+        if i == 4 && value == 0 {
+            continue;
+        }
         hash.update(&value.to_le_bytes());
     }
     *hash.finalize().as_bytes()

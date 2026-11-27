@@ -2002,6 +2002,33 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_RT || slot == victory_shader::emit::SLOT_RT_NOTES || slot == victory_shader::emit::SLOT_WALK {
+                    // Ours: the host's acceleration structures' table and
+                    // the notes of structures it has none for (`crate::rt`),
+                    // and the walk records (diagnostics).
+                    let at = if slot == victory_shader::emit::SLOT_RT {
+                        crate::rt::table_gpu()
+                    } else if slot == victory_shader::emit::SLOT_WALK {
+                        crate::rt::walk_gpu()
+                    } else {
+                        crate::rt::notes_gpu()
+                    };
+                    let Some(at) = at else {
+                        crate::host::fail(format_args!("a shader asks for ray queries and their table could not be made"));
+                    };
+                    if self.sets.root(compute, param, Bound::Uav(at)) {
+                        // SAFETY: an open list; the buffers live as long as
+                        // the process.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootUnorderedAccessView(param, at);
+                            } else {
+                                l.SetGraphicsRootUnorderedAccessView(param, at);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_MARKS {
                     // Ours: where shaders mark the title pages they write
                     // (`crate::marks`).

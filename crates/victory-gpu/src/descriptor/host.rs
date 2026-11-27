@@ -315,6 +315,7 @@ impl Drop for HostHeap {
     /// fault; the owner's tree, d46d31b). And its title-memory run leaves
     /// the map ([`crate::memory::heap_gone`]).
     fn drop(&mut self) {
+        crate::rt::heap_gone(self.cpu);
         if !crate::wine::on_wine() {
             return;
         }
@@ -1754,6 +1755,10 @@ pub(crate) fn probe_view_limit() {
         let twins = raw_twins() && fits(2 * RAW_TWINS);
         if twins {
             victory_shader::emit::set_raw_views(RAW_TWINS);
+            // The host's acceleration structures' views, past the twins.
+            if crate::rt::on() && fits(2 * RAW_TWINS + crate::rt::VIEWS) {
+                crate::rt::view_heaps(2 * RAW_TWINS);
+            }
         }
         // (The twins lie past the null slot.)
         let views = if twins {
@@ -1860,7 +1865,7 @@ impl HostHeap {
                 }
             }
         } else {
-            let size = if raw == 0 { null + 1 } else { 2 * raw };
+            let size = if raw == 0 { null + 1 } else { 2 * raw + crate::rt::extra_views() };
             let fitted = if count + extra <= null {
                 count
             } else {
@@ -1885,6 +1890,9 @@ impl HostHeap {
             )
         };
         tracing::debug!(count, sampler, "host descriptor heap");
+        if !sampler {
+            crate::rt::heap_made(cpu, step, size);
+        }
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((

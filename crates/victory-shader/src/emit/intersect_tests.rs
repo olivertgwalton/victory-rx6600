@@ -756,7 +756,10 @@ fn a_picked_views_address_comes_from_the_hosts_table() {
                     // s0: the picked view's place in the table (slot 2).
                     roots: vec![
                         (0, Root::Constants(vec![2, 0, 0, 0, 0])),
-                        (1, Root::View { srv: true, data: table.clone() }),
+                        (
+                            super::host::root_view_param(&[&shader], SLOT_STRIDES, 1),
+                            Root::View { srv: true, data: table.clone() },
+                        ),
                     ],
                     views: &[
                         View::Buffer { data: &decoy, stride: Stride::Raw },
