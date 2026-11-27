@@ -679,7 +679,43 @@ fn bury(finished: u64) {
             }
             retired.drain(..n).collect()
         };
-        drop(done);
+        bury_aside(done);
+    }
+}
+
+/// Whether what [`bury`] lets go is dropped by a thread of its own
+/// (`VICTORY_BURY_ASIDE=0`: by the caller, as before). The caller is the
+/// thread that lands flights: releasing the host's objects took it 7 ms a
+/// frame between two landings (run air512, "the rest" of the landing's
+/// line), and the title is told that the card is done only by the next
+/// landing.
+fn bury_aside_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BURY_ASIDE").is_none_or(|v| v != "0"))
+}
+
+/// Drops `done`: on the thread that only does that, in the order given.
+fn bury_aside(done: Vec<(u64, Retired)>) {
+    if !bury_aside_on() {
+        return drop(done);
+    }
+    static TO: OnceLock<Option<std::sync::mpsc::Sender<Vec<(u64, Retired)>>>> = OnceLock::new();
+    let to = TO.get_or_init(|| {
+        let (to, from) = std::sync::mpsc::channel::<Vec<(u64, Retired)>>();
+        std::thread::Builder::new()
+            .name("victory-bury".into())
+            .spawn(move || {
+                // Each batch is dropped as it comes; the loop ends with the process.
+                for batch in from {
+                    drop(batch);
+                }
+            })
+            .ok()
+            .map(|_| to)
+    });
+    // No thread, or it is gone: dropped here.
+    if let Some(Err(back)) = to.as_ref().map(|to| to.send(done)) {
+        drop(back.0);
     }
 }
 
