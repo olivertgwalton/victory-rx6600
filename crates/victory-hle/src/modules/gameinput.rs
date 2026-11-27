@@ -18,7 +18,7 @@ use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
-use super::xgameruntime::{HRESULT, S_OK};
+use super::xgameruntime::{HRESULT, NOT_SUPPORTED, S_OK};
 use crate::{HleExport, HleModule};
 
 /// The documented errors.
@@ -27,6 +27,8 @@ pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
 pub const READING_NOT_FOUND: HRESULT = 0x838A_0003_u32 as i32;
 pub const REFERENCE_TOO_OLD: HRESULT = 0x838A_0004_u32 as i32;
 const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
+/// A motor index past the device's motors (console `GameInput.dll`).
+const E_BOUNDS: HRESULT = 0x8000_000B_u32 as i32;
 
 /// Input kinds (bits) our devices have.
 const KEYBOARD_KIND: u32 = 0x10;
@@ -177,7 +179,7 @@ pub struct Object {
 
 #[repr(C)]
 pub struct Device {
-    vtable: &'static Table<21>,
+    vtable: &'static Table<22>,
     hub: *const Hub,
     index: usize,
     info: DeviceInfo,
@@ -666,22 +668,31 @@ fn relative(
     out: Out,
     forward: bool,
 ) -> HRESULT {
-    if reference.is_null() {
-        return fail(out, E_INVALIDARG);
+    // As the console's GameInput.dll: the out pointer is cleared first; a
+    // walk needs its device (none: E_NOTIMPL), one of ours, a reference
+    // and the reference's device being that device (else E_INVALIDARG),
+    // and the device connected.
+    fail(out, S_OK);
+    if device.is_null() {
+        tracing::debug!(forward, "input reading walk without a device: E_NOTIMPL");
+        return E_NOTIMPL;
     }
     let hub = hub(this);
+    let Some(index) = hub.index(device) else {
+        return E_INVALIDARG;
+    };
+    if reference.is_null() {
+        return E_INVALIDARG;
+    }
     // SAFETY: a reading we handed out and the title still holds.
     let reference = unsafe { &*reference };
-    // shortcut: with no device given only the reference's device is walked,
-    // not every device's readings in time order; the title walks
-    // only keyboard readings (one device) and the current pad's previous one.
-    let Some(index) = hub.index(reference.device) else {
-        return fail(out, E_INVALIDARG);
-    };
-    if !device.is_null() && !std::ptr::eq(device, reference.device) {
-        return fail(out, E_INVALIDARG);
+    if !std::ptr::eq(device, reference.device) {
+        return E_INVALIDARG;
     }
     let state = hub.state();
+    if !state.slots[index].connected {
+        return DEVICE_DISCONNECTED;
+    }
     let history = &state.slots[index].history;
     if history
         .front()
@@ -722,34 +733,29 @@ extern "system" fn previous_reading(
 ) -> HRESULT {
     relative(this, reference, kind, device, out, false)
 }
-/// The device's reading at `time`, among those still kept.
+/// Not implemented by the console's GameInput.dll either: the out pointer
+/// is cleared and the call fails with E_NOTIMPL.
 extern "system" fn temporal_reading(
-    this: This,
-    time: u64,
-    device: *const Device,
+    _: This,
+    _time: u64,
+    _device: *const Device,
     out: Out,
 ) -> HRESULT {
-    let hub = hub(this);
-    let Some(index) = hub.index(device) else {
-        return fail(out, E_INVALIDARG);
-    };
-    let state = hub.state();
-    let history = &state.slots[index].history;
-    hand(out, history.iter().rev().find(|r| r.timestamp <= time))
+    fail(out, E_NOTIMPL)
 }
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-fn token(out: *mut u64) -> HRESULT {
+/// Writes `value` through a token out pointer if it is non-null.
+fn put_token(out: *mut u64, value: u64) {
     if !out.is_null() {
         // SAFETY: checked non-null.
-        unsafe { out.write(NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)) };
+        unsafe { out.write(value) };
     }
-    S_OK
 }
 
-// shortcut: reading callbacks never run; the title registers none
-// (it polls).
+/// The console's GameInput.dll does not implement reading callbacks: the
+/// token is cleared and the call fails with E_NOTIMPL.
 extern "system" fn register_reading(
     _: This,
     _device: *const c_void,
@@ -759,8 +765,8 @@ extern "system" fn register_reading(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
-    tracing::warn!("input reading callbacks are never called");
-    token(out)
+    put_token(out, 0);
+    E_NOTIMPL
 }
 
 /// Device callbacks run on our poll thread when a device comes or goes.
@@ -777,6 +783,7 @@ extern "system" fn register_device(
     callback: Option<DeviceCallback>,
     out: *mut u64,
 ) -> HRESULT {
+    put_token(out, 0);
     let Some(callback) = callback else {
         return E_INVALIDARG;
     };
@@ -818,46 +825,76 @@ extern "system" fn register_device(
     S_OK
 }
 /// Guide button and keyboard layout callbacks: neither ever changes here.
+/// As on the console the token is cleared first and a missing callback is
+/// E_INVALIDARG.
 extern "system" fn register_other(
     _: This,
     _device: *const c_void,
     _context: *mut c_void,
-    _callback: *const c_void,
+    callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
-    token(out)
+    put_token(out, 0);
+    if callback.is_null() {
+        return E_INVALIDARG;
+    }
+    put_token(out, NEXT_TOKEN.fetch_add(1, Ordering::Relaxed));
+    S_OK
 }
 
-fn forget(this: This, token: u64) {
+/// Takes the registration away; whether there was one.
+fn forget(this: This, token: u64) -> bool {
     let mut state = hub(this).state();
+    let before = state.callbacks.len();
     state.callbacks.retain(|r| r.token != token);
     state.pending.retain(|e| e.registration.token != token);
+    state.callbacks.len() != before
 }
+/// Token 0 is no callback; `u64::MAX` from inside a callback names that
+/// callback (console GameInput.dll).
 extern "system" fn stop_callback(this: This, token: u64) {
-    forget(this, token);
+    let token = if token == u64::MAX {
+        let me = std::thread::current().id();
+        match hub(this).state().running.iter().find(|r| r.1 == me) {
+            Some(r) => r.0,
+            None => return,
+        }
+    } else {
+        token
+    };
+    if token != 0 {
+        forget(this, token);
+    }
 }
-/// Stops the callback, then waits up to `timeout` µs for a call of it that
-/// is running; false on time-out, or from inside that callback (it cannot
-/// wait for itself), as documented. Either way it is never called again.
+/// As the console's GameInput.dll: tokens 0 and `u64::MAX`, a call from
+/// inside any device callback (which leaves the registration in place)
+/// and an unknown token are false; otherwise the registration is taken
+/// away and the result is true. A call of it running on another thread is
+/// waited for, up to `timeout` µs.
 extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> bool {
-    forget(this, token);
     let hub = hub(this);
     let me = std::thread::current().id();
+    if token == 0 || token == u64::MAX || hub.state().running.iter().any(|r| r.1 == me) {
+        return false;
+    }
+    if !forget(this, token) {
+        return false;
+    }
     let deadline = Instant::now().checked_add(Duration::from_micros(timeout));
     let mut state = hub.state();
     loop {
-        let running = state.running.iter().filter(|r| r.0 == token);
-        if running.clone().any(|r| r.1 == me) {
-            return false;
-        }
-        if running.count() == 0 {
+        if !state.running.iter().any(|r| r.0 == token) {
             return true;
         }
         state = match deadline {
-            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
+            None => hub
+                .returned
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner),
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-                    return false;
+                    // Taken away all the same: the console reports it so.
+                    return true;
                 };
                 let waited = hub.returned.wait_timeout(state, left);
                 waited.unwrap_or_else(PoisonError::into_inner).0
@@ -890,11 +927,15 @@ extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRES
         None => fail(out, DEVICE_NOT_FOUND),
     }
 }
-/// Lookup by object, platform handle or platform string: our devices have
-/// none of these.
+/// Lookup by object or platform string: our devices have none of these.
 extern "system" fn find_device(_: This, _value: *const c_void, out: Out) -> HRESULT {
     fail(out, DEVICE_NOT_FOUND)
 }
+/// Lookup by platform handle: not implemented by the console's DLL.
+extern "system" fn find_by_handle(_: This, _handle: *const c_void, out: Out) -> HRESULT {
+    fail(out, E_NOTIMPL)
+}
+/// E_NOTIMPL on the console as well.
 extern "system" fn enable_oem_device(
     _: This,
     _vendor: u16,
@@ -902,7 +943,7 @@ extern "system" fn enable_oem_device(
     _interface: u8,
     _collection: u8,
 ) -> HRESULT {
-    S_OK
+    E_NOTIMPL
 }
 extern "system" fn set_focus_policy(_: This, _policy: u32) {}
 
@@ -925,7 +966,7 @@ static INPUT: Table<22> = Table([
     create_aggregate as *const (),    // 0x78
     find_by_id as *const (),          // 0x80
     find_device as *const (),         // 0x88 by object
-    find_device as *const (),         // 0x90 by platform handle
+    find_by_handle as *const (),      // 0x90 by platform handle
     find_device as *const (),         // 0x98 by platform string
     enable_oem_device as *const (),   // 0xa0
     set_focus_policy as *const (),    // 0xa8
@@ -974,36 +1015,107 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
         source.rumble(device.index, speed(low), speed(high));
     }
 }
-extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
-    tracing::warn!(
-        slot = format_args!("{SLOT:#x}"),
-        "input device method not implemented"
-    );
+// The other device methods answer as the console's GameInput.dll does for
+// a device with no battery report, no force feedback or haptic motors and
+// no raw reports (what ours are).
+
+/// Battery state: rates and capacities 0, status unknown (-1).
+extern "system" fn battery_state(_: *const Device, out: *mut [u32; 5]) {
+    if !out.is_null() {
+        // SAFETY: checked non-null; the title passes a battery state.
+        unsafe { out.write([0, 0, 0, 0, u32::MAX]) };
+    }
+}
+/// Force feedback effect: no motor has the index; the effect is cleared.
+extern "system" fn create_effect(
+    _: *const Device,
+    _motor: u32,
+    _params: *const c_void,
+    out: Out,
+) -> HRESULT {
+    fail(out, E_BOUNDS)
+}
+/// Whether a force feedback motor is on: no such motor.
+extern "system" fn motor_powered(_: *const Device, _motor: u32) -> bool {
+    false
+}
+/// Haptic motor state: no motor has the index.
+extern "system" fn set_haptic(_: *const Device, _motor: u32, _params: *const c_void) -> HRESULT {
+    E_BOUNDS
+}
+/// Methods without a result that change nothing on our devices: motor
+/// gain, input synchronization state and hint, power off, the end of
+/// exclusive raw access.
+extern "system" fn ignore(_: *const Device) {}
+/// Raw report: kind 2 (feature) is not implemented; input and output
+/// reports need a report the device describes, and ours describe none.
+extern "system" fn create_raw_report(_: *const Device, _id: u32, kind: u32, out: Out) -> HRESULT {
+    fail(out, if kind == 2 { E_NOTIMPL } else { E_INVALIDARG })
+}
+/// Raw feature reads and output with a response: not implemented.
+extern "system" fn raw_not_implemented(
+    _: *const Device,
+    _report: *const c_void,
+    out: Out,
+) -> HRESULT {
+    fail(out, E_NOTIMPL)
+}
+extern "system" fn set_raw_feature(_: *const Device, _report: *const c_void) -> HRESULT {
     E_NOTIMPL
 }
+/// Raw output: a disconnected device fails as such; ours have no raw
+/// output channel.
+extern "system" fn send_raw_output(this: *const Device, _report: *const c_void) -> HRESULT {
+    if device_status(this) & STATUS_CONNECTED == 0 {
+        DEVICE_DISCONNECTED
+    } else {
+        NOT_SUPPORTED
+    }
+}
+/// Raw IO control: not implemented; the bytes-returned count is cleared.
+extern "system" fn raw_io_control(
+    _: *const Device,
+    _code: u32,
+    _in_size: usize,
+    _in_buffer: *const c_void,
+    _out_size: usize,
+    _out_buffer: *mut c_void,
+    used: *mut usize,
+) -> HRESULT {
+    if !used.is_null() {
+        // SAFETY: checked non-null.
+        unsafe { used.write(0) };
+    }
+    E_NOTIMPL
+}
+/// Exclusive raw access: never granted.
+extern "system" fn acquire_exclusive(_: *const Device, _timeout: u64) -> bool {
+    false
+}
 
-static DEVICE: Table<21> = Table([
+static DEVICE: Table<22> = Table([
     no_interface as *const (),        // 0x00
     add_ref as *const (),             // 0x08 AddRef
     add_ref as *const (),             // 0x10 Release
     device_info as *const (),         // 0x18
     device_status as *const (),       // 0x20
-    unsupported::<0x28> as *const (), // battery
-    unsupported::<0x30> as *const (), // force feedback
-    unsupported::<0x38> as *const (), //
-    unsupported::<0x40> as *const (), //
-    unsupported::<0x48> as *const (), // haptics
+    battery_state as *const (),       // 0x28
+    create_effect as *const (),       // 0x30 force feedback effect
+    motor_powered as *const (),       // 0x38
+    ignore as *const (),              // 0x40 force feedback motor gain
+    set_haptic as *const (),          // 0x48
     set_rumble as *const (),          // 0x50
-    unsupported::<0x58> as *const (), // input synchronization
-    unsupported::<0x60> as *const (), //
-    unsupported::<0x68> as *const (), // power off
-    unsupported::<0x70> as *const (), // raw device access
-    unsupported::<0x78> as *const (), //
-    unsupported::<0x80> as *const (), //
-    unsupported::<0x88> as *const (), //
-    unsupported::<0x90> as *const (), //
-    unsupported::<0x98> as *const (), //
-    unsupported::<0xa0> as *const (), //
+    ignore as *const (),              // 0x58 input synchronization state
+    ignore as *const (),              // 0x60 input synchronization hint
+    ignore as *const (),              // 0x68 power off
+    create_raw_report as *const (),   // 0x70
+    raw_not_implemented as *const (), // 0x78 get raw feature
+    set_raw_feature as *const (),     // 0x80
+    send_raw_output as *const (),     // 0x88
+    raw_not_implemented as *const (), // 0x90 raw output with a response
+    raw_io_control as *const (),      // 0x98
+    acquire_exclusive as *const (),   // 0xa0
+    ignore as *const (),              // 0xa8 release exclusive raw access
 ]);
 
 fn reading<'a>(this: *const Reading) -> &'a Reading {
@@ -1024,9 +1136,11 @@ extern "system" fn reading_release(this: *const Reading) -> u32 {
 extern "system" fn input_kind(this: *const Reading) -> u32 {
     reading(this).kind()
 }
+/// One kind's sequence number: a mask of several kinds, or a kind the
+/// reading lacks, is 0 (console GameInput.dll).
 extern "system" fn sequence_number(this: *const Reading, kind: u32) -> u64 {
     let reading = reading(this);
-    if reading.kind() & kind != 0 {
+    if kind.is_power_of_two() && reading.kind() & kind != 0 {
         reading.sequence
     } else {
         0
@@ -1059,19 +1173,32 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     unsafe { std::ptr::copy_nonoverlapping(keys.as_ptr(), out, n) };
     n as u32
 }
+/// A reading without gamepad state clears the title's (console DLL).
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
-    match &reading(this).value {
-        Value::Pad(state) if !out.is_null() => {
-            // SAFETY: checked non-null.
-            unsafe { out.write(*state) };
-            true
-        }
-        _ => false,
+    if out.is_null() {
+        return false;
     }
+    let (state, found) = match &reading(this).value {
+        Value::Pad(state) => (*state, true),
+        Value::Keys(_) => (PadState::default(), false),
+    };
+    // SAFETY: checked non-null.
+    unsafe { out.write(state) };
+    found
 }
-/// Kinds our devices do not have: no count, no state.
+/// Counts and arrays of kinds our devices do not have: none.
 extern "system" fn nothing(_: *const c_void) -> usize {
     0
+}
+/// The state of a kind our readings never carry: as the console's DLL, the
+/// title's `BYTES`-byte state is cleared and the result is false (for the
+/// raw report, the report pointer is cleared).
+extern "system" fn absent<const BYTES: usize>(_: *const Reading, out: *mut u8) -> bool {
+    if !out.is_null() {
+        // SAFETY: checked non-null; the title passes room for the state.
+        unsafe { out.write_bytes(0, BYTES) };
+    }
+    false
 }
 
 static READING: Table<25> = Table([
@@ -1082,7 +1209,7 @@ static READING: Table<25> = Table([
     sequence_number as *const (),   // 0x20
     reading_timestamp as *const (), // 0x28
     reading_device as *const (),    // 0x30
-    nothing as *const (),           // 0x38 raw report
+    absent::<8> as *const (),       // 0x38 raw report
     nothing as *const (),           // 0x40 controller axes, buttons, switches
     nothing as *const (),           // 0x48
     nothing as *const (),           // 0x50
@@ -1091,15 +1218,15 @@ static READING: Table<25> = Table([
     nothing as *const (),           // 0x68
     key_count as *const (),         // 0x70
     key_state as *const (),         // 0x78
-    nothing as *const (),           // 0x80 mouse
+    absent::<0x28> as *const (),    // 0x80 mouse
     nothing as *const (),           // 0x88 touch
     nothing as *const (),           // 0x90
-    nothing as *const (),           // 0x98 motion
-    nothing as *const (),           // 0xa0 arcade stick
-    nothing as *const (),           // 0xa8 flight stick
+    absent::<0x44> as *const (),    // 0x98 motion
+    absent::<4> as *const (),       // 0xa0 arcade stick
+    absent::<0x18> as *const (),    // 0xa8 flight stick
     gamepad_state as *const (),     // 0xb0
-    nothing as *const (),           // 0xb8 racing wheel
-    nothing as *const (),           // 0xc0 UI navigation
+    absent::<0x1c> as *const (),    // 0xb8 racing wheel
+    absent::<4> as *const (),       // 0xc0 UI navigation
 ]);
 
 pub(crate) fn module() -> HleModule {
@@ -1198,7 +1325,9 @@ mod host {
             // to the pad (the title's start screen) saw nothing.
             if slot == 0 {
                 for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                    if let Some(&(_, button)) =
+                        super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk)
+                    {
                         pad.buttons |= button;
                     }
                 }
@@ -1588,7 +1717,11 @@ mod tests {
         assert_eq!(pad(hub).left_x, 1.0);
         // A pad is switched on, in any slot: its input arrives, beside the
         // keyboard's, and no device comes or goes.
-        host.lock().unwrap().pads[2] = Some(PadState { buttons: A, left_y: -0.5, ..Default::default() });
+        host.lock().unwrap().pads[2] = Some(PadState {
+            buttons: A,
+            left_y: -0.5,
+            ..Default::default()
+        });
         hub.poll();
         let p = pad(hub);
         assert_eq!((p.buttons, p.left_x, p.left_y), (A, 1.0, -0.5));
@@ -1659,7 +1792,16 @@ mod tests {
         let mut token = 0;
         let context = (&raw const hub.object).cast_mut().cast();
         assert_eq!(
-            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
+            register(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                1,
+                0,
+                context,
+                Some(slow),
+                &mut token
+            ),
             S_OK
         );
         host.lock().unwrap().pads[1] = Some(PadState::default());
@@ -1668,7 +1810,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
             LEAVE.store(true, Ordering::SeqCst);
@@ -1676,6 +1817,11 @@ mod tests {
         let start = Instant::now();
         assert!(unregister(&hub.object, token, u64::MAX), "waits for it");
         assert!(start.elapsed() >= Duration::from_millis(40));
+        assert!(
+            !unregister(&hub.object, token, 0),
+            "a token no longer registered"
+        );
+        assert!(!unregister(&hub.object, 0, 0) && !unregister(&hub.object, u64::MAX, 0));
         assert_eq!(FROM_INSIDE.load(Ordering::SeqCst), 1);
         poller.join().unwrap();
         leave.join().unwrap();
@@ -1706,5 +1852,94 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    /// What the console's GameInput.dll answers that a naive layer would
+    /// not: missing devices, unimplemented calls, cleared outputs.
+    #[test]
+    fn answers_follow_the_console_library() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
+        hub.poll();
+        let first = current(hub, GAMEPAD_KIND, 0).unwrap();
+
+        // A walk needs its device; the temporal lookup is not implemented.
+        type Walk = extern "system" fn(This, *const Reading, u32, *const Device, Out) -> HRESULT;
+        let mut out = std::ptr::dangling();
+        let next = slot::<Walk, _>(&hub.object, 0x28);
+        assert_eq!(
+            next(&hub.object, first, GAMEPAD_KIND, std::ptr::null(), &mut out),
+            E_NOTIMPL
+        );
+        assert!(out.is_null());
+        let other = &hub.devices[1] as *const Device;
+        assert_eq!(
+            next(&hub.object, first, GAMEPAD_KIND, other, &mut out),
+            E_INVALIDARG
+        );
+        type Temporal = extern "system" fn(This, u64, *const Device, Out) -> HRESULT;
+        let temporal = slot::<Temporal, _>(&hub.object, 0x38);
+        out = std::ptr::dangling();
+        assert_eq!(
+            temporal(&hub.object, now(), &hub.devices[0], &mut out),
+            E_NOTIMPL
+        );
+        assert!(out.is_null());
+
+        // Reading callbacks are not implemented: the token is cleared.
+        type ReadingCallback = extern "system" fn(
+            This,
+            *const c_void,
+            u32,
+            f32,
+            *mut c_void,
+            *const c_void,
+            *mut u64,
+        ) -> HRESULT;
+        let mut token = 7;
+        let register = slot::<ReadingCallback, _>(&hub.object, 0x40);
+        let null = std::ptr::null();
+        assert_eq!(
+            register(
+                &hub.object,
+                null,
+                GAMEPAD_KIND,
+                0.0,
+                null.cast_mut(),
+                null,
+                &mut token
+            ),
+            E_NOTIMPL
+        );
+        assert_eq!(token, 0);
+
+        // One kind's sequence number only.
+        let sequence = slot::<extern "system" fn(*const Reading, u32) -> u64, _>(first, 0x20);
+        assert_ne!(sequence(first, GAMEPAD_KIND), 0);
+        assert_eq!(sequence(first, GAMEPAD_KIND | KEYBOARD_KIND), 0);
+
+        // A state the reading lacks is cleared.
+        let mouse =
+            slot::<extern "system" fn(*const Reading, *mut [u8; 0x28]) -> bool, _>(first, 0x80);
+        let mut state = [0xff; 0x28];
+        assert!(!mouse(first, &mut state));
+        assert_eq!(state, [0; 0x28]);
+
+        // Devices: battery unknown, no motors, no raw access.
+        let device = &hub.devices[0] as *const Device;
+        let battery = slot::<extern "system" fn(*const Device, *mut [u32; 5]), _>(device, 0x28);
+        let mut info = [1; 5];
+        battery(device, &mut info);
+        assert_eq!(info, [0, 0, 0, 0, u32::MAX]);
+        let haptic = slot::<extern "system" fn(*const Device, u32, *const c_void) -> HRESULT, _>(
+            device, 0x48,
+        );
+        assert_eq!(haptic(device, 0, null), E_BOUNDS);
+        let acquire = slot::<extern "system" fn(*const Device, u64) -> bool, _>(device, 0xa0);
+        assert!(!acquire(device, 0));
+        release(first);
     }
 }

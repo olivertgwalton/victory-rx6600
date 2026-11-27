@@ -189,15 +189,35 @@ pub extern "system" fn XGameRuntimeUninitialize() {
     tracing::info!("XGameRuntimeUninitialize");
 }
 
-/// The arguments identify the title's build of the stub; not checked.
+/// `E_GAMERUNTIME_NOT_INITIALIZED`: a module asked to join an
+/// initialisation that has not happened.
+pub const NOT_INITIALIZED: HRESULT = 0x8924_0100_u32 as i32;
+/// `E_GAMERUNTIME_VERSION_MISMATCH`: the title was built for a newer runtime.
+pub const VERSION_MISMATCH: HRESULT = 0x8924_0102_u32 as i32;
+const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
+/// IUnknown, which every area's object also answers.
+const IUNKNOWN: Guid = Guid::new(0, 0, 0, [0xc0, 0, 0, 0, 0, 0, 0, 0x46]);
+
+/// The console's xgameruntime.dll is this runtime version (major, minor);
+/// titles built for a later one are refused.
+const RUNTIME_VERSION: (u64, u64) = (0x6336, 0x2712);
+
+/// Initialisation flags: bit 0 joins an existing initialisation (a DLL of
+/// the title's after the executable) without counting; bit 1 says the
+/// version arrives as major << 32 | minor; bit 2 checks options only.
+const JOIN: u64 = 0x1;
+const SPLIT_VERSION: u64 = 0x2;
+const CHECK_ONLY: u64 = 0x4;
+
+/// Initialisations not yet undone, and the version the first one gave.
+static INITIALIZED: Mutex<(u64, (u64, u64))> = Mutex::new((0, (0, 0)));
+
 pub extern "system" fn InitializeApiImpl(version: u64, build: u64) -> HRESULT {
-    tracing::info!(version, build, "InitializeApiImpl");
-    S_OK
+    initialize(version, build, 0, std::ptr::null())
 }
 
 pub extern "system" fn InitializeApiImplEx(version: u64, build: u64, flags: u64) -> HRESULT {
-    tracing::info!(version, build, flags, "InitializeApiImplEx");
-    S_OK
+    initialize(version, build, flags, std::ptr::null())
 }
 
 /// The stub prefers this one when present. It passes the same three values
@@ -209,12 +229,51 @@ pub extern "system" fn InitializeApiImplEx2(
     flags: u64,
     options: *const c_void,
 ) -> HRESULT {
-    tracing::info!(version, build, flags, ?options, "InitializeApiImplEx2");
+    initialize(version, build, flags, options)
+}
+
+/// As the console's xgameruntime.dll: unknown flags are E_INVALIDARG, a
+/// title built for a later runtime is refused, a check-only call succeeds,
+/// a join without an initialisation fails (reported as the console
+/// reports it), and the rest count up for `UninitializeApiImpl`.
+// shortcut: options (the fourth argument) are not compared with an earlier
+// initialisation's; no title of ours passes any.
+fn initialize(version: u64, build: u64, flags: u64, options: *const c_void) -> HRESULT {
+    tracing::info!(version, build, flags, ?options, "InitializeApiImpl");
+    if flags & !0xf != 0 {
+        return xasync::E_INVALIDARG;
+    }
+    let wanted = if flags & SPLIT_VERSION != 0 {
+        (version >> 32, version & 0xffff_ffff)
+    } else {
+        (version, build)
+    };
+    if wanted > RUNTIME_VERSION {
+        tracing::warn!(?wanted, runtime = ?RUNTIME_VERSION, "the title wants a newer runtime");
+        return VERSION_MISMATCH;
+    }
+    if flags & CHECK_ONLY != 0 {
+        return S_OK;
+    }
+    let mut state = INITIALIZED.lock().unwrap_or_else(|e| e.into_inner());
+    if state.0 == 0 {
+        if flags & JOIN != 0 {
+            XErrorReport(NOT_INITIALIZED, c"the runtime is not initialised".as_ptr());
+            return NOT_INITIALIZED;
+        }
+        state.1 = wanted;
+    }
+    if flags & JOIN == 0 {
+        state.0 += 1;
+    }
     S_OK
 }
 
+/// Undoes one counted initialisation; nothing when there is none.
 pub extern "system" fn UninitializeApiImpl() {
-    tracing::info!("UninitializeApiImpl");
+    let mut state = INITIALIZED.lock().unwrap_or_else(|e| e.into_inner());
+    state.0 = state.0.saturating_sub(1);
+    tracing::info!(left = state.0, "UninitializeApiImpl");
 }
 
 /// The object for an implemented (provider, interface id); others fail,
@@ -241,10 +300,15 @@ pub extern "system" fn QueryApiImpl(
             calls.push(from);
         }
     }
-    let found = AREAS
-        .iter()
-        .flat_map(|area| area.iter())
-        .find(|(p, i, _)| (*p, *i) == (provider, iid));
+    let mut pairs = AREAS.iter().flat_map(|area| area.iter());
+    let found = pairs
+        .clone()
+        .find(|(p, i, _)| (*p, *i) == (provider, iid))
+        .or_else(|| {
+            pairs
+                .clone()
+                .find(|(p, _, _)| *p == provider && iid == IUNKNOWN)
+        });
     if let Some(&(_, _, object)) = found
         && !out.is_null()
     {
@@ -256,6 +320,18 @@ pub extern "system" fn QueryApiImpl(
     if !queried.contains(&(provider, iid)) {
         queried.push((provider, iid));
         tracing::warn!(%provider, %iid, "runtime API area not implemented");
+    }
+    // As the console's runtime: a provider it has answers an interface id
+    // it lacks with E_NOINTERFACE and a cleared pointer; an unknown
+    // provider is NOT_SUPPORTED, the pointer untouched.
+    // shortcut: providers the console has that we lack altogether still
+    // answer NOT_SUPPORTED.
+    if pairs.any(|(p, _, _)| *p == provider) {
+        if !out.is_null() {
+            // SAFETY: checked non-null.
+            unsafe { out.write(std::ptr::null_mut()) };
+        }
+        return E_NOINTERFACE;
     }
     NOT_SUPPORTED
 }
@@ -291,6 +367,32 @@ pub(crate) fn module() -> HleModule {
 mod tests {
     use super::*;
     use crate::modules::kernel::{FreeLibrary, GetProcAddress, LoadLibraryExA};
+
+    #[test]
+    fn initialisation_checks_flags_and_version_as_the_console_does() {
+        let ours = 0x6336 << 32 | 0x2712;
+        assert_eq!(InitializeApiImplEx(ours, 0, 0x12), xasync::E_INVALIDARG);
+        assert_eq!(
+            InitializeApiImplEx(ours + 1, 0, SPLIT_VERSION),
+            VERSION_MISMATCH
+        );
+        assert_eq!(InitializeApiImplEx(0x6337, 0, 0), VERSION_MISMATCH);
+        assert_eq!(
+            InitializeApiImplEx(ours, 0, SPLIT_VERSION | CHECK_ONLY),
+            S_OK
+        );
+
+        // A known provider without the interface: E_NOINTERFACE, cleared.
+        let mut out = std::ptr::dangling_mut();
+        let other = Guid::new(1, 2, 3, [4; 8]);
+        assert_eq!(
+            QueryApiImpl(&xasync::PROVIDER, &other, &mut out),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
+        assert_eq!(QueryApiImpl(&xasync::PROVIDER, &IUNKNOWN, &mut out), S_OK);
+        assert!(!out.is_null());
+    }
 
     #[test]
     fn title_stub_loads_the_runtime_dynamically() {
