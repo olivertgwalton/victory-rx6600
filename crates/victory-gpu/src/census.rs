@@ -36,7 +36,7 @@ pub fn set_title_bytes(f: fn() -> u64) {
 }
 
 /// The keys, in the order they are printed.
-const KEYS: [&str; 24] = [
+const KEYS: [&str; 26] = [
     "title_committed",
     "duplicates",
     "private_commit",
@@ -48,6 +48,8 @@ const KEYS: [&str; 24] = [
     "snapshot_pool",
     "texture_staging",
     "texture_pool_blocks",
+    "texture_pool_free",
+    "target_pool_free",
     "staging_pool_blocks",
     "host_textures",
     "title_filled_textures",
@@ -135,6 +137,8 @@ fn log(frame: u64) {
         copies[6],
         crate::texture::live_staging_bytes(),
         texture_blocks,
+        crate::pool::texture_room(),
+        crate::pool::target_room(),
         staging_blocks,
         host_textures,
         filled,
