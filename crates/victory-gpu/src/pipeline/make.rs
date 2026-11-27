@@ -178,6 +178,10 @@ impl Pending {
                 tracing::warn!(ms = began.elapsed().as_millis() as u64, ok = made.is_some(), shaders = hashes(self), "pipeline made slowly");
             }
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+            // Slow, not hung: it came back, so later runs make it again.
+            if self.noted_hung.load(Ordering::Relaxed) && made.is_some() {
+                unnote_hung(&self.key);
+            }
             made
         });
         let (lock, done) = &DONE;
@@ -349,6 +353,21 @@ fn hung() -> &'static std::collections::HashSet<String> {
         }
         list
     })
+}
+
+/// Takes `key` out of the list of pipelines that never came back: it was
+/// noted after 30 s and came back after all. The title's biggest trace
+/// programs (the irradiance cache's and screen probes' gathers) take that
+/// long to make while every other shader is being made too; noted, they
+/// were left out of every run after (run rq1 listed six, and the rooms
+/// their light reaches stayed black from then on).
+fn unnote_hung(key: &str) {
+    let Some(dir) = super::library::dir() else { return };
+    let path = dir.join(HUNG_FILE);
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    let kept: Vec<&str> = text.lines().filter(|l| l.split_whitespace().next() != Some(key)).collect();
+    let _ = std::fs::write(&path, kept.iter().map(|l| format!("{l}\n")).collect::<String>());
+    tracing::info!(key, "a pipeline noted as never coming back came back: made again in later runs");
 }
 
 /// Notes `p` in the list of pipelines that never came back.
