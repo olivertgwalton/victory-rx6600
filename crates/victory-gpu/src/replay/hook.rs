@@ -46,6 +46,15 @@ pub(super) unsafe fn orig<T>(this: *mut c_void) -> &'static T {
     unsafe { &*(*shim(this)).orig.cast::<T>() }
 }
 
+/// The address of the object's own method table.
+///
+/// # Safety
+/// As [`orig`].
+pub(super) unsafe fn orig_table(this: *mut c_void) -> usize {
+    // SAFETY: the caller's.
+    unsafe { (*shim(this)).orig as usize }
+}
+
 /// What [`install`] was given for the object.
 ///
 /// # Safety
