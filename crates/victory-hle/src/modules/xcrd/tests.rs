@@ -1491,3 +1491,46 @@ fn xas_paths() {
         f(&mut out, std::ptr::null(), ip.as_ptr(), host.as_ptr(), acct.as_ptr(), cont.as_ptr(), name.as_ptr(), sas_list[0].as_ptr(), 1, 0, std::ptr::null(), 0)
     }));
 }
+
+static FIRED: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+extern "system" fn fired(context: *mut c_void, value: u32) {
+    FIRED.lock().unwrap().push((context as usize, value));
+}
+
+#[test]
+fn storage_notifications() {
+    let s = session();
+    type Reg2 = extern "system" fn(*const c_void, *mut *mut super::notify::Registration) -> HRESULT;
+    type Reg3 = extern "system" fn(*const c_void, *mut c_void, *mut *mut super::notify::Registration) -> HRESULT;
+    type Unreg = extern "system" fn(*mut super::notify::Registration) -> HRESULT;
+    let (rc, lc) = both!("XCrdRegisterCorruptionCallback": Reg2);
+    let three = [both!("XCrdRegisterExternalStorageChangeCallback": Reg3), both!("XCrdRegisterWriteBudgetCallback": Reg3)];
+    let unreg = [both!("XCrdUnregisterCorruptionCallback": Unreg), both!("XCrdUnregisterExternalStorageChangeCallback": Unreg), both!("XCrdUnregisterWriteBudgetCallback": Unreg)];
+    let data = [0x34u8, 0x12, 0x78, 0x56];
+    type Fire = unsafe extern "system" fn(u64, u32, *const c_void, *mut c_void, *const u8, u32) -> i32;
+    for kind in 0..3usize {
+        for (query, subscribe) in [(0, 0), (0xc000_0001_u32 as i32, 0), (0, 0xc000_0022_u32 as i32)] {
+            same(&format!("kind {kind} {query:#x} {subscribe:#x}"), run(&s, |_| {}, |side| {
+                {
+                    let mut w = reference::WNF.lock().unwrap();
+                    *w = reference::Wnf { names: Vec::new(), handler: 0, context: 0, query, subscribe, unsubscribed: Vec::new() };
+                }
+                FIRED.lock().unwrap().clear();
+                let mut reg = std::ptr::null_mut();
+                let hr = match kind {
+                    0 => (if side { rc } else { lc })(fired as *const c_void, &mut reg),
+                    k => { let (r, l) = three[k - 1]; (if side { r } else { l })(fired as *const c_void, 0x77 as *mut c_void, &mut reg) }
+                };
+                let (handler, context) = { let w = reference::WNF.lock().unwrap(); (w.handler, w.context) };
+                if hr >= 0 {
+                    // SAFETY: the handler the library subscribed.
+                    let fire: Fire = unsafe { std::mem::transmute(handler) };
+                    unsafe { fire(0, 0, std::ptr::null(), context as *mut c_void, data.as_ptr(), 4) };
+                }
+                let unhr = if hr >= 0 { let (r, l) = unreg[kind]; Some((if side { r } else { l })(reg)) } else { None };
+                let w = reference::WNF.lock().unwrap();
+                (hr, reg.is_null(), w.names.clone(), w.unsubscribed.clone(), FIRED.lock().unwrap().clone(), unhr)
+            }));
+        }
+    }
+}

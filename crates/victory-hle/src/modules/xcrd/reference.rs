@@ -161,6 +161,44 @@ unsafe extern "system" fn fake_tick() -> u64 {
     1_000_000
 }
 
+/// WNF, faked: the state name each call names, the last subscription's
+/// handler and context (a test fires it), and statuses to answer with.
+pub struct Wnf {
+    pub names: Vec<u64>,
+    pub handler: usize,
+    pub context: usize,
+    pub query: i32,
+    pub subscribe: i32,
+    pub unsubscribed: Vec<usize>,
+}
+
+pub static WNF: Mutex<Wnf> = Mutex::new(Wnf { names: Vec::new(), handler: 0, context: 0, query: 0, subscribe: 0, unsubscribed: Vec::new() });
+
+unsafe extern "system" fn fake_query_wnf(stamp: *mut u32, name: u64, _: *const c_void, _: *mut c_void, _: *const c_void) -> i32 {
+    let mut w = WNF.lock().unwrap_or_else(|e| e.into_inner());
+    w.names.push(name);
+    // SAFETY: the caller's stamp.
+    unsafe { *stamp = 0x55 };
+    w.query
+}
+
+unsafe extern "system" fn fake_subscribe_wnf(out: *mut *mut c_void, name: u64, stamp: u32, handler: *const c_void, context: *mut c_void, _: *const c_void, _: u32, _: u32) -> i32 {
+    let mut w = WNF.lock().unwrap_or_else(|e| e.into_inner());
+    w.names.push(name ^ u64::from(stamp));
+    w.handler = handler as usize;
+    w.context = context as usize;
+    if w.subscribe >= 0 {
+        // SAFETY: the caller's out.
+        unsafe { *out = 0x5_0000 as *mut c_void };
+    }
+    w.subscribe
+}
+
+unsafe extern "system" fn fake_unsubscribe_wnf(subscription: *mut c_void) -> i32 {
+    WNF.lock().unwrap_or_else(|e| e.into_inner()).unsubscribed.push(subscription as usize);
+    0
+}
+
 /// The console is not a server (a title's console), for the reference as
 /// for the port.
 unsafe extern "system" fn fake_server_type() -> u32 {
@@ -182,6 +220,9 @@ const FAKE_SYS: Sys = Sys {
     sleep: fake_sleep,
     get_tick_count64: fake_tick,
     putws: fake_putws,
+    rtl_query_wnf_state_data: fake_query_wnf,
+    rtl_subscribe_wnf: fake_subscribe_wnf,
+    rtl_unsubscribe_wnf: fake_unsubscribe_wnf,
     ..sys::HOST
 };
 
@@ -222,7 +263,10 @@ fn load() -> Option<Library> {
 /// `base` is a loaded PE module.
 unsafe fn patch_imports(base: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let fakes: [(&str, usize); 8] = [
+    let fakes: [(&str, usize); 11] = [
+        ("RtlQueryWnfStateData", fake_query_wnf as *const () as usize),
+        ("RtlSubscribeWnfStateChangeNotification", fake_subscribe_wnf as *const () as usize),
+        ("RtlUnsubscribeWnfNotificationWaitForCompletion", fake_unsubscribe_wnf as *const () as usize),
         ("XpalGetServerType", fake_server_type as *const () as usize),
         ("CreateFileW", fake_create_file_w as *const () as usize),
         ("NtDeviceIoControlFile", fake_nt_device_io_control_file as *const () as usize),

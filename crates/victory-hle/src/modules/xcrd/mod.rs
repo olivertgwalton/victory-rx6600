@@ -18,6 +18,7 @@ pub mod blobs;
 pub mod disks;
 pub mod headers;
 pub mod info;
+pub mod notify;
 pub mod regions;
 pub mod storage;
 pub mod xas;
@@ -518,6 +519,7 @@ pub(crate) fn exports() -> Vec<HleExport> {
     all.extend(info::exports());
     all.extend(disks::exports());
     all.extend(xas::exports());
+    all.extend(notify::exports());
     all.extend([
         hle_export!(XCrdSetTraceFlags),
         hle_export!(XCrdBuildPath),

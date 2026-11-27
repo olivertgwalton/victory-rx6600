@@ -43,6 +43,10 @@ pub struct Sys {
     pub get_tick_count64: unsafe extern "system" fn() -> u64,
     /// The library's message output (`_putws`, a line to standard output).
     pub putws: unsafe extern "C" fn(*const u16) -> i32,
+    /// WNF: the library subscribes to three state names.
+    pub rtl_query_wnf_state_data: unsafe extern "system" fn(*mut u32, u64, *const std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void) -> i32,
+    pub rtl_subscribe_wnf: unsafe extern "system" fn(*mut *mut std::ffi::c_void, u64, u32, *const std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void, u32, u32) -> i32,
+    pub rtl_unsubscribe_wnf: unsafe extern "system" fn(*mut std::ffi::c_void) -> i32,
 }
 
 unsafe extern "system" fn create_file_w(
@@ -124,6 +128,18 @@ unsafe extern "C" fn putws(text: *const u16) -> i32 {
     0
 }
 
+unsafe extern "system" fn rtl_query_wnf_state_data(stamp: *mut u32, name: u64, handler: *const std::ffi::c_void, context: *mut std::ffi::c_void, kind: *const std::ffi::c_void) -> i32 {
+    host!("ntdll.dll", "RtlQueryWnfStateData": extern "system" fn(*mut u32, u64, *const std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void) -> i32)(stamp, name, handler, context, kind)
+}
+
+unsafe extern "system" fn rtl_subscribe_wnf(out: *mut *mut std::ffi::c_void, name: u64, stamp: u32, handler: *const std::ffi::c_void, context: *mut std::ffi::c_void, kind: *const std::ffi::c_void, group: u32, unknown: u32) -> i32 {
+    host!("ntdll.dll", "RtlSubscribeWnfStateChangeNotification": extern "system" fn(*mut *mut std::ffi::c_void, u64, u32, *const std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void, u32, u32) -> i32)(out, name, stamp, handler, context, kind, group, unknown)
+}
+
+unsafe extern "system" fn rtl_unsubscribe_wnf(subscription: *mut std::ffi::c_void) -> i32 {
+    host!("ntdll.dll", "RtlUnsubscribeWnfNotificationWaitForCompletion": extern "system" fn(*mut std::ffi::c_void) -> i32)(subscription)
+}
+
 pub const HOST: Sys = Sys {
     create_file_w,
     nt_device_io_control_file,
@@ -134,6 +150,9 @@ pub const HOST: Sys = Sys {
     sleep,
     get_tick_count64,
     putws,
+    rtl_query_wnf_state_data,
+    rtl_subscribe_wnf,
+    rtl_unsubscribe_wnf,
 };
 
 static SYS: RwLock<Sys> = RwLock::new(HOST);
