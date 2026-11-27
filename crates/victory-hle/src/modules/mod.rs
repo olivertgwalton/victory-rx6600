@@ -11,6 +11,10 @@
 #[cfg(windows)]
 pub mod apu;
 pub mod audio;
+#[cfg(windows)]
+pub mod com;
+#[cfg(all(test, windows))]
+mod core_bench;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;
@@ -29,6 +33,8 @@ pub mod net;
 pub mod rpcrt4;
 pub mod speech;
 pub mod storage;
+#[cfg(windows)]
+pub mod threads;
 pub mod xasync;
 pub mod xg;
 pub mod xgame;
@@ -70,6 +76,10 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(rpcrt4::module());
     #[cfg(windows)]
     all.push(xmem::module());
+    #[cfg(windows)]
+    all.push(com::module());
+    #[cfg(windows)]
+    all.push(threads::module());
     #[cfg(windows)]
     all.push(xsystem::module());
     all

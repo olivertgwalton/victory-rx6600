@@ -57,6 +57,13 @@ pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
+
+/// The return addresses on another thread of this process, innermost
+/// first (it is suspended while they are read): for sampling profilers.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn sample_thread(thread: windows_sys::Win32::Foundation::HANDLE) -> Vec<u64> {
+    stacks::frames_of(thread).0
+}
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use profile::profile_on_schedule;
 #[cfg(windows)]
