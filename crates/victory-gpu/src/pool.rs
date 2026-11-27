@@ -888,13 +888,16 @@ pub(crate) unsafe fn texture(
         return None;
     }
     let size_class = [1u64 << 20, 4 << 20, 16 << 20, BLOCK / 2].iter().position(|&l| info.SizeInBytes <= l).unwrap_or(4);
-    let biggest_hole = || lock(&TEXTURES).blocks.iter().flatten().flat_map(|b| b.free.0.values().copied()).max().unwrap_or(0);
     let taken = lock(&TEXTURES).take_ripe(
         info.SizeInBytes,
         info.Alignment.max(1),
         now(),
         Ripe::now(SPARES.load(Ordering::Relaxed).min(texture_spare_cap())),
         || {
+            // Free ranges only, while the card has no room (`resource::pool_gaps_only`).
+            if crate::resource::gaps_only_now() {
+                return None;
+            }
             if !crate::budget::admit_pool_growth(crate::host::host().and_then(|host| host.video_memory()), BLOCK) {
                 tracing::debug!(heap_bytes = BLOCK, "texture heap growth refused by shared GPU memory budget");
                 return None;
@@ -922,9 +925,6 @@ pub(crate) unsafe fn texture(
     );
     let Some((piece, heap, again)) = taken else {
         TEXTURE_MISSES[size_class][0].fetch_add(1, Ordering::Relaxed);
-        if info.SizeInBytes <= biggest_hole() {
-            TEXTURE_MISSES[size_class][1].fetch_add(1, Ordering::Relaxed);
-        }
         return None;
     };
     TEXTURE_MISSES[size_class][2].fetch_add(1, Ordering::Relaxed);
@@ -1371,12 +1371,12 @@ mod tests {
 }
 
 /// Textures the pool was asked for, by size (up to 1, 4, 16, 32 MiB, more):
-/// not placed, not placed although a free range that big was there (its
-/// alignment, or blocks not ripe), placed.
+/// not placed, (unused), placed. Run tex3: no miss came with a free range
+/// as big as the texture there.
 pub(crate) static TEXTURE_MISSES: [[AtomicU64; 3]; 5] = [const { [const { AtomicU64::new(0) }; 3] }; 5];
 
 pub(crate) fn texture_misses_line() -> String {
     let v = |i: usize, j: usize| TEXTURE_MISSES[i][j].load(Ordering::Relaxed);
     let names = ["<=1M", "<=4M", "<=16M", "<=32M", "more"];
-    (0..5).map(|i| format!("{} placed {} missed {} (with a big enough free range {})", names[i], v(i, 2), v(i, 0), v(i, 1))).collect::<Vec<_>>().join("; ")
+    (0..5).map(|i| format!("{} placed {} missed {}", names[i], v(i, 2), v(i, 0))).collect::<Vec<_>>().join("; ")
 }

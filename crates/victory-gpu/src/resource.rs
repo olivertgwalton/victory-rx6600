@@ -2574,6 +2574,13 @@ pub(crate) fn pool_gaps_only<R>(f: impl FnOnce() -> R) -> (R, bool) {
     (out, POOL_MISSED.with(|c| c.replace(false)))
 }
 
+/// Whether this thread is in [`pool_gaps_only`]: the pool takes no new
+/// block for it either (run gap1: blocks 4,288 -> 5,888 MB, the room kept
+/// for targets and buffers taken, the card 1.4 GB over its budget).
+pub(crate) fn gaps_only_now() -> bool {
+    POOL_ONLY.with(std::cell::Cell::get)
+}
+
 /// Whether the texture pass makes textures in the pool's free ranges while
 /// the card has no room (`VICTORY_POOL_GAPS=0`: it does not, as before).
 ///
