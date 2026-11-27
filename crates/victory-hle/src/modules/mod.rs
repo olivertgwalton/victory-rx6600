@@ -6,7 +6,8 @@
 //!
 //! Planned areas (driven by census results, not by completeness):
 //! `file` (package paths), `thread` (TLS callbacks for title threads),
-//! `xaudio2`, `xstore` stubs.
+//! `xstore` stubs. XAudio2 passes through to the host but for X3DAudio
+//! (`x3daudio`).
 
 #[cfg(windows)]
 pub mod apu;
@@ -29,6 +30,7 @@ pub mod net;
 pub mod rpcrt4;
 pub mod speech;
 pub mod storage;
+pub mod x3daudio;
 pub mod xasync;
 pub mod xg;
 pub mod xgame;
@@ -54,6 +56,7 @@ pub(crate) fn all() -> Vec<HleModule> {
         audio::module(),
         dsp::module(),
         xg::module(),
+        x3daudio::module(),
     ];
     #[cfg(windows)]
     all.push(apu::module());

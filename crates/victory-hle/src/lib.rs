@@ -134,6 +134,24 @@ mod tests {
         );
     }
 
+    // X3DAudio is the console's arithmetic; the rest of XAudio2 is the host's.
+    #[test]
+    fn x3daudio_is_ours_inside_the_hosts_xaudio2() {
+        let r = HleResolver::new(HostPolicy::none());
+        for call in ["X3DAudioInitialize", "X3DAudioCalculate"] {
+            assert_eq!(
+                r.classify("XAudio2_9.dll", &name(call)),
+                Some(Provenance::Hle),
+                "{call}"
+            );
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            HleResolver::default().classify("XAudio2_9.dll", &name("XAudio2Create")),
+            Some(Provenance::Host)
+        );
+    }
+
     // #510: the RPC runtime's GUID calls are ours, so the DLL itself stays
     // outside the host policy (its own `ws2_32` imports would be a network
     // path `modules::net` never sees).
