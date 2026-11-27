@@ -1046,10 +1046,7 @@ impl Texture {
             n => n,
         };
         let stencil = formats.len() == 2 && formats[1].bytes == 1 && formats[0].subsample == 1;
-        if formats.len() > 1 && desc.samples > 1 {
-            // The library has no multisampled two-plane textures.
-            return Err(Error::Invalid);
-        }
+
         let mut planes: Vec<Plane> = vec![];
         let mut end = 0u64;
         for (i, f) in formats.iter().enumerate() {

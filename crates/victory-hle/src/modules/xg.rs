@@ -160,13 +160,68 @@ enum PlaneKind {
     Empty,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Meta {
     size: u64,
     slice_size: u64,
     alignment: u64,
-    /// The mode its mip reports (`FMASK` only).
+    /// The mode its mip reports (`FMASK` and `DCC`).
     swizzle: u32,
+    dcc: Option<Dcc>,
+}
+
+/// `DCC`'s own mip chain: 8 KiB blocks, each for 2 MiB of texels
+/// (2 samples counting for any number), the small mips sharing one 8 KiB
+/// tail block at the start, the others after it from the smallest up.
+#[derive(Debug, Clone)]
+struct Dcc {
+    /// Texels a block covers across and down.
+    block: [u32; 2],
+    /// Size and offset of each mip.
+    mips: Vec<(u64, u64)>,
+    /// The first mip in the tail.
+    tail: usize,
+    slice_size: u64,
+}
+
+const DCC_BLOCK: u64 = 8 << 10;
+
+/// The `DCC` of a render target with the render XOR flag (measured).
+fn dcc(desc: &ResourceDesc, l: &Layout, mips: u32) -> Dcc {
+    let element_log2 = l.desc.element_bytes.trailing_zeros();
+    let samples_log2 = u32::from(desc.samples > 1);
+    let texels_log2 = 21 - element_log2 - samples_log2;
+    let wide = texels_log2.div_ceil(2);
+    let block = [1 << wide, 1 << (texels_log2 - wide)];
+    // The tail takes mips of at most this many elements a side.
+    let tail_side = match l.desc.element_bytes {
+        1 | 2 => 128,
+        4 | 8 => 64,
+        _ => 32,
+    };
+    let (w, h) = (desc.width as u32, desc.height);
+    let mut sizes = vec![];
+    let mut tail = mips as usize;
+    for m in 0..mips {
+        let (mw, mh) = ((w >> m).max(1), (h >> m).max(1));
+        let elements = mw.div_ceil(l.desc.block).max(mh.div_ceil(l.desc.block_height));
+        // A single mip has no tail.
+        if elements <= tail_side && mips > 1 {
+            tail = m as usize;
+            break;
+        }
+        sizes.push(DCC_BLOCK * u64::from(mw.div_ceil(block[0])) * u64::from(mh.div_ceil(block[1])));
+    }
+    let mut offset = if tail < mips as usize { DCC_BLOCK } else { 0 };
+    let mut out = vec![(0, 0); mips as usize];
+    for m in (0..sizes.len()).rev() {
+        out[m] = (sizes[m], offset);
+        offset += sizes[m];
+    }
+    if tail < mips as usize {
+        out[tail] = (DCC_BLOCK, 0);
+    }
+    Dcc { block, mips: out, tail, slice_size: offset }
 }
 
 /// Usages the library reports.
@@ -176,6 +231,7 @@ const FMASK: u32 = 3;
 const HTILE: u32 = 4;
 const FIRST_OF_TWO: u32 = 5;
 const DEPTH: u32 = 7;
+const DCC: u32 = 9;
 
 /// `CMASK` and `HTILE` take this much per slice for each started 1024x1024
 /// texels.
@@ -205,6 +261,8 @@ fn with_flags(desc: &ResourceDesc, texture: Option<Texture>, swizzle: Swizzle, m
         if swizzle != Swizzle::SW_64KB_Z_X {
             return None;
         }
+        // The formats it refuses stay refused.
+        victory_formats::texture::planes(desc.format)?;
         // Laid out as the depth format; other formats keep their own
         // layout (if any) for addresses only.
         return Some(match depth_format(desc.format) {
@@ -212,15 +270,35 @@ fn with_flags(desc: &ResourceDesc, texture: Option<Texture>, swizzle: Swizzle, m
             None => (texture.unwrap_or(Texture { planes: vec![], size: 0, alignment: 0 }), true),
         });
     }
+    if flags & ALLOW_RENDER_TARGET != 0 && flags & RENDER_XOR == 0 && surface && unrenderable(desc.format) {
+        // Nothing laid out but metadata; multisampled, the description
+        // itself need not make a texture (compressed in a depth mode).
+        let small = victory_formats::texture::planes(desc.format)
+            .and_then(|p| p.first())
+            .is_some_and(|f| f.bytes <= 8 && f.bytes != 0);
+        let empty = small || desc.samples > 1;
+        let texture = match texture {
+            Some(t) => t,
+            None if desc.samples > 1 => Texture::new(&TextureDesc { format: R8_UNORM, ..texture_desc(desc, swizzle)? }).ok()?,
+            None => return None,
+        };
+        return Some((texture, empty));
+    }
     let texture = texture?;
-    let compressed = victory_formats::texture::planes(desc.format)
-        .and_then(|p| p.first())
-        .is_some_and(|f| f.block == 4);
-    if flags & ALLOW_RENDER_TARGET != 0 && flags & RENDER_XOR == 0 && surface && compressed {
-        let small = texture.planes.first().is_some_and(|p| p.layout.desc.element_bytes <= 8);
-        return Some((texture, small || desc.samples > 1));
+    if texture.planes.len() > 1 && desc.samples > 1 {
+        // No multisampled two-plane textures but depth buffers.
+        return None;
     }
     Some((texture, false))
+}
+
+/// Formats the GPU cannot render to: block compressed, packed 4:2:2 and
+/// 190 (`A4B4G4R4`).
+fn unrenderable(format: u32) -> bool {
+    format == 190
+        || victory_formats::texture::planes(format)
+            .and_then(|p| p.first())
+            .is_some_and(|f| f.block != 1)
 }
 
 /// The format a depth buffer of `format` is laid out as (its depth and
@@ -242,10 +320,12 @@ fn place(desc: &ResourceDesc, texture: &Texture, mips: u32, empty: bool) -> (Vec
     let regions = desc.width.div_ceil(1024) * u64::from(desc.height.div_ceil(1024));
     let slices = u64::from(desc.depth_or_array.max(1));
     let depth = flags & ALLOW_DEPTH_STENCIL != 0;
-    let htile = depth && surface;
+    let htile = depth && surface && (empty || !texture.planes.is_empty());
     let first = texture.planes.first().map(|p| &p.layout);
+    // With the render XOR flag only multisampled targets keep `FMASK` and
+    // `CMASK` (every target gets `DCC`).
     let target = flags & ALLOW_RENDER_TARGET != 0
-        && flags & RENDER_XOR == 0
+        && (flags & RENDER_XOR == 0 || desc.samples > 1)
         && surface
         && texture.planes.len() == 1
         && first.is_some_and(|l| l.desc.element_bytes <= 8 || desc.samples > 1);
@@ -260,14 +340,22 @@ fn place(desc: &ResourceDesc, texture: &Texture, mips: u32, empty: bool) -> (Vec
     };
     if htile {
         let size = HTILE_BLOCK * regions * slices;
-        let meta = Meta { size, slice_size: 0, alignment: HTILE_BLOCK, swizzle: 0 };
+        let meta = Meta { size, slice_size: 0, alignment: HTILE_BLOCK, swizzle: 0, dcc: None };
         put(HTILE, PlaneKind::Meta(meta), size, HTILE_BLOCK, &mut placed);
     }
     if empty {
         // Nothing laid out for the data: a depth buffer of a format without
-        // depth is all of size 0, a compressed target its metadata alone.
+        // depth is all of size 0 (but for `R8_UINT`, the stencil view: a
+        // stencil of 1-byte texels, at 0 too), an unrenderable target its
+        // metadata alone.
         placed.push(Placed { usage: if depth { DEPTH } else { DATA }, offset: 0, kind: PlaneKind::Empty });
         if depth {
+            if desc.format == R8_UINT {
+                if let Some(p) = texture.planes.first() {
+                    placed.push(Placed { usage: DEPTH + 1, offset: 0, kind: PlaneKind::Data(0) });
+                    return (placed, p.layout.size, alignment.max(p.layout.alignment));
+                }
+            }
             return (placed, 0, alignment);
         }
     }
@@ -295,13 +383,30 @@ fn place(desc: &ResourceDesc, texture: &Texture, mips: u32, empty: bool) -> (Vec
                 ..first.expect("a target plane").desc
             });
             if let Ok(l) = l {
-                let meta = Meta { size: l.size, slice_size: l.slice_size, alignment: l.alignment, swizzle: Swizzle::SW_64KB_Z_X.0 };
+                let meta = Meta {
+                    size: l.size,
+                    slice_size: l.slice_size,
+                    alignment: l.alignment,
+                    swizzle: Swizzle::SW_64KB_Z_X.0,
+                    dcc: None,
+                };
                 put(FMASK, PlaneKind::Meta(meta), l.size, l.alignment, &mut placed);
             }
         }
         let size = CMASK_BLOCK * regions * slices;
-        let meta = Meta { size, slice_size: CMASK_BLOCK * regions, alignment: CMASK_BLOCK, swizzle: 0 };
+        let meta = Meta { size, slice_size: CMASK_BLOCK * regions, alignment: CMASK_BLOCK, swizzle: 0, dcc: None };
         put(CMASK, PlaneKind::Meta(meta), size, CMASK_BLOCK, &mut placed);
+    }
+    let compressed = flags & ALLOW_RENDER_TARGET != 0
+        && flags & RENDER_XOR != 0
+        && desc.dimension == 3
+        && texture.planes.len() == 1
+        && !empty;
+    if let (true, Some(l)) = (compressed, first) {
+        let d = dcc(desc, l, mips);
+        let size = d.slice_size * slices;
+        let meta = Meta { size, slice_size: d.slice_size, alignment: 64 << 10, swizzle: Swizzle::SW_64KB_R_X.0, dcc: Some(d) };
+        put(DCC, PlaneKind::Meta(meta), size, 64 << 10, &mut placed);
     }
     (placed, end, alignment)
 }
@@ -325,7 +430,9 @@ pub extern "system" fn XGCreateTextureComputer(
         tracing::warn!(?desc, "no texture layout");
         return E_INVALIDARG;
     };
-    let mips = requested_mips(&desc);
+    let degenerate = victory_formats::texture::planes(desc.format).is_some_and(|p| p.is_empty());
+    // Formats laid out empty have one mip whatever was asked.
+    let mips = if degenerate { 1 } else { requested_mips(&desc) };
     tracing::debug!(
         width = desc.width,
         height = desc.height,
@@ -335,7 +442,6 @@ pub extern "system" fn XGCreateTextureComputer(
         "texture computer"
     );
     let (planes, size, alignment) = place(&desc, &texture, mips, empty);
-    let degenerate = victory_formats::texture::planes(desc.format).is_some_and(|p| p.is_empty());
     let computer = Box::new(Computer {
         vtable: &VTABLE,
         refs: AtomicU32::new(1),
@@ -346,7 +452,7 @@ pub extern "system" fn XGCreateTextureComputer(
         size,
         alignment,
         degenerate,
-        bytes: degenerate
+        bytes: (degenerate || empty)
             .then(|| Texture::new(&TextureDesc { format: R8_UNORM, ..texture_desc(&desc, swizzle)? }).ok())
             .flatten(),
         texture,
@@ -357,6 +463,7 @@ pub extern "system" fn XGCreateTextureComputer(
 }
 
 const R8_UNORM: u32 = 61;
+const R8_UINT: u32 = 62;
 
 fn texture_desc(desc: &ResourceDesc, swizzle: Swizzle) -> Option<TextureDesc> {
     Some(TextureDesc {
@@ -548,7 +655,7 @@ extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
     out.mips = c.mips;
     out.planes = c.planes.len() as u32;
     out.dimension = c.desc.dimension;
-    if c.degenerate {
+    if c.degenerate && c.planes.is_empty() {
         // A format laid out empty: one data plane of nothing.
         out.size = 0;
         out.alignment = 0;
@@ -564,6 +671,24 @@ extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
                 plane.slice_size = m.slice_size;
                 plane.offset = placed.offset;
                 plane.alignment = m.alignment;
+                if let Some(d) = &m.dcc {
+                    plane.element_bytes = 1;
+                    for (i, mip) in plane.mips.iter_mut().take(c.mips as usize).enumerate() {
+                        let (size, offset) = d.mips[i];
+                        *mip = MipOut {
+                            size,
+                            offset,
+                            alignment: if i == 0 { m.alignment as u32 } else { 0 },
+                            padded: [d.block[0], d.block[1], 1],
+                            samples: c.desc.samples.max(1),
+                            swizzle: m.swizzle,
+                            slice_depth: 1,
+                            in_tail: u32::from(i >= d.tail),
+                            ..MipOut::default()
+                        };
+                    }
+                    continue;
+                }
                 plane.mips[0].size = m.size;
                 plane.mips[0].alignment = m.alignment as u32;
                 plane.mips[0].swizzle = m.swizzle;
@@ -859,8 +984,9 @@ extern "system" fn element_offset(
     }
     let c = computer(this);
     if let Some(Placed { kind: PlaneKind::Empty, .. }) = c.planes.get(plane as usize) {
-        // Nothing laid out, yet the texture's own addresses.
-        return c.texture.planes.first().and_then(|p| p.layout.address(mip, x as u32, y, z, sample).ok()).unwrap_or(u64::MAX);
+        // Nothing laid out, yet the addresses of 1-byte texels.
+        let layout = c.bytes.as_ref().and_then(|b| b.planes.first()).map(|p| &p.layout);
+        return layout.and_then(|l| l.address(mip, x as u32, y, z, sample).ok()).unwrap_or(u64::MAX);
     }
     if let Some(Placed { usage, kind: PlaneKind::Meta(_), .. }) = c.planes.get(plane as usize) {
         let at = meta_address(c, *usage, mip, x, y, z, sample);
@@ -869,7 +995,7 @@ extern "system" fn element_offset(
         }
         return at.map_or(u64::MAX, |at| at / 8);
     }
-    let layout = match &c.bytes {
+    let layout = match c.bytes.as_ref().filter(|_| c.degenerate) {
         Some(bytes) => bytes.planes.get(plane as usize).map(|p| &p.layout),
         // An empty plane (the depth of a stencil view format) answers with
         // the stencil's addresses, as on the console.
@@ -902,19 +1028,53 @@ const CMASK_Y: [u32; 10] = [0, 0, 0, 0x8, 0x1800, 0x2000, 0xc010, 0x840, 0x100, 
 const HTILE_X: [u32; 10] = [0, 0, 0, 0x20, 0x1000, 0x4000, 0xa000, 0x900, 0x400, 0x20000];
 const HTILE_Y: [u32; 10] = [0, 0, 0, 0x40, 0x1800, 0x2000, 0xc080, 0xa00, 0x10000, 0x40000];
 const META_SLICE: [u32; 2] = [0x2000, 0x1000];
+/// `DCC`'s, by element size (1 to 16 bytes); its slice bits flip these.
+const DCC_X: [[u32; 11]; 5] = [
+    [0, 0, 0, 0, 0x1000, 0x4000, 0xa000, 0x810, 0x8040, 0x100, 0x400],
+    [0, 0, 0, 0, 0x1000, 0x4000, 0xa000, 0x820, 0x8080, 0x200, 0],
+    [0, 0, 0, 0x8, 0x1000, 0x4000, 0xa000, 0x840, 0x8100, 0x400, 0],
+    [0, 0, 0, 0x10, 0x1000, 0x4000, 0xa000, 0x880, 0x8200, 0, 0],
+    [0, 0, 0x8, 0x8000, 0x1000, 0x4000, 0x2040, 0x900, 0x8400, 0, 0],
+];
+const DCC_Y: [[u32; 11]; 5] = [
+    [0, 0, 0, 0, 0x1800, 0x2000, 0x4008, 0x820, 0x8080, 0x200, 0],
+    [0, 0, 0, 0x8, 0x1800, 0x2000, 0x4010, 0x840, 0x8100, 0x400, 0],
+    [0, 0, 0, 0x10, 0x1800, 0x2000, 0x4020, 0x880, 0x8200, 0, 0],
+    [0, 0, 0x8, 0x20, 0x1800, 0x2000, 0x4040, 0x900, 0x8400, 0, 0],
+    [0, 0, 0x10, 0x20, 0x1800, 0x2000, 0x4080, 0xa00, 0x8000, 0, 0],
+];
+const DCC_SLICE: [u32; 3] = [0x4000, 0x2000, 0x1000];
 
 /// The bit address of a texel's `CMASK` or `HTILE` entry in its plane;
 /// `None` for `FMASK` and what the texture does not have.
 fn meta_address(c: &Computer, usage: u32, mip: u32, x: u64, y: u32, z: u32, sample: u32) -> Option<u64> {
+    let flip = |masks: &[u32], v: u64| masks.iter().enumerate().filter(|&(i, _)| v >> i & 1 != 0).fold(0, |a, (_, m)| a ^ m);
+    if z >= u32::from(c.desc.depth_or_array.max(1)) || sample >= c.desc.samples.max(1) {
+        return None;
+    }
+    if usage == DCC {
+        let Some(Placed { kind: PlaneKind::Meta(Meta { dcc: Some(d), .. }), .. }) = c.planes.iter().find(|p| p.usage == DCC) else {
+            return None;
+        };
+        let e = c.texture.planes.first()?.layout.desc.element_bytes.trailing_zeros() as usize;
+        let &(_, base) = d.mips.get(mip as usize)?;
+        // Addresses for single-sample, single-mip textures only.
+        if c.desc.samples > 1 || c.mips > 1 {
+            return None;
+        }
+        let row = ((c.desc.width as u32 >> mip).max(1)).div_ceil(d.block[0]);
+        let inside = flip(&DCC_X[e], x) ^ flip(&DCC_Y[e], u64::from(y)) ^ flip(&DCC_SLICE, u64::from(z));
+        let index = u64::from(y / d.block[1]) * u64::from(row) + x / u64::from(d.block[0]);
+        return Some((u64::from(z) * d.slice_size + base + index * DCC_BLOCK) * 8 + u64::from(inside));
+    }
     let (xs, ys, block) = match usage {
         CMASK => (&CMASK_X, &CMASK_Y, CMASK_BLOCK),
         HTILE => (&HTILE_X, &HTILE_Y, HTILE_BLOCK),
         _ => return None,
     };
-    if mip != 0 || z >= u32::from(c.desc.depth_or_array.max(1)) || sample >= c.desc.samples.max(1) {
+    if mip != 0 {
         return None;
     }
-    let flip = |masks: &[u32], v: u64| masks.iter().enumerate().filter(|&(i, _)| v >> i & 1 != 0).fold(0, |a, (_, m)| a ^ m);
     let inside = flip(xs, x) ^ flip(ys, u64::from(y)) ^ flip(&META_SLICE, u64::from(z));
     let row = c.desc.width.div_ceil(1024);
     let regions = row * u64::from(c.desc.height.div_ceil(1024));
