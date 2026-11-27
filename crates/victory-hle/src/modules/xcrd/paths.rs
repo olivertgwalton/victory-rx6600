@@ -659,6 +659,103 @@ pub extern "system" fn XCrdTrimXvc(adapter: *const Adapter, path: *const u16, co
     })())
 }
 
+/// 0x180002260: creates an XVD of `pages` 4 KiB pages (1 MiB to 1 TiB in
+/// all), of a type (0 or 1) and content type (up to 0x28), with optional
+/// ids, a sandbox (up to 16 bytes) and a second path; the new XVD's id
+/// comes back (+0x60). Streaming roamable XVDs (flag 0x20000) are for server
+/// consoles, which a title's is not.
+pub extern "system" fn XCrdCreateXVD(
+    adapter: *const Adapter,
+    path: *const u16,
+    id: *const [u8; 16],
+    flags: u32,
+    pages: u64,
+    kind: u32,
+    content: u32,
+    created: *mut [u8; 16],
+    id2: *const [u8; 16],
+    sandbox: *const u8,
+    sandbox_len: u32,
+    second: *const u16,
+) -> HRESULT {
+    result((|| {
+        check(!adapter.is_null(), "Invalid Adapter Handle.\n")?;
+        check(!path.is_null(), "Invalid Input Path.\n")?;
+        check(flags & 0xff8c_0c18 == 0, "Invalid Create Flags.\n")?;
+        if flags & 0x2_0000 != 0 {
+            super::srb::log(1, "Streaming roamable XVDs can only be created on server consoles.\n");
+            return Err(super::NOT_SUPPORTED);
+        }
+        check(flags & 0x3_0000 != 0x3_0000 && flags & 0x42_0000 != 0x42_0000, "Incompatible Create Flags.\n")?;
+        check(sandbox.is_null() || sandbox_len <= 0x10, "Invalid Sandbox ID.\n")?;
+        let bytes = pages << 12;
+        check(bytes.wrapping_sub(0xa0_0000) <= 0xff_ff60_0000 && bytes >= pages, "Invalid Drive Size. Size must be between 1MB and 1TB, and multiples of 512 bytes.\n")?;
+        check(kind <= 1, "Invalid XVD type.\n")?;
+        check(content <= 0x28, "Invalid XVD content type.\n")?;
+        if flags & 0x10_0000 != 0 {
+            check(kind == 1 && content == 0x22 && flags & 2 == 0, "Invalid flags. Cannot enable trim unless the XVD is dynamic and thin-provisioned, and has integrity disabled\n")?;
+        }
+        let path = text(path);
+        let second = if second.is_null() || text(second).is_empty() { None } else { Some(text(second)) };
+        let mut total = path.len() * 2 + 0x72;
+        if let Some(s) = second {
+            total += s.len() * 2 + 2;
+        }
+        let mut p = Payload::new(0x7800_0020, total);
+        p.u32(0, total as u32);
+        p.u32(0x1c, content);
+        const MAP: [(u32, u32); 12] = [
+            (1, 4), (2, 2), (4, 1), (0x20, 8), (0x40, 0x10), (0x100, 0x40), (0x200, 0x80), (0x1_0000, 0x1000),
+            (0x2_0000, 0x2000), (0x10_0000, 0x4000), (0x20_0000, 0x8000), (0x40_0000, 0x1_0000),
+        ];
+        let mut mapped = MAP.iter().filter(|(f, _)| flags & f != 0).fold(0, |m, (_, v)| m | v);
+        match flags & 0xf080 {
+            0 => {}
+            0x80 => mapped |= 0x20,
+            0x1000 => mapped |= 0x100,
+            0x1080 => mapped |= 0x120,
+            _ => return Ok(E_INVALIDARG),
+        }
+        p.u32(4, mapped);
+        p.u64(0x20, (bytes >> 12) as u64);
+        p.u32(0x18, kind);
+        p.u32(0x28, 0x70);
+        p.u32(0x2c, (path.len() * 2) as u32);
+        p.u64(0x30, 0);
+        // SAFETY: the caller's ids and sandbox, when given.
+        unsafe {
+            if !id.is_null() {
+                p.put(8, &*id);
+            }
+            if !id2.is_null() {
+                p.put(0x40, &*id2);
+            }
+            if !sandbox.is_null() {
+                p.put(0x50, std::slice::from_raw_parts(sandbox, sandbox_len as usize));
+            }
+        }
+        let status = copy_string(p.body(), 0x70, path.len() * 2 + 2, path);
+        if status < 0 {
+            return Ok(status);
+        }
+        if let Some(s) = second {
+            let at = 0x70 + path.len() * 2 + 2;
+            p.u32(0x30, at as u32);
+            p.u32(0x34, (s.len() * 2) as u32);
+            let status = copy_string(p.body(), at, s.len() * 2 + 2, s);
+            if status < 0 {
+                return Ok(status);
+            }
+        }
+        let hr = send(handle_of(adapter), &mut p);
+        if hr >= 0 && !created.is_null() {
+            // SAFETY: checked non-null.
+            unsafe { (*created).copy_from_slice(&p.bytes[super::srb::HEADER + 0x60..super::srb::HEADER + 0x70]) };
+        }
+        Ok(hr)
+    })())
+}
+
 pub(crate) fn exports() -> Vec<crate::HleExport> {
     use crate::hle_export;
     vec![
@@ -679,6 +776,7 @@ pub(crate) fn exports() -> Vec<crate::HleExport> {
         hle_export!(XCrdXBlobCopy),
         hle_export!(XCrdTrimXvd),
         hle_export!(XCrdTrimXvc),
+        hle_export!(XCrdCreateXVD),
         hle_export!(XCrdSetFlatContentPath),
         hle_export!(XCrdStorageQueryBlobAttributes),
         hle_export!(XCrdStreamingAdjustStreamingFlags),

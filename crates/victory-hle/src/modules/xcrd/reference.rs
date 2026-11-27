@@ -157,6 +157,12 @@ unsafe extern "system" fn fake_tick() -> u64 {
     1_000_000
 }
 
+/// The console is not a server (a title's console), for the reference as
+/// for the port.
+unsafe extern "system" fn fake_server_type() -> u32 {
+    0
+}
+
 unsafe extern "C" fn fake_putws(text: *const u16) -> i32 {
     // SAFETY: a NUL-terminated line.
     let line = unsafe { super::wide_str(text) };
@@ -212,7 +218,8 @@ fn load() -> Option<Library> {
 /// `base` is a loaded PE module.
 unsafe fn patch_imports(base: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let fakes: [(&str, usize); 7] = [
+    let fakes: [(&str, usize); 8] = [
+        ("XpalGetServerType", fake_server_type as *const () as usize),
         ("CreateFileW", fake_create_file_w as *const () as usize),
         ("NtDeviceIoControlFile", fake_nt_device_io_control_file as *const () as usize),
         ("DeviceIoControl", fake_device_io_control as *const () as usize),

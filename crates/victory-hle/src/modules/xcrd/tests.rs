@@ -1307,3 +1307,47 @@ fn xvd_reads() {
         }
     }
 }
+
+type Create = extern "system" fn(*const Adapter, *const u16, *const [u8; 16], u32, u64, u32, u32, *mut [u8; 16], *const [u8; 16], *const u8, u32, *const u16) -> HRESULT;
+
+#[test]
+fn create_xvd() {
+    let s = session();
+    trace_all(&s);
+    let (r, l) = both!("XCrdCreateXVD": Create);
+    let a = adapter();
+    let path = wz("[XUC:]\\new.xvd");
+    let second = [wz("[XTE:]\\other"), wz("")];
+    let id = [7u8; 16];
+    let id2 = [9u8; 16];
+    let sandbox = *b"SANDBOX-ID-0123456789";
+    let mut cases: Vec<(u32, u64, u32, u32)> = Vec::new();
+    for bit in 0..32 {
+        cases.push((1 << bit, 0x1000, 1, 0x22));
+    }
+    for flags in [0u32, 0x80, 0x1000, 0x1080, 0x2000, 0x8080, 0x30000, 0x420000, 0x10_0000, 0x10_0002, 0x7f_f3e7] {
+        cases.push((flags, 0x1000, 1, 0x22));
+        cases.push((flags, 0x1000, 0, 0x22));
+        cases.push((flags, 0x1000, 1, 3));
+    }
+    for pages in [0u64, 0x9ff, 0xa00, 0x1000_0000, 0x1000_0001, u64::MAX >> 12, u64::MAX] {
+        cases.push((0, pages, 0, 0));
+    }
+    for (kind, content) in [(2, 0), (0, 0x28), (0, 0x29), (u32::MAX, 0)] {
+        cases.push((0, 0x1000, kind, content));
+    }
+    for (flags, pages, kind, content) in cases {
+        for (with_ids, sb_len, sec) in [(true, 16, 0), (false, 0, 2), (true, 17, 1), (true, 3, 0)] {
+            for (what, driver) in drivers(&[]) {
+                same(&format!("{flags:#x} {pages:#x} {kind} {content} {with_ids} {sb_len} {sec} {what}"), run(&s, |s| driver(s), |side| {
+                    let mut out = [0xccu8; 16];
+                    let (i1, i2): (*const [u8; 16], *const [u8; 16]) = if with_ids { (&id, &id2) } else { (std::ptr::null(), std::ptr::null()) };
+                    let sb = if sb_len == 0 { std::ptr::null() } else { sandbox.as_ptr() };
+                    let sp = if sec == 2 { std::ptr::null() } else { second[sec].as_ptr() };
+                    let f = if side { r } else { l };
+                    (f(&a, path.as_ptr(), i1, flags, pages, kind, content, &mut out, i2, sb, sb_len, sp), out)
+                }));
+            }
+        }
+    }
+}
