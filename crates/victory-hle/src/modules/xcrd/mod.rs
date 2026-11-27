@@ -14,6 +14,7 @@
 
 pub mod ops;
 pub mod paths;
+pub mod regions;
 pub mod srb;
 pub mod sys;
 #[cfg(test)]
@@ -504,6 +505,7 @@ pub extern "system" fn XCrdCloseMetadataHandle(handle: *mut *mut Metadata, adapt
 pub(crate) fn exports() -> Vec<HleExport> {
     let mut all = ops::exports();
     all.extend(paths::exports());
+    all.extend(regions::exports());
     all.extend([
         hle_export!(XCrdSetTraceFlags),
         hle_export!(XCrdBuildPath),

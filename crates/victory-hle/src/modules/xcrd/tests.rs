@@ -420,6 +420,8 @@ pub enum Kind {
     OutOpt(usize),
     /// A wide path the library does not check for null.
     PathReq,
+    /// As `PathReq`, never past the library's limit (where it would loop).
+    PathShort,
     /// A pointer out-parameter that receives a heap object of n bytes:
     /// compared by null-ness and the object's bytes.
     Object(usize),
@@ -467,6 +469,7 @@ fn values(kind: Kind) -> Vec<Value> {
             vec![Value::Bytes(v), Value::Null]
         }
         Kind::Path => vec![text("[XUC:]\\pkg\\content"), Value::Null, text(""), text(&"y".repeat(0x80010))],
+        Kind::PathShort => vec![text("[XUC:]\\pkg\\content"), text("")],
         Kind::PathReq => vec![text("[XUC:]\\pkg\\content"), text(""), text(&"y".repeat(0x80010))],
         Kind::In(n) | Kind::InOpt(n) => {
             let mut v = vec![
@@ -754,4 +757,28 @@ fn fuzz_streaming_queries() {
     fuzz("XCrdStreamingQueryInformationEx", &[Out(0x108), Out(0x30), Adp, Int(&[0x44, 0, u64::MAX])], W32);
     fuzz("XCrdStreamingQueryInformation", &[Out(0x108), Adp, Int(&[0x44, 0, u64::MAX])], W32);
     fuzz("XCrdStreamingQueryInformationByPath", &[Out(0x108), Adp, Path, Int(FLAG1)], W32);
+}
+
+const COUNTS: &[u64] = &[3, 0, 1, 8];
+
+#[test]
+fn fuzz_regions() {
+    fuzz("XCrdStreamingQueryRegionIdByOffset", &[Out(0x20), Adp, Path, Int(&[0, 1, 2, 0xffff_ffff]), Int(&[0x1000, 0])], W32);
+    fuzz("XCrdStreamingQueryRegionInformation", &[OutOpt(0x180), Adp, Int(&[5, 0]), Int(COUNTS), InOpt(32)], W32);
+    // A path past the limit alone makes the library halve its chunk to 0
+    // and loop for good (0x180008bd5); not a case to run.
+    fuzz("XCrdStreamingQueryRegionInformationByPath", &[OutOpt(0x180), Adp, PathShort, Int(COUNTS), InOpt(32)], W32);
+}
+
+#[test]
+fn fuzz_specifiers() {
+    fuzz("XCrdStreamingQueryRegionSpecifiers", &[OutOpt(0x188 * 8), OutOpt(4), Adp, Int(&[0x1234, 0]), Int(COUNTS)], W32);
+    fuzz("XCrdStreamingQueryRegionSpecifiersByPath", &[OutOpt(0x188 * 8), OutOpt(4), Adp, Path, Int(COUNTS)], W32);
+}
+
+#[test]
+fn fuzz_region_queue() {
+    let kinds: &[u64] = &[0, 1, 3, 4];
+    fuzz("XCrdStreamingQueueQueryRegionList", &[OutOpt(64), Out(4), Adp, Int(&[7, 0]), Int(&[4, 0, 1, 16]), Int(kinds)], W32);
+    fuzz("XCrdStreamingQueueQueryRegionListByPath", &[OutOpt(64), Out(4), Adp, Path, Int(&[4, 0, 1, 16]), Int(kinds)], W32);
 }
