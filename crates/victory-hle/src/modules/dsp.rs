@@ -28,16 +28,29 @@
 //!
 //! Commands complete when submitted here.
 //!
-//! The transforms themselves are not computed: the coprocessor's firmware
-//! does them and is not part of `chad.dll`. Outputs are silence, so reverb
-//! returns are dry.
-// shortcut: no convolution or block transform; outputs are zeros. Needs the
-// coprocessor's spectrum layout (VICTORY_DSP_DUMP captures the title's).
+//! The arithmetic is the coprocessor firmware's, not `chad.dll`'s. What
+//! the DLL fixes: the transform is a packed real FFT of `2 * frames`
+//! samples with `e^-` twiddles (it builds exactly those tables for the
+//! firmware, 0x1800054d4/0x1800051f4), and a partition is `frames` packed
+//! bins of it. Convolutions run here as uniformly partitioned overlap-save
+//! convolution over those partitions (`convolve`). An envelope (submitted
+//! with `XDspSubmitCommandWithEnvelope`) is one gain per partition, a
+//! second set 4-float aligned after the first for two impulse responses;
+//! like the DLL, it is taken every 8th block and kept until the next.
+// shortcut: assumed, not read from code: blocks are planar (channel 0's
+// frames, then channel 1's), each output channel is scaled by its gain
+// (`gains[c]`), and transform streams (kinds 2, 3) output silence. Check
+// them against the coprocessor's output when one can be captured
+// (VICTORY_DSP_DUMP logs what the title submits).
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
 use std::sync::Mutex;
+
+mod convolve;
+mod fft;
+use convolve::Convolver;
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
@@ -133,6 +146,11 @@ pub struct Stream {
     /// ticket is checked on deactivation.
     submitted: u32,
     status: Box<Status>,
+    /// A convolution's engine, and the block count mod 8 at which an
+    /// envelope is taken.
+    convolver: Option<Convolver>,
+    phase: u32,
+    two_irs: bool,
 }
 
 /// One block of work.
@@ -362,6 +380,16 @@ fn activate(
         pages,
         "audio DSP stream activated"
     );
+    let two_irs = options & TWO_IRS != 0;
+    let convolver = (kind == CONVOLUTION && !desc.ir.is_null()).then(|| {
+        let sets = if two_irs { 2 } else { 1 };
+        // SAFETY: the title's impulse response: `partitions * frames` bins
+        // (float pairs) per set, copied at activation as the DLL does.
+        let ir = unsafe {
+            std::slice::from_raw_parts(desc.ir, sets * 2 * (partitions * frames) as usize)
+        };
+        Convolver::new(frames as usize, channels as usize, partitions as usize, ir, two_irs)
+    });
     let new = Box::new(Stream {
         dsp,
         slot,
@@ -370,6 +398,9 @@ fn activate(
         channels,
         partitions,
         pages,
+        convolver,
+        phase: 0,
+        two_irs,
         submitted: 0,
         status: Box::new(Status {
             submitted: 0,
@@ -451,9 +482,7 @@ fn submit(
         return E_INVALIDARG;
     }
     log_command(stream, command);
-    let samples = (stream.frames * stream.channels) as usize;
-    // SAFETY: the title's output buffer holds one block of the stream.
-    unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+    run(stream, command, envelope);
     stream.submitted = stream.submitted.wrapping_add(1);
     // SAFETY: the stream's status block.
     let next = unsafe { std::ptr::read_volatile(&raw const (*status).submitted) }.wrapping_add(1);
@@ -470,7 +499,47 @@ fn submit(
     S_OK
 }
 
-/// Completes the command at once: its output block is silence.
+/// One block of a stream, computed now.
+fn run(stream: &mut Stream, command: &Command, envelope: *const f32) {
+    let frames = stream.frames as usize;
+    let samples = frames * stream.channels as usize;
+    let Some(conv) = stream.convolver.as_mut() else {
+        // SAFETY: the title's output buffer holds one block of the stream.
+        unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+        return;
+    };
+    if stream.phase == 0 {
+        let p = stream.partitions as usize;
+        for set in 0..if stream.two_irs { 2 } else { 1 } {
+            if envelope.is_null() {
+                conv.set_envelope(set, &vec![1.0; p]);
+            } else {
+                // SAFETY: the title's envelope in its connection memory:
+                // one gain per partition per set, sets 4-float aligned.
+                let gains =
+                    unsafe { std::slice::from_raw_parts(envelope.add(set * p.next_multiple_of(4)), p) };
+                conv.set_envelope(set, gains);
+            }
+        }
+    }
+    stream.phase = (stream.phase + 1) % 8;
+    // Input first, as the output may be the same buffer.
+    // SAFETY: the title's input block.
+    let input = unsafe { std::slice::from_raw_parts(command.input, samples) }.to_vec();
+    // SAFETY: the title's output block.
+    let output = unsafe { std::slice::from_raw_parts_mut(command.output, samples) };
+    for c in 0..stream.channels as usize {
+        let gain = command.gains[c.min(1)];
+        conv.block(
+            c,
+            &input[c * frames..(c + 1) * frames],
+            &mut output[c * frames..(c + 1) * frames],
+            gain,
+        );
+    }
+}
+
+/// Completes the command at once.
 pub extern "system" fn XDspSubmitCommand(
     stream: *mut Stream,
     command: *const Command,
@@ -735,5 +804,250 @@ mod tests {
         assert_eq!(XDspDeactivate(stream), S_OK);
         assert_eq!(XDspDisconnect(one), S_OK);
         assert_eq!(XDspDisconnect(a), S_OK);
+    }
+
+    /// The spectra of an impulse response cut into partitions of `frames`
+    /// samples, each zero-padded to `2 * frames`, as packed bins.
+    fn partitioned(ir: &[f32], frames: usize) -> Vec<f32> {
+        let real = fft::Real::new(frames);
+        let mut out = Vec::new();
+        for part in ir.chunks(frames) {
+            let mut padded = vec![0f32; 2 * frames];
+            padded[..part.len()].copy_from_slice(part);
+            let mut bins = vec![fft::C::default(); frames];
+            real.forward(&padded, &mut bins);
+            out.extend(bins.iter().flat_map(|c| [c.re, c.im]));
+        }
+        out
+    }
+
+    fn direct(signal: &[f32], ir: &[f32]) -> Vec<f32> {
+        (0..signal.len())
+            .map(|n| (0..=n.min(ir.len() - 1)).map(|k| ir[k] * signal[n - k]).sum())
+            .collect()
+    }
+
+    /// A stereo convolution through the exports: planar blocks, each
+    /// channel scaled by its gain, matching direct convolution; then an
+    /// envelope that mutes every partition but the first, taken at the 8th
+    /// block boundary.
+    #[test]
+    fn convolution_matches_direct_convolution() {
+        let _serial = lock(&SERIAL);
+        let frames = 0x200usize;
+        let partitions = 9;
+        let mut base = vec![0u8; 0x10_0000];
+        let (hr, dsp) = connect(&mut base, 1, 4);
+        assert_eq!(hr, S_OK);
+        let ir: Vec<f32> = (0..frames * partitions)
+            .map(|i| (-(i as f32) / 900.0).exp() * if i % 3 == 0 { 0.5 } else { -0.25 })
+            .collect();
+        let spectra = partitioned(&ir, frames);
+        let desc = StreamDesc {
+            kind: CONVOLUTION,
+            options: STEREO_INPUT,
+            frames: frames as u32,
+            channels: 2,
+            ir_floats: spectra.len() as u32,
+            ir: spectra.as_ptr(),
+        };
+        let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
+        assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
+        let blocks = 12;
+        let left: Vec<f32> = (0..frames * blocks).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+        let right: Vec<f32> = (0..frames * blocks).map(|i| ((i as f32) * 0.01).sin()).collect();
+        let io = base.as_mut_ptr().cast::<f32>();
+        let mut out_l = Vec::new();
+        let mut out_r = Vec::new();
+        let gains = [0.5f32, 2.0];
+        for b in 0..blocks {
+            // SAFETY: two planar blocks of the stream inside `base`.
+            let block = unsafe { std::slice::from_raw_parts_mut(io, 2 * frames) };
+            block[..frames].copy_from_slice(&left[b * frames..(b + 1) * frames]);
+            block[frames..].copy_from_slice(&right[b * frames..(b + 1) * frames]);
+            // In place, as a title may do it.
+            let command = Command {
+                gains,
+                input: io,
+                output: io,
+                aux: std::ptr::null(),
+            };
+            assert_eq!(XDspSubmitCommand(stream, &command, std::ptr::null_mut()), S_OK);
+            out_l.extend_from_slice(&block[..frames]);
+            out_r.extend_from_slice(&block[frames..]);
+        }
+        for (out, input, gain) in [(&out_l, &left, gains[0]), (&out_r, &right, gains[1])] {
+            let want = direct(input, &ir);
+            for (n, (a, b)) in out.iter().zip(&want).enumerate() {
+                assert!((a - gain * b).abs() < 2e-3, "sample {n}: {a} vs {}", gain * b);
+            }
+        }
+        assert_eq!(XDspDeactivate(stream), S_OK);
+
+        // An envelope keeping only partition 0, submitted from block 8 on:
+        // blocks 0-7 convolve with the whole response, block 8 on with its
+        // first partition only.
+        assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
+        let env = base.as_mut_ptr().wrapping_add(0x8_0000).cast::<f32>();
+        // SAFETY: inside `base`, 2 sets of 12 (9 rounded up to 4).
+        let e = unsafe { std::slice::from_raw_parts_mut(env, 24) };
+        e.fill(0.0);
+        e[0] = 1.0;
+        e[12] = 1.0;
+        let impulse_at = 8 * frames;
+        let mut out = Vec::new();
+        for b in 0..10 {
+            // SAFETY: as above.
+            let block = unsafe { std::slice::from_raw_parts_mut(io, 2 * frames) };
+            block.fill(0.0);
+            if b == 8 {
+                block[0] = 1.0;
+            }
+            let command = Command {
+                gains: [1.0, 1.0],
+                input: io,
+                output: io,
+                aux: std::ptr::null(),
+            };
+            let with = if b >= 8 { env.cast_const() } else { std::ptr::null() };
+            assert_eq!(
+                XDspSubmitCommandWithEnvelope(stream, &command, with, std::ptr::null_mut()),
+                S_OK
+            );
+            out.extend_from_slice(&block[..frames]);
+        }
+        for k in 0..2 * frames {
+            let want = if k < frames { ir[k] } else { 0.0 };
+            assert!((out[impulse_at + k] - want).abs() < 1e-3, "sample {k}");
+        }
+        // An envelope outside the connection's memory is refused.
+        let stray = vec![1f32; 24];
+        let command = Command {
+            gains: [1.0, 1.0],
+            input: io,
+            output: io,
+            aux: std::ptr::null(),
+        };
+        assert_eq!(
+            XDspSubmitCommandWithEnvelope(stream, &command, stray.as_ptr(), std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+        assert_eq!(XDspDeactivate(stream), S_OK);
+        assert_eq!(XDspDisconnect(dsp), S_OK);
+    }
+
+    /// The status block as the coprocessor would leave it: commands in
+    /// flight fill the stream's 8 slots, keep it from deactivating, and a
+    /// failure it reports is what every later submit returns.
+    #[test]
+    fn status_block_rules() {
+        let _serial = lock(&SERIAL);
+        let mut base = vec![0u8; 0x1_0000];
+        let (hr, dsp) = connect(&mut base, 0, 2);
+        assert_eq!(hr, S_OK);
+        let desc = StreamDesc {
+            kind: 2,
+            options: 0,
+            frames: 0x200,
+            channels: 1,
+            ir_floats: 0,
+            ir: std::ptr::null(),
+        };
+        let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
+        assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
+        let io = base.as_mut_ptr().cast::<f32>();
+        let mut command = Command {
+            gains: [1.0, 1.0],
+            input: io,
+            output: io,
+            aux: std::ptr::null(),
+        };
+        // Kind 2's third buffer must start in the connection memory too.
+        let outside = [0f32; 4];
+        command.aux = outside.as_ptr();
+        assert_eq!(XDspSubmitCommand(stream, &command, std::ptr::null_mut()), E_INVALIDARG);
+        command.aux = io;
+        let s = status.cast_mut();
+        let mut ticket = 0;
+        for n in 1..=8 {
+            assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
+            assert_eq!(ticket, n);
+            // SAFETY: the stream's status block: hold completion back.
+            unsafe { (*s).completed = 0 };
+        }
+        assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), QUEUE_FULL);
+        assert_eq!(XDspDeactivate(stream), BUSY);
+        // SAFETY: as above: all done, then a failure.
+        unsafe {
+            (*s).completed = 8;
+            (*s).result = 0x8000_4005_u32 as i32;
+        }
+        assert_eq!(
+            XDspSubmitCommand(stream, &command, &mut ticket),
+            0x8000_4005_u32 as i32
+        );
+        assert_eq!(XDspDeactivate(stream), S_OK);
+        // Nulls.
+        assert_eq!(XDspSubmitCommand(std::ptr::null_mut(), &command, &mut ticket), E_INVALIDARG);
+        assert_eq!(XDspDeactivate(std::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(
+            XDspActivate(dsp, &desc, std::ptr::null_mut(), &mut stream),
+            E_POINTER
+        );
+        assert_eq!(
+            XDspActivate(std::ptr::null_mut(), &desc, &mut status, &mut stream),
+            E_INVALIDARG
+        );
+        assert_eq!(XDspDisconnect(std::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(XDspDisconnect(dsp), S_OK);
+    }
+
+    /// Connect's argument checks (XDspConnectWithMaximumStreamLimit at
+    /// 0x180003ac0) and XDspConnect's defaults (0x180003a90).
+    #[test]
+    fn connect_checks() {
+        let _serial = lock(&SERIAL);
+        let mut base = vec![0u8; 0x1_0000];
+        let p = base.as_mut_ptr().cast();
+        let mut dsp = std::ptr::null_mut();
+        for (len, secs, streams, chans) in [
+            (0xFFFF, 0, 1, 1),
+            (0x1F40_0001, 0, 1, 1),
+            (0x1_0000, 0x81, 1, 1),
+            (0x1_0000, 0, 0x101, 1),
+            (0x1_0000, 0, 1, 3),
+        ] {
+            assert_eq!(
+                XDspConnectWithMaximumStreamLimit(p, len, secs, streams, chans, &mut dsp),
+                E_INVALIDARG
+            );
+        }
+        assert_eq!(
+            XDspConnectWithMaximumStreamLimit(std::ptr::null_mut(), 0x1_0000, 0, 1, 1, &mut dsp),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            XDspConnectWithMaximumStreamLimit(p, 0x1_0000, 0, 1, 1, std::ptr::null_mut()),
+            E_POINTER
+        );
+        assert_eq!(XDspConnect(p, 0x1_0000, 2, &mut dsp), S_OK);
+        // SAFETY: just connected: 256 slots, pages for 2 s of 2 channels.
+        unsafe {
+            assert_eq!(lock(&(*dsp).state).slots.len(), 0x100);
+            assert_eq!((*dsp).pages, ir_pages(2, 0x100, 2));
+        }
+        assert_eq!(XDspDisconnect(dsp), S_OK);
+        // Pages (0x18000262c): 2 s at 48 kHz, the larger of the 512-frame
+        // need (20 streams of 0x13000 bytes per channel plus 16 bytes per
+        // whole 512-sample block's sample) and the 1024-frame one (10 of
+        // 0x22000), in 8 KiB pages: 4644864 and 4308992 bytes.
+        let samples = 2 * 48_000u32;
+        let small = 0x13000 * (samples / 0x1200) * 2 + (samples - samples % 0x200) * 16;
+        let large = 0x22000 * (samples / 0x2400) * 2 + (samples - samples % 0x400) * 16;
+        assert_eq!((small, large), (4_644_864, 4_308_992));
+        assert_eq!(ir_pages(2, 0x100, 2), 567);
+        // The stream limit caps the streams counted.
+        // (4 x 0x22000 + 1523712 = 2080768 bytes.)
+        assert_eq!(ir_pages(2, 4, 1), 254);
     }
 }
