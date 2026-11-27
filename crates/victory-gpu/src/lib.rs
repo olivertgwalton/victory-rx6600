@@ -108,6 +108,7 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 pub mod memclass;
+mod owed;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]

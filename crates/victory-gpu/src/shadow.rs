@@ -2728,6 +2728,8 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // What it owes goes into title memory while its bytes are still here.
+        crate::owed::land_copy(self);
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -3661,6 +3663,16 @@ impl Shadow {
         let (now, held) = (&now[first..=last], &mut held[first..=last]);
         title.clear();
         title.resize(n, 0);
+        // Copy-back on access (`crate::owed`): owed while title memory still
+        // holds the snapshot's bytes; the snapshot then takes the card's, as
+        // a merge would leave it.
+        if crate::owed::on() && self.owable() {
+            let same = || crate::host::read_into((start + at) as *const u8, title) && &title[..] == &held[..];
+            if let crate::owed::Owe::Owed = crate::owed::owe(self, start + at, same) {
+                held.copy_from_slice(now);
+                return 0;
+            }
+        }
         // Title memory not there: looked at again when the next flight
         // that declared the range lands (the snapshot stays as it is).
         if !crate::host::read_into((start + at) as *const u8, title) {
@@ -3671,6 +3683,33 @@ impl Shadow {
             return 0;
         }
         put_changed(start + at, &was, title)
+    }
+
+    /// Whether what shaders write to this copy can be owed
+    /// (`crate::owed`): a copy in the PC's memory of write-watched private
+    /// title memory, not placed, not mapped from the card.
+    fn owable(&self) -> bool {
+        self.card.is_none() && self.place.is_none() && !self.mapped && self.watched.load(Ordering::Relaxed) == 1
+    }
+
+    /// `crate::owed`: what the copy holds of title memory `[at, at + len)`
+    /// and title memory does not goes in (title memory there was frozen,
+    /// owed, since it held the copy's snapshot). Returns the bytes put.
+    pub(crate) fn land_owed(&self, at: usize, len: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (at.max(start), (at + len).min(end));
+        if from >= to {
+            return 0;
+        }
+        let mut title = vec![0u8; to - from];
+        if !crate::host::read_into(from as *const u8, &mut title) {
+            return 0;
+        }
+        // SAFETY: inside the copy's mapping; the card may be writing it, and
+        // each byte read is one it held at some moment.
+        let held = unsafe { std::slice::from_raw_parts(self.data.add(from - start), to - from) };
+        let merged = held.to_vec();
+        put_changed(from, &title, &merged)
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -5060,7 +5099,26 @@ impl Shadow {
         // keeps out what else writes them. Title memory that is not there
         // is looked at again when the next flight that declared the range
         // lands.
-        unsafe { crate::land::piece(self.start as usize + at, self.data.add(at), held.add(at), &[(0, n)], false, notes, self) }
+        let title_at = self.start as usize + at;
+        // Copy-back on access (`crate::owed`): owed while title memory still
+        // holds the snapshot's bytes of the piece; the snapshot then takes
+        // the card's, as a merge would leave it.
+        if crate::owed::on() && self.owable() {
+            let same = || {
+                let mut title = vec![0u8; n];
+                // SAFETY: the snapshot's bytes of the piece (as below).
+                crate::host::read_into(title_at as *const u8, &mut title) && title[..] == *unsafe { std::slice::from_raw_parts(held.add(at), n) }
+            };
+            if let crate::owed::Owe::Owed = crate::owed::owe(self, title_at, same) {
+                // SAFETY: as below; the snapshot's piece takes the copy's bytes.
+                unsafe { std::ptr::copy_nonoverlapping(self.data.add(at), held.add(at), n) };
+                return 0;
+            }
+        }
+        // SAFETY: as above.
+        let put = unsafe { crate::land::piece(title_at, self.data.add(at), held.add(at), &[(0, n)], false, notes, self) };
+        crate::memclass::back(title_at, put as usize);
+        put
     }
 
     /// What shaders wrote in 64 KiB block `block` (of title memory) of this
