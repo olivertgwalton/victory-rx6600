@@ -2606,7 +2606,34 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     unsafe { VirtualFree(address, size, kind) }
 }
 
+/// The class of title memory at `at` for the GPU side's copy counts
+/// (`victory_gpu::memclass::CLASSES`), from what the title asked for it.
+fn memory_class(at: usize) -> u8 {
+    let Some(r) = regions().at(at) else {
+        return 0;
+    };
+    let p = r.protect;
+    if r.flags & XMEM_MAPPABLE != 0 {
+        6
+    } else if r.flags & spec::XMEM_32BIT != 0 {
+        7
+    } else if p & GPU_PROTECTION == 0x800 {
+        8
+    } else if p & GPU_PROTECTION == 0 && r.flags & spec::XMEM_GPU == 0 {
+        1
+    } else if p & 0x2_0000 != 0 {
+        5
+    } else if p & 0x400 != 0 {
+        4
+    } else if p & (0x2000 | 0x1_0000) == 0 && p & (0x1000 | 0x8000 | 0x4000) != 0 {
+        2
+    } else {
+        3
+    }
+}
+
 pub(crate) fn module() -> HleModule {
+    victory_gpu::memclass::set_classifier(memory_class);
     HleModule {
         name: "xmem",
         dlls: &["xmem.dll", "kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],

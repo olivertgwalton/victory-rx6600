@@ -3518,6 +3518,12 @@ impl Shadow {
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
+        let n = self.copy_back_uncounted(address, len, found);
+        crate::memclass::back(address, n);
+        n
+    }
+
+    fn copy_back_uncounted(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
         if self.place.is_some() {
             return 0;
         }
@@ -3619,6 +3625,12 @@ impl Shadow {
     /// never see each other half done. `now` and `title` are scratch
     /// memory. Returns the bytes written to title memory.
     pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
+        let written = self.relay_merge_uncounted(at, n, now, title);
+        crate::memclass::back(self.start as usize + at, written);
+        written
+    }
+
+    fn relay_merge_uncounted(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
@@ -4096,6 +4108,12 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        let n = self.update_uncounted(address, len);
+        crate::memclass::up(address, n);
+        n
+    }
+
+    fn update_uncounted(&self, address: usize, len: usize) -> usize {
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
@@ -4791,6 +4809,12 @@ impl Shadow {
     /// sends it up before the next submission. `title` is scratch memory.
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
+        let written = self.card_merge_uncounted(at, gpu, title);
+        crate::memclass::back(self.start as usize + at, written);
+        written
+    }
+
+    fn card_merge_uncounted(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         if self.card.is_none() || at + gpu.len() > self.len as usize {
             return 0;
@@ -4853,6 +4877,12 @@ impl Shadow {
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+        let written = self.card_merge_relay_uncounted(at, gpu, fetched_after, title);
+        crate::memclass::back(self.start as usize + at, written);
+        written
+    }
+
+    fn card_merge_relay_uncounted(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         let Some(card) = &self.card else {
             return 0;
@@ -4960,6 +4990,16 @@ impl Shadow {
     /// The third of each piece is the address of its bytes, which stay as
     /// they are during the call.
     pub(crate) unsafe fn land_card(&self, pieces: &[(usize, usize, usize)], fetched_after: u64, notes: &mut crate::land::Notes) -> u64 {
+        // SAFETY: the caller's promise, passed on.
+        let written = unsafe { self.land_card_uncounted(pieces, fetched_after, notes) };
+        let first = pieces.iter().map(|p| p.0).min().unwrap_or(0);
+        crate::memclass::back(self.start as usize + first, written as usize);
+        written
+    }
+
+    /// # Safety
+    /// As [`Shadow::land_card`].
+    unsafe fn land_card_uncounted(&self, pieces: &[(usize, usize, usize)], fetched_after: u64, notes: &mut crate::land::Notes) -> u64 {
         let Some(card) = &self.card else {
             return 0;
         };
