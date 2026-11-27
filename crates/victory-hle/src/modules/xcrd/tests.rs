@@ -2583,9 +2583,16 @@ fn xfer_tests_reach_their_paths() {
     assert!(logs[2].iter().any(|l| l.starts_with("late result 0x800703e3")), "{:?}", logs[2]);
 }
 
+/// The reference's factory starts once per process, so its two tests run in
+/// this order, in one.
 #[test]
-fn mapped_control_page() {
+fn the_factory_start_then_the_dstorage_client() {
     let s = session();
+    mapped_control_page(&s);
+    dstorage_client(&s);
+}
+
+fn mapped_control_page(s: &Session) {
     trace_all(&s);
     let Some((rf, _)) = both_or_none::<extern "system" fn(*const c_void, *mut *mut c_void) -> HRESULT>("DStorageGetFactory") else {
         return;
@@ -2634,4 +2641,195 @@ fn mapped_control_page() {
     let mut p = 0;
     lp(&mut p);
     assert_eq!(p, second, "the layer maps the second page");
+}
+
+// DirectStorage's client against the reference's, on a fake storage host:
+// the factory (started, its pages real memory), status arrays, files and
+// queue creation. The host side (reads, results) is the layer's own and is
+// not compared.
+
+/// Slot `index` of a COM object's method table.
+fn slot<F: Copy>(object: *mut c_void, index: usize) -> F {
+    // SAFETY: an object whose first word is its method table.
+    unsafe {
+        let table = *(object as *const *const usize);
+        std::mem::transmute_copy(&*table.add(index))
+    }
+}
+
+type Qi = extern "system" fn(*mut c_void, *const super::super::xgameruntime::Guid, *mut *mut c_void) -> HRESULT;
+type Rel = extern "system" fn(*mut c_void) -> u32;
+
+fn bogus_iid() -> super::super::xgameruntime::Guid {
+    super::super::xgameruntime::Guid::new(0x1234_5678, 0x9abc, 0xdef0, [1, 2, 3, 4, 5, 6, 7, 8])
+}
+
+/// A fake host: Scsi0 opens and answers the probe; the control pages map
+/// to `pages`; queue creation (0x118) and file registration (0x120) work
+/// (file id 0x31); files named `missing` do not open.
+fn dstorage_host(s: &Session, pages: [u64; 2]) {
+    s.open(|n| if n == "\\\\.\\Scsi0:" { Ok(FAKE) } else if n.contains("missing") { Err(2) } else { Ok(FAKE + 0xe00) });
+    s.reply(move |call, b| {
+        match call.code {
+            0x7800_013c => {
+                b[..8].copy_from_slice(&pages[0].to_le_bytes());
+                b[8..16].copy_from_slice(&pages[1].to_le_bytes());
+            }
+            0x7800_0120 => b[8..12].copy_from_slice(&0x31u32.to_le_bytes()),
+            0x7800_0118 => {}
+            _ => {
+                if b.len() >= 0x1c {
+                    b[4..12].copy_from_slice(&srb::SIGNATURE);
+                    b[0x14..0x18].fill(0);
+                }
+            }
+        }
+        0
+    });
+}
+
+fn dstorage_client(s: &Session) {
+    use super::super::dstorage as ds;
+    let Some((rf, lf)) = both_or_none::<extern "system" fn(*const c_void, *mut *mut c_void) -> HRESULT>("DStorageGetFactory") else {
+        return;
+    };
+    // Both factories already hold the pages the start test mapped (the
+    // reference's cannot be started again); the counters get a pattern.
+    let pages = super::control::pages().expect("mapped by the start test");
+    for i in 0..0x800usize {
+        // SAFETY: the start test's page memory (0x800 bytes from the second page).
+        unsafe { ((pages[1] as usize + i) as *mut u8).write((i as u8).wrapping_mul(29).wrapping_add(1)) };
+    }
+    let counters = memory_view(pages[1], 0x800);
+    dstorage_host(&s, pages);
+    let (mut rfac, mut lfac) = (std::ptr::null_mut(), std::ptr::null_mut());
+    assert_eq!(rf((&ds::FACTORY as *const super::super::xgameruntime::Guid).cast(), &mut rfac), 0);
+    assert_eq!(lf((&ds::FACTORY as *const super::super::xgameruntime::Guid).cast(), &mut lfac), 0);
+    assert_eq!(super::control::initialize(), 0);
+    let both = |f: &dyn Fn(*mut c_void) -> String| {
+        dstorage_host(&s, pages);
+        let r = f(rfac);
+        dstorage_host(&s, pages);
+        let l = f(lfac);
+        assert_eq!(r, l);
+    };
+    // QueryInterface.
+    let iids: Vec<super::super::xgameruntime::Guid> = ds::FACTORY_IIDS.iter().copied().chain([ds::FILE_IIDS[0], bogus_iid()]).collect();
+    for iid in &iids {
+        both(&|f| {
+            let mut out = std::ptr::null_mut();
+            let hr = slot::<Qi>(f, 0)(f, iid, &mut out);
+            format!("{hr:#x} {}", out.is_null())
+        });
+    }
+    // Debug flags (bit 1 would break into a debugger on the console).
+    for flags in [0u32, 1, 4, 0x10, 0xfff0_0000, 0] {
+        both(&|f| {
+            slot::<extern "system" fn(*mut c_void, u32)>(f, 7)(f, flags);
+            let got = slot::<extern "system" fn(*mut c_void) -> u32>(f, 12)(f);
+            format!("{got:#x} {:#x}", u32::from_le_bytes(memory_view(pages[0], 4).try_into().unwrap()))
+        });
+    }
+    // Statistics, from the counters' page; the bytes between untouched.
+    both(&|f| {
+        let mut out = [0xccu8; 0x100];
+        slot::<extern "system" fn(*mut c_void, *mut u8)>(f, 9)(f, out.as_mut_ptr());
+        format!("{out:?}")
+    });
+    let mut out = [0xccu8; 0x100];
+    slot::<extern "system" fn(*mut c_void, *mut u8)>(lfac, 9)(lfac, out.as_mut_ptr());
+    assert_eq!((out[0x1c], out[0xc2], out[0xc3]), (0xcc, 0xcc, 0xcc), "gaps untouched");
+    assert_eq!(out[0], counters[0x380], "a counter copied (the last block first)");
+    assert_eq!(out[0xfc], counters[0x414]);
+    // Status arrays.
+    for capacity in [0u32, 1, 3, 4159] {
+        for iid in [ds::STATUS_IIDS[0], ds::STATUS_IIDS[1], bogus_iid()] {
+            both(&|f| {
+                let mut out = std::ptr::null_mut();
+                let name = b"status\0";
+                let hr = slot::<extern "system" fn(*mut c_void, u32, *const u8, *const super::super::xgameruntime::Guid, *mut *mut c_void) -> HRESULT>(f, 5)(f, capacity, name.as_ptr(), &iid, &mut out);
+                let mut seen = format!("{hr:#x} {}", out.is_null());
+                if !out.is_null() {
+                    for index in [0, capacity.wrapping_sub(1), capacity, u32::MAX] {
+                        let done = slot::<extern "system" fn(*mut c_void, u32) -> bool>(out, 3)(out, index);
+                        let hr = slot::<extern "system" fn(*mut c_void, u32) -> HRESULT>(out, 4)(out, index);
+                        seen += &format!(" [{index:#x}: {done} {hr:#x}]");
+                    }
+                    let mut again = std::ptr::null_mut();
+                    for qi in [ds::STATUS_IIDS[0], ds::FILE_IIDS[0]] {
+                        seen += &format!(" qi {:#x}", slot::<Qi>(out, 0)(out, &qi, &mut again));
+                        if !again.is_null() {
+                            slot::<Rel>(again, 2)(again);
+                            again = std::ptr::null_mut();
+                        }
+                    }
+                    slot::<Rel>(out, 2)(out);
+                }
+                seen
+            });
+        }
+    }
+    // Files: one that opens, one that does not, a wrong interface.
+    let real = std::env::temp_dir().join("victory-dstorage-client.bin");
+    std::fs::write(&real, b"0123456789").unwrap();
+    let real: Vec<u16> = real.to_string_lossy().encode_utf16().chain([0]).collect();
+    let missing: Vec<u16> = std::env::temp_dir().join("missing-victory.bin").to_string_lossy().encode_utf16().chain([0]).collect();
+    for (path, iid) in [(&real, ds::FILE_IIDS[0]), (&real, ds::FILE_IIDS[1]), (&missing, ds::FILE_IIDS[0]), (&real, bogus_iid())] {
+        both(&|f| {
+            let mut out = std::ptr::null_mut();
+            let hr = slot::<extern "system" fn(*mut c_void, *const u16, *const super::super::xgameruntime::Guid, *mut *mut c_void) -> HRESULT>(f, 4)(f, path.as_ptr(), &iid, &mut out);
+            if !out.is_null() {
+                slot::<Rel>(out, 2)(out);
+            }
+            format!("{hr:#x} {}", out.is_null())
+        });
+    }
+    // Queues: the description's checks, then the queue's interfaces.
+    #[repr(C)]
+    struct Desc {
+        source: u64,
+        capacity: u16,
+        priority: i8,
+        name: *const u8,
+        options: u64,
+    }
+    let name = b"queue\0";
+    for options in [0u64, 1, 2, 3] {
+        for priority in [-2i8, -1, 0, 1, 2, 3] {
+            for capacity in [0u16, 1, 4159, 0xffff] {
+                for iid in [ds::QUEUE_IIDS[1], bogus_iid()] {
+                    if (capacity != 4159 || iid != ds::QUEUE_IIDS[1]) && (options != 1 || priority != 2) {
+                        continue;
+                    }
+                    let desc = Desc { source: 0, capacity, priority, name: name.as_ptr(), options };
+                    both(&|f| {
+                        let mut out = std::ptr::null_mut();
+                        let hr = slot::<extern "system" fn(*mut c_void, *const Desc, *const super::super::xgameruntime::Guid, *mut *mut c_void) -> HRESULT>(f, 10)(f, &desc, &iid, &mut out);
+                        let mut seen = format!("{hr:#x} {}", out.is_null());
+                        if !out.is_null() {
+                            for qi in ds::QUEUE_IIDS.iter().copied().chain([ds::STATUS_IIDS[0]]) {
+                                let mut again = std::ptr::null_mut();
+                                seen += &format!(" qi {:#x}", slot::<Qi>(out, 0)(out, &qi, &mut again));
+                                if !again.is_null() {
+                                    slot::<Rel>(again, 2)(again);
+                                }
+                            }
+                            slot::<extern "system" fn(*mut c_void)>(out, 8)(out);
+                            slot::<Rel>(out, 2)(out);
+                        }
+                        seen
+                    });
+                }
+            }
+        }
+    }
+    let desc = Desc { source: 0, capacity: 4159, priority: 2, name: name.as_ptr(), options: 1 };
+    let mut q = std::ptr::null_mut();
+    assert_eq!(slot::<extern "system" fn(*mut c_void, *const Desc, *const super::super::xgameruntime::Guid, *mut *mut c_void) -> HRESULT>(rfac, 10)(rfac, &desc, &ds::QUEUE_IIDS[1], &mut q), 0, "the reference made a queue");
+    assert!(s.take().calls.iter().any(|c| c.code == 0x7800_0118), "through the host");
+}
+
+fn memory_view(at: u64, n: usize) -> Vec<u8> {
+    // SAFETY: the test's own page memory.
+    unsafe { std::slice::from_raw_parts(at as *const u8, n) }.to_vec()
 }

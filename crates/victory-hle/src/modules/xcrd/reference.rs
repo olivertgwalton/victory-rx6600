@@ -124,12 +124,16 @@ unsafe extern "system" fn fake_disconnect_pipe(pipe: Handle) -> i32 {
     1
 }
 
-/// A message, described: its type and its first fields.
+/// A message, described: its type and its first fields. A read request's
+/// slot (word 3) is left out: the completion thread signals a read before it
+/// frees the read's slot, so the next read takes that slot or the next one
+/// depending on timing, in the library as in the layer.
 fn describe(bytes: &[u8]) -> String {
-    let words: Vec<String> = bytes.chunks(4).take(8).map(|c| {
+    let read_request = bytes.len() >= 4 && bytes[..4] == 3u32.to_le_bytes();
+    let words: Vec<String> = bytes.chunks(4).take(8).enumerate().map(|(i, c)| {
         let mut w = [0u8; 4];
         w[..c.len()].copy_from_slice(c);
-        format!("{:x}", u32::from_le_bytes(w))
+        if read_request && i == 3 { "slot".into() } else { format!("{:x}", u32::from_le_bytes(w)) }
     }).collect();
     format!("{} bytes [{}]", bytes.len(), words.join(" "))
 }

@@ -68,6 +68,11 @@ pub(crate) fn initialize() -> HRESULT {
     0
 }
 
+/// The two mapped pages, once started: the debug flags' and the counters'.
+pub(crate) fn pages() -> Option<[u64; 2]> {
+    CONTROL.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|c| c.pages)
+}
+
 /// Forgets a start (tests begin from a fresh factory).
 #[cfg(test)]
 pub(crate) fn reset() {

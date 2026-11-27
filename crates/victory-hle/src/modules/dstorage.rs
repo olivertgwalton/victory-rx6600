@@ -36,33 +36,33 @@ use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing
 use crate::{HleModule, hle_export};
 
 /// The factory interface the title asks for.
-const FACTORY: Guid = Guid::new(
+pub(crate) const FACTORY: Guid = Guid::new(
     0x6295_9d11,
     0xd45f,
     0x4884,
     [0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae],
 );
-const IUNKNOWN: Guid = Guid::new(0, 0, 0, [0xc0, 0, 0, 0, 0, 0, 0, 0x46]);
+pub(crate) const IUNKNOWN: Guid = Guid::new(0, 0, 0, [0xc0, 0, 0, 0, 0, 0, 0, 0x46]);
 // The interfaces each object answers to, as `XCRDAPI.dll`'s QueryInterface
 // methods list them (IUnknown included).
-const FACTORY_IIDS: [Guid; 4] = [
+pub(crate) const FACTORY_IIDS: [Guid; 4] = [
     Guid::new(0xfb3b_54ac, 0xbf82, 0x463a, [0xb7, 0x77, 0x73, 0x19, 0x58, 0x37, 0x86, 0x4d]),
     Guid::new(0xc74c_2a5b, 0x1e43, 0x46a5, [0xa2, 0x24, 0x91, 0x16, 0x35, 0x8e, 0x11, 0x18]),
     FACTORY,
     IUNKNOWN,
 ];
-const FILE_IIDS: [Guid; 2] = [
+pub(crate) const FILE_IIDS: [Guid; 2] = [
     Guid::new(0x4370_4f9f, 0x27c6, 0x4a9f, [0x88, 0x15, 0xd1, 0x65, 0x27, 0x89, 0x4d, 0xf4]),
     IUNKNOWN,
 ];
-const QUEUE_IIDS: [Guid; 4] = [
+pub(crate) const QUEUE_IIDS: [Guid; 4] = [
     Guid::new(0xa3f6_649a, 0x8c2c, 0x4b3a, [0x8b, 0x6e, 0x10, 0x18, 0x6a, 0x04, 0xb9, 0xbc]),
     // The title's.
     Guid::new(0x3c02_cb0c, 0xc050, 0x4195, [0x99, 0xa1, 0xa1, 0xce, 0x94, 0xba, 0x33, 0xc5]),
     Guid::new(0x3af5_c948, 0x6297, 0x426c, [0xbf, 0xfc, 0x8f, 0x18, 0x95, 0x9f, 0xb8, 0x7b]),
     IUNKNOWN,
 ];
-const STATUS_IIDS: [Guid; 2] = [
+pub(crate) const STATUS_IIDS: [Guid; 2] = [
     Guid::new(0xcd66_d752, 0x2786, 0x44f7, [0x90, 0x70, 0xe2, 0xa6, 0xfd, 0xad, 0x3f, 0x1b]),
     IUNKNOWN,
 ];
@@ -400,26 +400,76 @@ extern "system" fn set_cpu_affinity(_: Factory, mask: u64) -> HRESULT {
 }
 
 /// The debug flags (`SetDebugFlags` +0x38, read back by +0x60): on the
-/// console bits 0-1 turn on request checks before a request is enqueued and
-/// bit 2 keeps names. Kept and handed back; our checks always run.
+/// console they live in the first control page (0x180010c60/0x1800106e0),
+/// where the host reads them; bit 0 prints the library's errors, bit 1
+/// breaks into the debugger on them. Kept and handed back (in the page
+/// too, when one is mapped); our checks always run.
 static DEBUG_FLAGS: AtomicU32 = AtomicU32::new(0);
 extern "system" fn set_debug_flags(_: Factory, flags: u32) {
     tracing::info!(flags = format_args!("{flags:#x}"), "dstorage: debug flags");
     DEBUG_FLAGS.store(flags, Ordering::Relaxed);
+    if let Some([flags_page, _]) = super::xcrd::control::pages() {
+        // SAFETY: the mapped control page, its first word the flags.
+        unsafe { (flags_page as *mut u32).write_volatile(flags) };
+    }
 }
 extern "system" fn debug_flags(_: Factory) -> u32 {
-    DEBUG_FLAGS.load(Ordering::Relaxed)
+    match super::xcrd::control::pages() {
+        // SAFETY: as above.
+        Some([flags_page, _]) => unsafe { (flags_page as *const u32).read_volatile() },
+        None => DEBUG_FLAGS.load(Ordering::Relaxed),
+    }
 }
 
-/// Slot +0x48: the console copies 0x100 bytes of its storage host's
-/// counters (per-priority request and byte counts). The layout's fields are
-/// not named anywhere the library shows; ours are all 0.
+/// Where slot +0x48 (0x1800106f0) takes each statistic from in the second
+/// control page: `(to, from, bytes)`. Four 0x30-byte blocks (per priority,
+/// last first) of seven counts and two totals, then single counts; the
+/// bytes between are left as the title had them.
+const STATISTICS: [(usize, usize, usize); 59] = {
+    let mut map = [(0, 0, 0); 59];
+    let single = [(0xc0, 0x606, 1), (0xc1, 0x607, 1), (0xc4, 0x608, 4), (0xc8, 0x60c, 4), (0xcc, 0x610, 4), (0xd0, 0x614, 4), (0xd4, 0x618, 4), (0xd8, 0x628, 4), (0xdc, 0x62c, 4), (0xe0, 0x630, 4), (0xe4, 0x63c, 4)];
+    let mut n = 0;
+    while n < single.len() {
+        map[n] = single[n];
+        n += 1;
+    }
+    let blocks = [0x90, 0x60, 0x30, 0];
+    let mut b = 0;
+    while b < 4 {
+        let (to, from) = (blocks[b], 0x200 + 0x80 * b);
+        let fields = [(0, 0, 4), (4, 4, 4), (8, 8, 4), (0xc, 0xc, 4), (0x10, 0x10, 4), (0x14, 0x14, 4), (0x18, 0x18, 4), (0x20, 0x28, 8), (0x28, 0x30, 8)];
+        let mut f = 0;
+        while f < fields.len() {
+            map[n] = (to + fields[f].0, from + fields[f].1, fields[f].2);
+            n += 1;
+            f += 1;
+        }
+        b += 1;
+    }
+    let tail = [(0xe8, 0x400), (0xec, 0x404), (0xf0, 0x408), (0xf4, 0x40c), (0xf8, 0x410), (0xfc, 0x414)];
+    let mut t = 0;
+    while t < tail.len() {
+        map[n] = (tail[t].0, tail[t].1, 4);
+        n += 1;
+        t += 1;
+    }
+    map
+};
+
+/// Slot +0x48: the storage host's counters, from the second control page.
+/// With no page mapped (the layer's case) they are all 0.
 extern "system" fn statistics(_: Factory, out: *mut u8) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| tracing::info!("dstorage: statistics asked for (all 0 here)"));
-    if !out.is_null() {
-        // SAFETY: the title passes the console's 0x100-byte statistics block.
-        unsafe { out.write_bytes(0, 0x100) };
+    if out.is_null() {
+        return;
+    }
+    let page = super::xcrd::control::pages().map(|[_, counters]| counters as *const u8);
+    for (to, from, bytes) in STATISTICS {
+        for i in 0..bytes {
+            // SAFETY: the mapped page's counters, or 0; the title's 0x100-byte block.
+            unsafe { *out.add(to + i) = page.map_or(0, |p| p.add(from + i).read_volatile()) };
+        }
     }
 }
 
