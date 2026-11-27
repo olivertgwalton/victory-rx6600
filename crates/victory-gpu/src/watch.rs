@@ -4298,6 +4298,7 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    crate::owed::land_range(at, len);
     #[cfg(feature = "diagnostics")]
     land_watch::release(at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
@@ -4923,6 +4924,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    crate::owed::forget_range(at, if len != 0 { len } else { allocation_end(at, at).saturating_sub(at).max(1) });
     if len != 0 {
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {
@@ -5053,6 +5055,13 @@ pub(crate) fn install() {
         if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             && r.NumberParameters >= 2
             && land_watch::fault(r.ExceptionInformation[1], r.ExceptionInformation[0] == WRITE, ours.is_some(), context)
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // An owed block (`crate::owed`): landed, and the access goes on.
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && crate::owed::fault(r.ExceptionInformation[1], r.ExceptionInformation[0] == WRITE)
         {
             return EXCEPTION_CONTINUE_EXECUTION;
         }

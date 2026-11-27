@@ -1,0 +1,2 @@
+XMemDumpMemoryStats 0 0 -> 0 dead  |
+XMemDumpMemoryStats buf:8 0 -> 0 dead buf0=0000000000000000 |

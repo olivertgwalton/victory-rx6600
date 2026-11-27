@@ -50,6 +50,11 @@ windows-core = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "xmem"
+harness = false
 
 [features]
 # Debugging switches (scripted keys and the like).

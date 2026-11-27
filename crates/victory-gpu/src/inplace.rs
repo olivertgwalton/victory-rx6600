@@ -123,6 +123,18 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     if !private_whole(at as usize, bytes as usize) {
         return Err(None);
     }
+    // One heap for the whole allocation (`VICTORY_INPLACE_WHOLE`, on by
+    // default): every heap opened on the PC's memory costs every
+    // submission, used or not (uma-probe: +5.7 ms a submission at 64), so
+    // a few big ones, each opened once, and windows placed in them.
+    if whole_on()
+        && let Some((heap, base)) = region_heap(device, at as usize)
+    {
+        let buffer = place(device, &heap, at - base as u64, bytes).map_err(Some)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+        return Ok(Placed { buffer, heap, gpu, bias: start - at });
+    }
     let heap = open(device, From::Part(at as usize, bytes as usize)).map_err(Some)?;
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
@@ -130,11 +142,168 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     Ok(Placed { buffer, heap, gpu, bias: start - at })
 }
 
+fn views_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_VIEWS").is_some_and(|v| v == "1"))
+}
+
+/// Heaps opened on views so far, and their bytes (each pins its pages until
+/// the copy that holds it goes).
+static VIEW_OPENS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Title memory `[start, start + len)` that views show whole, as one dma-buf
+/// of their pieces in the order the title sees them, and a buffer over all
+/// of it; `None` if a part is in no view or the host refuses.
+fn place_in_views(device: &ID3D12Device, start: u64, len: u64) -> Option<Placed> {
+    let at = start & !(K64 as u64 - 1);
+    let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
+    let pieces = pieces(at as usize, bytes as usize)?;
+    let heap = match crate::dmabuf::open_heap_list(device, &pieces) {
+        Ok(heap) => heap,
+        Err(e) => {
+            if VIEW_OPENS[2].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(start = format_args!("{start:#x}"), bytes, pieces = pieces.len(), error = %e, "title memory in views: not opened as a dma-buf; a copy instead");
+            }
+            return None;
+        }
+    };
+    let buffer = place_with(device, &heap, 0, bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS).ok()?;
+    let n = VIEW_OPENS[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let total = VIEW_OPENS[1].fetch_add(bytes, Ordering::Relaxed) + bytes;
+    if n.is_power_of_two() || n.is_multiple_of(256) {
+        tracing::info!(opened = n, mb = total >> 20, refused = VIEW_OPENS[2].load(Ordering::Relaxed), pieces = pieces.len(), "title memory in views opened as dma-bufs so far (each let go when the title remaps it)");
+    }
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+    Some(Placed { buffer, heap, gpu, bias: start - at })
+}
+
+fn hostptr_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_HOSTPTR").is_some_and(|v| v == "1"))
+}
+
+fn whole_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_WHOLE").is_none_or(|v| v != "0"))
+}
+
+/// Heaps opened on whole allocations, by base address (`None`: the host
+/// refused it, or it is not committed whole: windows there are opened part
+/// by part).
+static REGION_HEAPS: std::sync::Mutex<Option<std::collections::HashMap<usize, Option<ID3D12Heap>>>> = std::sync::Mutex::new(None);
+
+/// The heap opened on the whole allocation holding `at`, and its base.
+fn region_heap(device: &ID3D12Device, at: usize) -> Option<(ID3D12Heap, usize)> {
+    // SAFETY: plain data filled in by the query.
+    let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    if unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) } == 0 {
+        return None;
+    }
+    let base = info.AllocationBase as usize;
+    let mut heaps = REGION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps.get_or_insert_with(Default::default);
+    if let Some(known) = heaps.get(&base) {
+        return known.clone().map(|h| (h, base));
+    }
+    let opened = open(device, From::Region(base));
+    match &opened {
+        // SAFETY: a live heap.
+        Ok(heap) => tracing::info!(base = format_args!("{base:#x}"), mb = unsafe { heap.GetDesc() }.SizeInBytes >> 20, "title memory in place: a whole allocation opened as one heap"),
+        Err(e) => tracing::info!(base = format_args!("{base:#x}"), error = %e, "title memory in place: the whole allocation could not be opened; part by part"),
+    }
+    let heap = opened.ok();
+    heaps.insert(base, heap.clone());
+    heap.map(|h| (h, base))
+}
+
+/// The runtime's sections behind title memory (`VICTORY_XMEM_SECTIONS`):
+/// for an address, the section's handle, the offset in it and the bytes to
+/// its end.
+static SECTION_AT: std::sync::OnceLock<fn(usize) -> Option<(usize, u64, u64)>> = std::sync::OnceLock::new();
+
+/// Set once, by the runtime's xmem.
+pub fn set_section_at(f: fn(usize) -> Option<(usize, u64, u64)>) {
+    let _ = SECTION_AT.set(f);
+}
+
+/// Heaps opened on chunks of the runtime's sections as dma-bufs: by
+/// (section, chunk), with their pin. `None`: refused.
+#[allow(clippy::type_complexity)]
+static SECTION_HEAPS: std::sync::Mutex<Option<std::collections::HashMap<(usize, u64), Option<(ID3D12Heap, std::sync::Arc<crate::dmabuf::Pin>)>>>> =
+    std::sync::Mutex::new(None);
+
+/// The chunk sections are opened in: few heaps (each costs a little at
+/// every submission that names it), small enough to pin what is used.
+const CHUNK: u64 = 256 << 20;
+
+/// Title memory `[start, start + len)` in a section of the runtime's, placed
+/// in a dma-buf heap of its chunk; `None` if it is not, or the host refuses.
+fn place_in_section(device: &ID3D12Device, start: u64, len: u64) -> Option<Placed> {
+    let (handle, offset, left) = SECTION_AT.get()?(start as usize)?;
+    let at = offset & !(K64 as u64 - 1);
+    let bytes = (offset + len.max(1)).next_multiple_of(K64 as u64) - at;
+    let chunk = at / CHUNK * CHUNK;
+    let section_end = offset + left;
+    if at + bytes > chunk + CHUNK || at + bytes > section_end {
+        return None;
+    }
+    let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = heaps.get_or_insert_with(Default::default).entry((handle, chunk)).or_insert_with(|| {
+        let n = CHUNK.min(section_end - chunk);
+        match crate::dmabuf::open_heap_pinned(device, &[(handle, chunk, n)]) {
+            Ok((heap, pin)) => {
+                tracing::info!(section = format_args!("{handle:#x}"), chunk = format_args!("{chunk:#x}"), mb = n >> 20, "title memory in place: a chunk of a GPU heap opened as a dma-buf");
+                Some((heap, std::sync::Arc::new(pin)))
+            }
+            Err(e) => {
+                tracing::warn!(section = format_args!("{handle:#x}"), chunk = format_args!("{chunk:#x}"), error = %e, "title memory in place: a chunk not opened as a dma-buf");
+                None
+            }
+        }
+    });
+    let (heap, _pin) = entry.as_ref()?;
+    let buffer = place_with(device, heap, at - chunk, bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS).ok()?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (offset - at);
+    Some(Placed { buffer, heap: heap.clone(), gpu, bias: offset - at })
+}
+
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
+        return None;
+    }
+    // In a section of the runtime's: as a dma-buf, if it can be.
+    if crate::dmabuf::on()
+        && let Some(host) = crate::host::host()
+        && let Some(placed) = place_in_section(&host.device, start, len)
+    {
+        let at = if window { 0 } else { 2 };
+        STATS[at].fetch_add(1, Ordering::Relaxed);
+        STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+        return Some(placed);
+    }
+    // In views of the title's physical pages (the page pool, the tiled
+    // range): one dma-buf of the pages as the title sees them
+    // (`VICTORY_INPLACE_VIEWS=1`). A remap there lets it go
+    // (`title_memory_freeing`), and the next use opens it anew.
+    if crate::dmabuf::on()
+        && views_on()
+        && let Some(host) = crate::host::host()
+        && let Some(placed) = place_in_views(&host.device, start, len)
+    {
+        let at = if window { 0 } else { 2 };
+        STATS[at].fetch_add(1, Ordering::Relaxed);
+        STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+        return Some(placed);
+    }
+    // Heaps of host pointers cost every submission by their size: only when
+    // asked (`VICTORY_INPLACE_HOSTPTR=1`).
+    if !hostptr_on() {
         return None;
     }
     // View memory: known from the runtime without asking Windows.

@@ -394,6 +394,22 @@ pub(crate) fn sync_heaps() {
                 per(3),
                 per(4)
             );
+            static NOTED: std::sync::Mutex<[u64; 7]> = std::sync::Mutex::new([0; 7]);
+            let now: [u64; 7] = std::array::from_fn(|i| host::NOTE_NS[i].load(Relaxed));
+            let mut last = NOTED.lock().unwrap_or_else(|e| e.into_inner());
+            let n: [u64; 7] = std::array::from_fn(|i| now[i] - last[i]);
+            *last = now;
+            let per = |i: usize| n[i] as f64 / d[5].max(1) as f64;
+            tracing::info!(
+                "slot mirrors noting, ns a call: {:.0} texture queue, {:.0} spans, {:.0} stale, {:.0} strides and addresses, {:.0} buffer sets; the queue locked {} times, {:.0} ns a time waiting for it",
+                per(0),
+                per(1),
+                per(2),
+                per(3),
+                per(4),
+                n[6],
+                n[5] as f64 / n[6].max(1) as f64
+            );
         }
     }
     let started = std::time::Instant::now();

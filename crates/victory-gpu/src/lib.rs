@@ -40,7 +40,7 @@ mod native;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
-mod census;
+pub mod census;
 #[cfg(windows)]
 mod compose;
 pub mod console;
@@ -71,7 +71,7 @@ mod pixels;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
-mod inplace;
+pub mod inplace;
 #[cfg(windows)]
 mod port;
 #[cfg(windows)]
@@ -110,6 +110,8 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
+pub mod memclass;
+mod owed;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]

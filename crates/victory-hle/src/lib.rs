@@ -114,9 +114,10 @@ mod tests {
             r.classify("api-ms-win-core-synch-l1-2-0.dll", &name("Sleep")),
             Some(Provenance::Host)
         );
-        // Console-only DLLs never pass through.
+        // Console-only DLLs never pass through (xmem.dll has no such export;
+        // all 36 of its own are ours).
         assert_eq!(
-            r.classify("xmem.dll", &name("XMemSetAllocationHooks")),
+            r.classify("xmem.dll", &name("XMemNoSuchExport")),
             None
         );
     }

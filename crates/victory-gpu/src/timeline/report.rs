@@ -154,7 +154,10 @@ impl Names {
     pub(super) fn new() -> Names {
         Names {
             known: HashMap::new(),
-            symbols: Symbols::load(),
+            // `VICTORY_TIMELINE_NAMES=0`: no names from dbghelp, module and
+            // offset alone (Wine's SymFromAddr faulted inside dbghelp on this
+            // program, run tl1: the title died as the timeline was written).
+            symbols: if std::env::var_os("VICTORY_TIMELINE_NAMES").is_some_and(|v| v == "0") { None } else { Symbols::load() },
         }
     }
 

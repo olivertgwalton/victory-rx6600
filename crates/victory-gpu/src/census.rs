@@ -26,8 +26,19 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// The title's own memory, committed (told by the runtime's xmem: its
+/// commits and its physical pages).
+static TITLE_BYTES: OnceLock<fn() -> u64> = OnceLock::new();
+
+/// Set once, by the runtime's xmem.
+pub fn set_title_bytes(f: fn() -> u64) {
+    let _ = TITLE_BYTES.set(f);
+}
+
 /// The keys, in the order they are printed.
-const KEYS: [&str; 22] = [
+const KEYS: [&str; 28] = [
+    "title_committed",
+    "duplicates",
     "private_commit",
     "working_set",
     "title_copies",
@@ -37,6 +48,10 @@ const KEYS: [&str; 22] = [
     "snapshot_pool",
     "texture_staging",
     "texture_pool_blocks",
+    "texture_pool_free",
+    "texture_pool_resting",
+    "texture_pool_empty",
+    "target_pool_free",
     "staging_pool_blocks",
     "host_textures",
     "title_filled_textures",
@@ -107,7 +122,15 @@ fn log(frame: u64) {
     // their twins, windows there, and host textures. (Pool blocks hold
     // placed host textures, which the textures count already.)
     let known_local = copies[2] + copies[3] + copies[4] + copies[5] + host_textures;
+    // Bytes of title data held again somewhere else: host copies of title
+    // memory, their card sides and twins, windows on the card (mapped or
+    // not), host textures (each made from title memory), view copies. The
+    // console holds each byte once; the goal is for this to be near 0.
+    let duplicates = copies[1] + known_local + crate::shadow::view_copy_bytes();
+    let room_parts = crate::pool::texture_room_parts();
     let values: [u64; KEYS.len()] = [
+        TITLE_BYTES.get().map_or(UNKNOWN, |f| f()),
+        duplicates,
         private,
         working,
         copies[1],
@@ -117,6 +140,10 @@ fn log(frame: u64) {
         copies[6],
         crate::texture::live_staging_bytes(),
         texture_blocks,
+        crate::pool::texture_room(),
+        room_parts[0],
+        room_parts[1],
+        crate::pool::target_room(),
         staging_blocks,
         host_textures,
         filled,
@@ -133,6 +160,7 @@ fn log(frame: u64) {
     ];
     let line = format_line(&values, &PEAK);
     let (budget, nonlocal_budget) = card.map_or((UNKNOWN, UNKNOWN), |c| (c[0], c[2]));
+    tracing::warn!(target: "victory_gpu::census", "texture pool frame {frame}: {}", crate::pool::texture_holes());
     tracing::warn!(
         target: "victory_gpu::census",
         "memory census frame {frame}: {line} dxgi_local_budget={} dxgi_nonlocal_budget={} unaccounted_local={} \
@@ -193,11 +221,11 @@ mod tests {
         let mut values = [0u64; KEYS.len()];
         values[0] = 300 * MIB;
         let first = format_line(&values, &peaks);
-        assert!(first.starts_with("private_commit=300/300 "));
+        assert!(first.starts_with("title_committed=300/300 "));
         values[0] = 100 * MIB;
         values[1] = UNKNOWN;
         let second = format_line(&values, &peaks);
-        assert!(second.starts_with("private_commit=100/300 working_set=?/0 "));
+        assert!(second.starts_with("title_committed=100/300 duplicates=?/0 "));
         assert_eq!(second.split(' ').count(), KEYS.len());
     }
 }

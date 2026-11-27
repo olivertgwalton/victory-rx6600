@@ -1,0 +1,1 @@
+XMemIsToolsMemAvailable  -> 1 dead  | NtDeviceIoControlFile(code=0x1500e8,in=3b000000,outlen=8)

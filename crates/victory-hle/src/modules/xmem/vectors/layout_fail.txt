@@ -1,0 +1,1 @@
+XMemGetPhysicalMemoryLayout buf:10 -> 0 1f buf0=00000000000000000000000000000000 | NtDeviceIoControlFile(code=0x1500d4,in=,outlen=16)

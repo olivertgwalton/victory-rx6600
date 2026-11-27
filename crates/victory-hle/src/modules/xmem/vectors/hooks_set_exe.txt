@@ -1,0 +1,5 @@
+XMemSetAllocationHooks 0 0 -> 0 dead  |
+XMemAlloc 40 0 -> 37040 dead  | HeapAlloc(flags=0x0,size=0x40)
+XMemFree r:1 0 -> 0 dead  | HeapFree()
+XMemFree 0 0 -> 0 dead  | HeapFree()
+XMemAllocDefault 0 0 -> 0 dead  |
