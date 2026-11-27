@@ -772,3 +772,50 @@ fn small_exports_match_the_library() {
     XGComputeOptimalDepthStencilSwizzleMode(3, 40, 256, 256, 1, 1, 1, 0x40, &mut mode);
     assert_eq!(mode, 24);
 }
+
+/// `XGComputeTileShape` and `XGComputeBufferLayout` over the harness's
+/// sweeps, against one hash of the library's answers in order.
+#[test]
+fn tile_shapes_and_buffer_layouts_match_the_library() {
+    let want: [u64; 2] = {
+        let b = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/xg/tiles-buffers.hashes"));
+        [u64::from_le_bytes(b[..8].try_into().unwrap()), u64::from_le_bytes(b[8..].try_into().unwrap())]
+    };
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |v: u32| {
+        for b in v.to_le_bytes() {
+            h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+        }
+    };
+    for dim in 0..=5 {
+        for fmt in 0..192 {
+            for a in 0..=5 {
+                for s in 0..=8u32 {
+                    if s > 2 && !s.is_power_of_two() {
+                        continue;
+                    }
+                    let (mut x, mut y) = ([7u32; 3], [7u32; 3]);
+                    let hr = XGComputeTileShape(dim, fmt, a, s, &mut x, &mut y);
+                    mix(hr as u32);
+                    x.iter().chain(&y).for_each(|&v| mix(v));
+                }
+            }
+        }
+    }
+    let shapes = h;
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for width in [0, 1, 4, 65535, 65536, 65537, 131072, 1_000_000] {
+        for bind in [0, 1, 8, 0x20, 0x40, 0x80, 0x100, 0x200, 0x400, 0x6ff, 0x700, 0x800] {
+            for misc in [0, 1, 0x40_0000, 0x400_0000, 0x800_0000, 0xc00_0000] {
+                let d = BufferDesc { width, usage: 0, bind_flags: bind, cpu_access: 0, misc_flags: misc, stride: 0 };
+                let mut out = vec![0xcdu8; 0x2000];
+                let hr = XGComputeBufferLayout(&d, out.as_mut_ptr().cast());
+                let lh = out[..0x1b40].iter().fold(0xcbf2_9ce4_8422_2325u64, |a, &b| (a ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
+                for b in (hr as u32).to_le_bytes().into_iter().chain(lh.to_le_bytes()) {
+                    h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+                }
+            }
+        }
+    }
+    assert_eq!([shapes, h], want, "tile shapes, buffer layouts");
+}
