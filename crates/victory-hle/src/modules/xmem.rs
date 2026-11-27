@@ -60,7 +60,7 @@ const PAGES_64K: u32 = PAGES_2M | PAGES_64K_BIT;
 /// adds GPU access bits (0x800-0x40000). Write-combining and uncached are
 /// dropped too: our GPU side reads this memory through the CPU.
 const HOST_PROTECTION: u32 = 0x1ff;
-/// XMem flags of memory both processors reach: all of ours.
+/// XMem flags of memory both processors reach (CPU and GPU).
 const GRAPHICS: u64 = 3;
 /// XMem flag bit of 32-bit graphics memory.
 const ADDRESS_32BIT: u64 = 4;
