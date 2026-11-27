@@ -2394,12 +2394,29 @@ extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, fl
     }
 }
 
+/// A top-of-pipe write: the console's command processor stores it when it
+/// reaches the packet, before the work ahead of it is done. Here it is
+/// stored when the list is submitted, in order with the list's copies
+/// ([`crate::host::HostList::defer`]), not when the whole list has run.
+/// shortcut: earlier than the console by the issue of the commands ahead of
+/// it in the list.
+fn write_top(this: This, address: u64, what: Written, bytes: usize) {
+    if address == 0 {
+        return;
+    }
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.defer(move || what.write(address as *mut u8, bytes));
+        return;
+    }
+    let _ = this;
+    what.write(address as *mut u8, bytes);
+}
+
 /// List method 0x2d0, `Write32BitValueTopOfPipeX(address, value, flags)`
 /// (GameOS `xgs12_10.dll` +0x3a3f0).
-/// shortcut: stored when the list has run, as the bottom-of-pipe writes
-/// ([`write32`]), not when the command processor reaches it.
 pub(super) extern "system" fn write32_top(this: This, address: u64, value: u32, _flags: u32) {
-    defer_write(this, address, Written::Value(u64::from(value)), 4);
+    write_top(this, address, Written::Value(u64::from(value)), 4);
     value_written(this, address, u64::from(value));
 }
 
@@ -2412,7 +2429,7 @@ pub(super) extern "system" fn write64_top(this: This, address: u64, value: u64, 
         ONCE.call_once(|| tracing::warn!(flags, "a top-of-pipe copy (Write64BitValueTopOfPipeX flags 0x4/0x8): left out"));
         return;
     }
-    defer_write(this, address, Written::Value(value), 8);
+    write_top(this, address, Written::Value(value), 8);
     value_written(this, address, value);
 }
 
@@ -2466,8 +2483,9 @@ pub(super) extern "system" fn write_immediate(this: This, count: u32, params: *c
 /// List methods 0x1f8, 0x200 and 0x208, `FillMemoryWith{32,64,128}BitValueX
 /// (destination, size, value)` (+0x2ef60, +0x2f020, +0x2ef30; the 128-bit
 /// value by address): the pattern over `size` bytes of title memory.
-/// shortcut: written when the list has run, as [`copy_memory`] without a
-/// host copy.
+/// Written when the list is submitted, in order with its copies, as
+/// [`copy_memory`] without a host copy.
+/// shortcut: on the console the card writes it in the list's order.
 pub(super) extern "system" fn fill32(this: This, dst: u64, size: u64, value: u32) {
     let mut p = [0u8; 16];
     for c in p.chunks_mut(4) {
