@@ -4494,7 +4494,7 @@ impl Drop for Remapping {
         if CHANGING.replace((false, false)).1 {
             guards().changing.clear();
         }
-        CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        change_counted();
     }
 }
 
@@ -4540,33 +4540,69 @@ pub(crate) fn change_over() {
     if now.is_multiple_of(2) {
         return;
     }
-    let started = std::time::Instant::now();
-    while changes() == now && started.elapsed().as_millis() < 2 {
-        for _ in 0..50 {
-            std::hint::spin_loop();
-        }
-    }
+    changed_from(now, 2);
 }
 
 /// [`changes`], when no change is under way (or one has been for a second).
 fn change_done() -> u64 {
-    let mut tries = 0;
-    let mut started = None;
+    let started = std::time::Instant::now();
     loop {
         let now = changes();
         if now.is_multiple_of(2) {
             return now;
         }
-        tries += 1;
-        if tries < 100 {
-            std::hint::spin_loop();
-            continue;
-        }
-        if started.get_or_insert_with(std::time::Instant::now).elapsed().as_secs() >= 1 {
+        let left = 1000u128.saturating_sub(started.elapsed().as_millis()) as u32;
+        if left == 0 {
             return now;
         }
-        // SAFETY: gives the processor to another thread.
-        unsafe { windows_sys::Win32::System::Threading::Sleep(u32::from(tries > 200)) };
+        changed_from(now, left);
+    }
+}
+
+/// Threads asleep in [`changed_from`]: a change of mapping wakes them only
+/// if there are any (the runtime remaps thousands of pages a frame, and a
+/// wake is a system call).
+static CHANGE_WAITERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Returns when [`CHANGES`] is no longer `seen`, or after `ms` milliseconds:
+/// a short spin first (a remap of one page is over in microseconds), then
+/// asleep on the counter's address until [`change_counted`] wakes it. It
+/// was a loop of `Sleep(0)` and `Sleep(1)` before.
+fn changed_from(seen: u64, ms: u32) {
+    use std::sync::atomic::Ordering::SeqCst;
+    for _ in 0..100 {
+        if changes() != seen {
+            return;
+        }
+        std::hint::spin_loop();
+    }
+    // Counted before the wait compares: a change after the compare finds the
+    // count and wakes; one before it makes the wait return at once.
+    CHANGE_WAITERS.fetch_add(1, SeqCst);
+    // SAFETY: a static's address and a value of its size.
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::System::Threading::WaitOnAddress((&raw const CHANGES).cast(), (&raw const seen).cast(), 8, ms);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = ms;
+        std::thread::yield_now();
+    }
+    CHANGE_WAITERS.fetch_sub(1, SeqCst);
+}
+
+/// One more change of mapping begun or ended: counted, and whoever sleeps
+/// until then is woken.
+fn change_counted() {
+    use std::sync::atomic::Ordering::SeqCst;
+    CHANGES.fetch_add(1, SeqCst);
+    if CHANGE_WAITERS.load(SeqCst) != 0 {
+        // SAFETY: a static's address.
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const CHANGES).cast())
+        };
     }
 }
 
@@ -4658,7 +4694,7 @@ pub fn title_memory_remapping_in(ranges: &[(usize, usize)]) -> Remapping {
     } else {
         Changing::Whole(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
     };
-    CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    change_counted();
     CHANGING.set((true, false));
     Remapping(changing)
 }

@@ -714,7 +714,9 @@ pub extern "system" fn XGValidateDepthStencilSwizzleMode(_a: u32, _b: u32, mode:
 /// (and held).
 static INITIALIZED: AtomicU32 = AtomicU32::new(0);
 static LOCKING: AtomicU32 = AtomicU32::new(0);
-static LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The library's exclusive lock: whether it is held, and the waiters' bell.
+/// Taken and let go by two calls of the title's, so no guard is kept.
+static LOCKED: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
 
 /// 0 if this call initialized the library, 1 if it already was.
 pub extern "system" fn XGInitializeLibrary() -> u32 {
@@ -742,14 +744,15 @@ pub extern "system" fn XGEnterExclusiveLock() -> u32 {
     if LOCKING.load(Ordering::Acquire) == 0 {
         return 0;
     }
-    while LOCKED.swap(true, Ordering::Acquire) {
-        std::thread::yield_now();
-    }
+    let held = LOCKED.0.lock().unwrap_or_else(|e| e.into_inner());
+    let mut held = LOCKED.1.wait_while(held, |held| *held).unwrap_or_else(|e| e.into_inner());
+    *held = true;
     1
 }
 
 pub extern "system" fn XGLeaveExclusiveLock() {
-    LOCKED.store(false, Ordering::Release);
+    *LOCKED.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    LOCKED.1.notify_one();
 }
 
 /// Tile-shape class by DXGI format (measured).
