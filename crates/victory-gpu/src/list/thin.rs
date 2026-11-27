@@ -481,6 +481,8 @@ const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
 const CLEAR_UAV: u64 = after(17);
+const RESOLVE_REGION: u64 = after(18);
+const SAMPLE_POSITIONS: u64 = after(19);
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -721,6 +723,32 @@ extern "system" fn write_immediate(this: This, count: u32, params: *const super:
         write32(this, p.dest, p.value, 0, 0);
     }
 }
+extern "system" fn resolve_region(
+    this: This,
+    dst: This,
+    dst_sub: u32,
+    x: u32,
+    y: u32,
+    src: This,
+    src_sub: u32,
+    rect: *const [i32; 4],
+    format: u32,
+    mode: u32,
+) {
+    // SAFETY: the title passes a rectangle or none.
+    let r = unsafe { rect.as_ref() }.copied();
+    let w = |a: i32, b: i32| u64::from(a as u32) | u64::from(b as u32) << 32;
+    let [l, t, rt, b] = r.unwrap_or([0; 4]);
+    front(this).put(
+        RESOLVE_REGION,
+        &[dst as u64, u64::from(dst_sub), u64::from(x) | u64::from(y) << 32, src as u64, u64::from(src_sub), u64::from(r.is_some()), w(l, t), w(rt, b), u64::from(format) | u64::from(mode) << 32],
+    );
+}
+extern "system" fn sample_positions(this: This, per_pixel: u32, pixels: u32, positions: *const [i8; 2]) {
+    let n = (per_pixel as usize * pixels as usize).min(64);
+    let n = if positions.is_null() { 0 } else { n };
+    front(this).put_with(SAMPLE_POSITIONS, &[u64::from(per_pixel) | u64::from(pixels) << 32, n as u64], &[bytes_of(positions, n)]);
+}
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -842,6 +870,18 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                     at(w, 3 + RECORD, n),
                 );
             }
+            RESOLVE_REGION => {
+                let rect = (w[5] != 0).then(|| [w[6] as i32, (w[6] >> 32) as i32, w[7] as i32, (w[7] >> 32) as i32]);
+                super::resolve_region_at(list, w[0] as This, w[1] as u32, w[2] as u32, (w[2] >> 32) as u32, w[3] as This, w[4] as u32, rect, w[8] as u32, (w[8] >> 32) as u32);
+            }
+            SAMPLE_POSITIONS => {
+                let n = w[1] as usize;
+                let p: &[[i8; 2]] = if n == 0 { &[] } else {
+                    // SAFETY: the `n` positions written down after the counts.
+                    unsafe { std::slice::from_raw_parts(w[2..].as_ptr().cast(), n) }
+                };
+                super::sample_positions_at(list, w[0] as u32, (w[0] >> 32) as u32, p);
+            }
             CLEAR_UAV => {
                 let v = [w[3] as u32, (w[3] >> 32) as u32, w[4] as u32, (w[4] >> 32) as u32];
                 super::clear_uav(list, w[5..].as_ptr() as u64, w[1] as This, v, w[2] != 0, n as u32, at(w, 5 + RECORD, n));
@@ -883,7 +923,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     f
 }
 
-const MINE: [(usize, *const ()); 64] = [
+const MINE: [(usize, *const ()); 66] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
     (12, draw as *const ()),
@@ -921,6 +961,8 @@ const MINE: [(usize, *const ()); 64] = [
     (51, clear_dsv as *const ()),
     (52, clear_rtv as *const ()),
     (107, depth_bounds as *const ()),
+    (108, sample_positions as *const ()),
+    (109, resolve_region as *const ()),
     (104, scissors as *const ()),
     (61, fill32 as *const ()),
     (62, fill64 as *const ()),
@@ -1004,5 +1046,45 @@ mod tests {
         assert_eq!(slot[1], 99);
         assert_eq!(kept[1], 2);
         assert_eq!(record(0), [0; RECORD]);
+    }
+}
+
+/// ResolveSubresourceRegion and SetSamplePositions (list 0x378/0x370; GameOS
+/// `xgs12_10.dll` +0x50590, +0x38110: D3D12's List1 arguments) reach the
+/// host step with the same arguments called plainly and written down and
+/// played.
+#[cfg(test)]
+mod list1_methods {
+    use super::*;
+
+    fn last() -> String {
+        super::super::SEEN.lock().unwrap().last().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn written_down_and_played_as_called() {
+        let rect = [1i32, 2, 30, 40];
+        let (dst, src) = (0x1000usize as This, 0x2000usize as This);
+        super::super::resolve_region(std::ptr::null(), dst, 3, 4, 5, src, 6, &rect, 28, 2);
+        let plain = last();
+        let positions = [[1i8, -2], [3, -4], [5, -6], [7, -8]];
+        super::super::sample_positions(std::ptr::null(), 4, 1, positions.as_ptr());
+        let plain_positions = last();
+        assert_eq!(plain_positions, "positions 4 1 [[1, -2], [3, -4], [5, -6], [7, -8]]");
+
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(super::super::create_allocator(null, 0, &super::super::ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(super::super::create_list(null, 0, 0, allocator, null, &super::super::LIST_IIDS[1], &mut list), S_OK);
+        front(list).recording = Some(Arc::new(Recording::new(0)));
+        front(list).words.clear();
+        resolve_region(list, dst, 3, 4, 5, src, 6, &rect, 28, 2);
+        sample_positions(list, 4, 1, positions.as_ptr());
+        let stream = std::mem::take(&mut front(list).words);
+        translate(std::ptr::null(), &stream, || false);
+        let n = super::super::SEEN.lock().unwrap().len();
+        let both = super::super::SEEN.lock().unwrap()[n - 2..].to_vec();
+        assert_eq!(both, vec![plain, plain_positions]);
     }
 }

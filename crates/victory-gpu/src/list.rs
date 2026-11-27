@@ -1354,6 +1354,115 @@ extern "system" fn resolve(
     let _ = (this, dst, dst_sub, src, src_sub, format);
 }
 
+/// What the host steps of the methods below were given, last first (tests).
+#[cfg(test)]
+pub(crate) static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+fn seen(what: String) {
+    SEEN.lock().unwrap_or_else(|e| e.into_inner()).push(what);
+}
+
+/// List method 0x378 `ResolveSubresourceRegion(dst, dst sub, dst x, dst y,
+/// src, src sub, src rect, format, mode)` (GameOS `xgs12_10.dll` +0x50590,
+/// D3D12's List1 method): the host's, prepared as [`resolve`] is.
+#[allow(clippy::too_many_arguments)] // the method's own arguments
+pub(super) extern "system" fn resolve_region(
+    this: This,
+    dst: This,
+    dst_sub: u32,
+    x: u32,
+    y: u32,
+    src: This,
+    src_sub: u32,
+    rect: *const [i32; 4],
+    format: u32,
+    mode: u32,
+) {
+    // SAFETY: the title passes a rectangle or none.
+    let rect = unsafe { rect.as_ref() }.copied();
+    resolve_region_at(this, dst, dst_sub, x, y, src, src_sub, rect, format, mode);
+}
+
+#[allow(clippy::too_many_arguments)] // the method's own arguments
+pub(super) fn resolve_region_at(
+    this: This,
+    dst: This,
+    dst_sub: u32,
+    x: u32,
+    y: u32,
+    src: This,
+    src_sub: u32,
+    rect: Option<[i32; 4]>,
+    format: u32,
+    mode: u32,
+) {
+    #[cfg(test)]
+    seen(format!("resolve {dst:?} {dst_sub} {x} {y} {src:?} {src_sub} {rect:?} {format} {mode}"));
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && let (Some(to), Some(from)) = (crate::resource::host_resource(dst), crate::resource::host_resource(src))
+    {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D12::{D3D12_RESOLVE_MODE, ID3D12GraphicsCommandList1};
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        use windows::core::Interface;
+        const RESOLVE_DEST: u32 = 0x1000;
+        const RESOLVE_SOURCE: u32 = 0x2000;
+        if unlike(dst, src) {
+            return;
+        }
+        list.twin_use(dst, false, true);
+        list.twin_use(src, false, false);
+        crate::texture::card_writes(list, dst, to, Some(dst_sub));
+        ensure_state(list, dst, RESOLVE_DEST);
+        ensure_state(list, src, RESOLVE_SOURCE);
+        crate::texture::host_written(dst);
+        let rect = rect.map(|[left, top, right, bottom]| RECT { left, top, right, bottom });
+        // SAFETY: an open list and live textures.
+        unsafe {
+            let format = if crate::resource::stands_in(dst) { to.GetDesc().Format } else { DXGI_FORMAT(format as i32) };
+            if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+                list1.ResolveSubresourceRegion(to, dst_sub, x, y, from, src_sub, rect.as_ref().map(|r| r as *const _), format, D3D12_RESOLVE_MODE(mode as i32));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (this, dst, dst_sub, x, y, src, src_sub, rect, format, mode);
+}
+
+/// List method 0x370 `SetSamplePositions(samples per pixel, pixels,
+/// positions)` (+0x38110, D3D12's List1 method; the debug build allows 0, 1
+/// or 4 pixels): the host's.
+pub(super) extern "system" fn sample_positions(this: This, per_pixel: u32, pixels: u32, positions: *const [i8; 2]) {
+    let n = (per_pixel as usize * pixels as usize).min(64);
+    let positions = if positions.is_null() || n == 0 {
+        &[][..]
+    } else {
+        // SAFETY: the title passes `per_pixel * pixels` positions.
+        unsafe { std::slice::from_raw_parts(positions, n) }
+    };
+    sample_positions_at(this, per_pixel, pixels, positions);
+}
+
+pub(super) fn sample_positions_at(this: This, per_pixel: u32, pixels: u32, positions: &[[i8; 2]]) {
+    #[cfg(test)]
+    seen(format!("positions {per_pixel} {pixels} {positions:?}"));
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        use windows::Win32::Graphics::Direct3D12::{D3D12_SAMPLE_POSITION, ID3D12GraphicsCommandList1};
+        use windows::core::Interface;
+        let p: Vec<D3D12_SAMPLE_POSITION> = positions.iter().map(|&[x, y]| D3D12_SAMPLE_POSITION { X: x, Y: y }).collect();
+        // SAFETY: an open list; the positions are as many as the counts say.
+        unsafe {
+            if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+                list1.SetSamplePositions(per_pixel, pixels, if p.is_empty() { std::ptr::null_mut() } else { p.as_ptr().cast_mut() });
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (this, per_pixel, pixels, positions);
+}
+
 #[repr(C)]
 pub(crate) struct Rect {
     left: i32,
@@ -2628,7 +2737,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 81] = [
+const METHODS: [(usize, *const ()); 83] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -2709,6 +2818,8 @@ const METHODS: [(usize, *const ()); 81] = [
     // debug build validating it as OMSetDepthBoundsX) and a second
     // RSSetScissorRects entry (+0x5dd30, the same validation).
     (107, state::depth_bounds as *const ()),      // 0x368
+    (108, sample_positions as *const ()),         // 0x370 SetSamplePositions
+    (109, resolve_region as *const ()),           // 0x378 ResolveSubresourceRegion
     (104, state::scissors as *const ()),          // 0x350
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
