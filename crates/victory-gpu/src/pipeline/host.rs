@@ -1604,7 +1604,9 @@ impl GraphicsState {
         // after it, PA_CL_CLIP_CNTL +8, PA_SU_SC_MODE_CNTL +9, the polygon
         // offset's clamp, scale and offset +12..+14, DB_DEPTH_CONTROL +15,
         // DB_STENCIL_CONTROL +16, DB_STENCILREFMASK and its back twin +17,
-        // +18, CB_BLEND0..7_CONTROL +21..+28 and CB_TARGET_MASK +29.
+        // +18, DB_ALPHA_TO_MASK +19, CB_TARGET_MASK +20 and
+        // CB_BLEND0..7_CONTROL +21..+28: where the console's driver writes
+        // them (GameOS xgs12_10.dll +0x4abe0; +29 is all ones in every image).
         let anchor = super::variant::context_anchor(&words);
         let tested = depth.0 != 0;
         let Some(c) = anchor else {
@@ -1615,7 +1617,7 @@ impl GraphicsState {
             return g.finish(layout, targets, depth, samples);
         };
         let color_on = words[c] >> 4 & 7 != 0;
-        let mask = if color_on { words[c + 29] } else { 0 };
+        let mask = if color_on { words[c + 20] } else { 0 };
         g.blend.IndependentBlendEnable = true.into();
         for (n, target) in g.blend.RenderTarget.iter_mut().enumerate() {
             let w = words[c + 21 + n];
