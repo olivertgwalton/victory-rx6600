@@ -1763,6 +1763,60 @@ mod tests {
         data
     }
 
+    /// Time per 256-byte output block of the XMA pump on a stream that
+    /// loops forever (empty frames, so this is the layer's own cost: locks,
+    /// context fields, ring writes). `cargo test --release -- --ignored
+    /// bench_ --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_xma_pump() {
+        let _serial = fresh();
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 4, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let context = Context(request.arrays[4].cast::<u32>().wrapping_add(16));
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut output, &mut output_apu, 0x2000, 0x100, 2), S_OK);
+        // Two packets looping forever, a ring of 32 blocks, 48 kHz mono.
+        context.set(0, 2 | 255 << 12 | 1 << 20 | 31 << 22);
+        context.set(1, 1 << 31 | 3 << 27);
+        context.set(2, 32);
+        context.set(3, 32);
+        context.set(4, 2 * xma::PACKET_BYTES as u32 * 8);
+        context.set(5, input_apu);
+        context.set(7, output_apu);
+        let mut acp = std::ptr::null_mut();
+        assert_eq!(AcpHalCreate(&mut acp), S_OK);
+        // SAFETY: just created.
+        let m = unsafe { (*acp).vtable };
+        assert_eq!((m.connect)(acp, 0x1000, 0), S_OK);
+        let submit = |command: u32, words: &[u32]| {
+            assert_eq!((m.submit)(acp, command, 0, u32::MAX, words.as_ptr().cast(), 0), S_OK);
+        };
+        submit(ENABLE_XMA, &[1]);
+        let produced = |x: &Xma| lock(&x.voices[1]).as_ref().map_or(0, |v| v.trace.produced);
+        let before = produced(&xma());
+        let start = std::time::Instant::now();
+        for _ in 0..20_000 {
+            submit(ADVANCE_XMA_READ, &[1, 31]);
+            xma().pump();
+        }
+        let blocks = (produced(&xma()) - before) / SAMPLES_PER_BLOCK;
+        let ns = start.elapsed().as_secs_f64() * 1e9 / blocks.max(1) as f64;
+        println!("bench xma pump: {ns:.0} ns per block ({blocks} blocks)");
+        submit(DISABLE_XMA, &[1]);
+        assert_eq!((m.disconnect)(acp), S_OK);
+        (m.release)(acp);
+    }
+
     /// A read block past the end of the ring (6 on a ring of four) is block
     /// 2 of it: a stream that loops forever fills blocks 0 and 1 and the
     /// pass ends. It used to fill the ring for good, holding the voice.
