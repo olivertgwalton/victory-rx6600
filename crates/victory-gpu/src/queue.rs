@@ -1329,6 +1329,8 @@ const fn queue_table(newer: bool) -> [*const (); 40] {
         i += 1;
     }
     if newer {
+        // 0x70 (+0x1b5c0): a PIX marker of a kind, as 0x58..0x68.
+        f[14] = marker as *const ();
         f[19] = object::stub_s_ok() as *const (); // 0x98: S_OK (+0x19460; its kernel notification is not modelled)
         f[23] = suspend as *const (); // 0xb8
         f[24] = resume as *const (); // 0xc0

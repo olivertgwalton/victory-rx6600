@@ -2434,7 +2434,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 54] = [
+const METHODS: [(usize, *const ()); 58] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -2477,6 +2477,14 @@ const METHODS: [(usize, *const ()); 54] = [
     (52, clear_rtv as *const ()),                 // 0x1a0
     (53, clear_uav_uint as *const ()),            // 0x1a8
     (54, clear_uav_float as *const ()),           // 0x1b0
+    // DiscardResource(resource, region) (GameOS xgs12_10.dll +0x38c90):
+    // the contents become undefined, which keeping them is.
+    (55, object::VOID_STUB),                      // 0x1b8
+    // PIX markers, packets the GPU passes over: SetMarker (+0x39e60),
+    // BeginEvent (+0x38bb0), EndEvent (+0x39060).
+    (56, object::VOID_STUB),                      // 0x1c0
+    (57, object::VOID_STUB),                      // 0x1c8
+    (58, object::VOID_STUB),                      // 0x1d0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
     (68, state::depth_bounds as *const ()),       // 0x220 depth bounds
@@ -2521,7 +2529,9 @@ const fn newer_slot(slot: usize) -> usize {
 /// called from the title's state flush with its result unused.
 /// shortcut: 0x470's purpose is unknown; ignored until a title shows it
 /// matters.
-const NEWER_METHODS: [(usize, *const ()); 3] = [
+const NEWER_METHODS: [(usize, *const ()); 4] = [
+    // A marker of a kind (+0x39160), as the others.
+    (59, object::VOID_STUB),
     (142, ignored_state as *const ()),
     (146, barrier_groups as *const ()),
     (148, allocate_upload as *const ()),
