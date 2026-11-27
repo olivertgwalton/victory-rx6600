@@ -2549,10 +2549,11 @@ const fn newer_slot(slot: usize) -> usize {
 
 /// Methods only newer titles' lists have. 0x490: the enhanced barrier
 /// `(group count, groups)`, with 16-byte groups `(type, count, barriers)`
-/// and 40-byte buffer barriers (title+0x95e0 builds them). 0x470 `(u64)`,
-/// called from the title's state flush with its result unused.
-/// shortcut: 0x470's purpose is unknown; ignored until a title shows it
-/// matters.
+/// and 40-byte buffer barriers (title+0x95e0 builds them). 0x470 is
+/// `SetSampleMaskX(mask)` (named by the driver's debug build, GameOS
+/// `xgs12_10d.dll`; retail +0x38580), called from the title's state flush.
+/// shortcut: the sample mask is not applied (host pipelines keep every
+/// sample); see `crate::reference::LIST_NAMES` for every slot's name.
 const NEWER_METHODS: [(usize, *const ()); 4] = [
     // A marker of a kind (+0x39160), as the others.
     (59, object::VOID_STUB),

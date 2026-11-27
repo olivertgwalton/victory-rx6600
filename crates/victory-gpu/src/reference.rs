@@ -180,6 +180,165 @@ pub(crate) const COMMAND_SIGNATURE: [Slot; 8] = [
     c(0x194e0, 0x0), b(0x3e480),  // 0x30
 ];
 
+
+/// Names of the graphics list's slots (`LIST`): from the messages of the
+/// driver's debug build (GameOS `xgs12_10d.dll`, its table at `.data`
+/// 0x26d160, slot for slot the retail one), else by D3D12's own order
+/// ("PC order"), else what the retail method is. Slot offset = index * 8.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const LIST_NAMES: [&str; 150] = [
+    "QueryInterface [PC order]", // 0x0 +0x6d360
+    "AddRef [PC order]", // 0x8 +0x19430
+    "Release [PC order]", // 0x10 +0x399d0
+    "GetPrivateData [PC order]", // 0x18 +0xa5680
+    "SetPrivateData [PC order]", // 0x20 +0xa5710
+    "SetPrivateDataInterface [PC order]", // 0x28 +0x41e80
+    "SetName [PC order]", // 0x30 +0x194e0
+    "GetDevice [PC order]", // 0x38 +0x3e480
+    "GetType [PC order]", // 0x40 +0x38100
+    "Close [PC order]", // 0x48 +0x38be0
+    "Reset [PC order]", // 0x50 +0x39b80
+    "ClearState", // 0x58 +0x5db90
+    "DrawInstanced", // 0x60 +0x448a0
+    "DrawIndexedInstanced", // 0x68 +0x44750
+    "Dispatch", // 0x70 +0x44610
+    "CopyBufferRegion", // 0x78 +0x2e450
+    "CopyTextureRegion [PC order]", // 0x80 +0x0
+    "CopyResource [PC order]", // 0x88 +0x0
+    "CopyTiles [PC order]", // 0x90 +0x6cfc0
+    "ResolveSubresource", // 0x98 +0x50870
+    "IASetPrimitiveTopology", // 0xa0 +0x44eb0
+    "RSSetViewports", // 0xa8 +0x5de80
+    "RSSetScissorRects", // 0xb0 +0x5dd80
+    "OMSetBlendFactor [PC order]", // 0xb8 +0x44fd0
+    "OMSetStencilRef", // 0xc0 +0x45030
+    "SetPipelineState [PC order]", // 0xc8 +0x455a0
+    "ResourceBarrier", // 0xd0 +0x39ba0
+    "ExecuteBundle", // 0xd8 +0x390b0
+    "BeginQuery [PC order]", // 0xe0 +0x4eeb0
+    "EndQuery [PC order]", // 0xe8 +0x4eed0
+    "ResolveQueryData", // 0xf0 +0x4eef0
+    "SetPredication", // 0xf8 +0x4f740
+    "SetDescriptorHeaps", // 0x100 +0x39ce0
+    "SetComputeRootSignature", // 0x108 +0x39c60
+    "SetGraphicsRootSignature", // 0x110 +0x39de0
+    "SetComputeRootDescriptorTable", // 0x118 +0x45240
+    "SetGraphicsRootDescriptorTable", // 0x120 +0x45500
+    "SetComputeRoot32BitConstant [PC order]", // 0x128 +0x45080
+    "SetGraphicsRoot32BitConstant [PC order]", // 0x130 +0x452c0
+    "SetComputeRoot32BitConstants", // 0x138 +0x45110
+    "SetGraphicsRoot32BitConstants", // 0x140 +0x45370
+    "SetComputeRootConstantBufferView", // 0x148 +0x451c0
+    "SetGraphicsRootConstantBufferView", // 0x150 +0x45460
+    "SetComputeRootShaderResourceView", // 0x158 +0x451c0
+    "SetGraphicsRootShaderResourceView", // 0x160 +0x45460
+    "SetComputeRootUnorderedAccessView", // 0x168 +0x451c0
+    "SetGraphicsRootUnorderedAccessView", // 0x170 +0x45460
+    "IASetIndexBuffer", // 0x178 +0x44e50
+    "IASetVertexBuffers", // 0x180 +0x44f00
+    "SOSetTargets", // 0x188 +0x39bb0
+    "OMSetRenderTargets", // 0x190 +0x749c0
+    "ClearDepthStencilView", // 0x198 +0x17610
+    "ClearRenderTargetView", // 0x1a0 +0x17660
+    "ClearUnorderedAccessViewUint", // 0x1a8 +0x178d0
+    "ClearUnorderedAccessViewFloat", // 0x1b0 +0x176b0
+    "DiscardResource", // 0x1b8 +0x38c90
+    "SetMarker", // 0x1c0 +0x39e60
+    "BeginEvent", // 0x1c8 +0x38bb0
+    "EndEvent", // 0x1d0 +0x39060
+    "InsertGpuMarker", // 0x1d8 +0x39160
+    "(console method: returns at once)", // 0x1e0 +0xa880
+    "ExecuteIndirect", // 0x1e8 +0x42b30
+    "CopyMemoryToMemoryX", // 0x1f0 +0x2e4c0
+    "FillMemoryWith32BitValueX", // 0x1f8 +0x2ef60
+    "FillMemoryWith64BitValueX", // 0x200 +0x2f020
+    "FillMemoryWith128BitValueX", // 0x208 +0x2ef30
+    "(console X-method, unnamed: no messages in either driver build)", // 0x210 +0x4f620
+    "(console X-method, unnamed: no messages in either driver build)", // 0x218 +0x4f6f0
+    "(console method: filled at device creation)", // 0x220 +0x0
+    "FlushPipelineX", // 0x228 +0x39120
+    "OMSetDepthBoundsX", // 0x230 +0x5db20
+    "Write32BitValueBottomOfPipeX", // 0x238 +0x3a200
+    "Write64BitValueBottomOfPipeX", // 0x240 +0x3a4a0
+    "Wait32BitValueX", // 0x248 +0x39f00
+    "Wait64BitValueX", // 0x250 +0x3a080
+    "SetPixelShaderDepthForceZOrderX", // 0x258 +0x39e90
+    "ExecuteIndirectBundleX", // 0x260 +0x42fc0
+    "(console X-method, unnamed: no messages in either driver build)", // 0x268 +0x39ef0
+    "DispatchRays family (validates D3D12_DISPATCH_RAYS_DESC)", // 0x270 +0x3a6b0
+    "(console X-method, unnamed: no messages in either driver build)", // 0x278 +0x39990
+    "DispatchX", // 0x280 +0x446c0
+    "SetHiStencilStateX", // 0x288 +0x5e390
+    "RSSetMSAAParametersX", // 0x290 +0x392f0
+    "DrawIndexedX", // 0x298 +0x44810
+    "(console X-method, unnamed: no messages in either driver build)", // 0x2a0 +0x20f30
+    "CopyTextureRegion", // 0x2a8 +0x2ea60
+    "CopyResourceX", // 0x2b0 +0x2e570
+    "(console method: filled at device creation)", // 0x2b8 +0x0
+    "(console method: filled at device creation)", // 0x2c0 +0x0
+    "(console method: returns at once)", // 0x2c8 +0xa880
+    "Write32BitValueTopOfPipeX", // 0x2d0 +0x3a3f0
+    "Write64BitValueTopOfPipeX", // 0x2d8 +0x3a590
+    "Write32BitValueBottomOfShaderX", // 0x2e0 +0x3a330
+    "GetExecutionCommandSizeX", // 0x2e8 +0xc880
+    "CloseBundleX", // 0x2f0 +0xc830
+    "(console X-method, unnamed: no messages in either driver build)", // 0x2f8 +0x39190
+    "(console X-method, unnamed: no messages in either driver build)", // 0x300 +0x39220
+    "SetGraphicsShaderLimitsX", // 0x308 +0x5e1a0
+    "SetComputeShaderLimitsX", // 0x310 +0x5df40
+    "SetResourceCompressionStateX", // 0x318 +0x34350
+    "DispatchMeshX", // 0x320 +0x933d0
+    "SetComputeRootSignature", // 0x328 +0x44950
+    "(console X-method, unnamed: no messages in either driver build)", // 0x330 +0x4f830
+    "SampleCountersX", // 0x338 +0x4f470
+    "(console X-method, unnamed: no messages in either driver build)", // 0x340 +0x4f850
+    "SetDeferredPrimitiveBatchBinningX", // 0x348 +0x5dfd0
+    "RSSetScissorRects (second entry; same validation)", // 0x350 +0x5dd30
+    "AtomicCopyBufferUINT (trap: not on the console) [PC order]", // 0x358 +0x2e330
+    "AtomicCopyBufferUINT64 (trap) [PC order]", // 0x360 +0x2e330
+    "OMSetDepthBounds [PC order]", // 0x368 +0x5db20
+    "SetSamplePositions", // 0x370 +0x38110
+    "ResolveSubresourceRegion", // 0x378 +0x50590
+    "SetViewInstanceMask (trap) [PC order]", // 0x380 +0x2e330
+    "WriteBufferImmediate", // 0x388 +0x2e340
+    "SetProtectedResourceSession [PC order]", // 0x390 +0xa880
+    "BeginRenderPass [PC order]", // 0x398 +0xa880
+    "EndRenderPass [PC order]", // 0x3a0 +0xa880
+    "InitializeMetaCommand [PC order]", // 0x3a8 +0xa880
+    "ExecuteMetaCommand [PC order]", // 0x3b0 +0xa880
+    "BuildRaytracingAccelerationStructure", // 0x3b8 +0x38310
+    "EmitRaytracingAccelerationStructurePostbuildInfo", // 0x3c0 +0x38480
+    "CopyRaytracingAccelerationStructure [PC order]", // 0x3c8 +0x383f0
+    "SetPipelineState1 [PC order]", // 0x3d0 +0x384b0
+    "DispatchRays", // 0x3d8 +0x38430
+    "(console X-method, unnamed: no messages in either driver build)", // 0x3e0 +0x38410
+    "(console X-method, unnamed: no messages in either driver build)", // 0x3e8 +0x38380
+    "RSSetShadingRate", // 0x3f0 +0x84fe0
+    "RSSetShadingRateImage", // 0x3f8 +0x85130
+    "RSSetShadingRateX", // 0x400 +0x85190
+    "DispatchMesh", // 0x408 +0x933b0
+    "BuildRaytracingAccelerationStructureBatchedX", // 0x410 +0x38500
+    "SyncTopOfPipeX", // 0x418 +0x388c0
+    "SyncBottomOfPipeX", // 0x420 +0x38880
+    "BuildRaytracingAccelerationStructureBatched2X", // 0x428 +0x384d0
+    "DispatchRaysX", // 0x430 +0x38530
+    "PrefetchMemoryX", // 0x438 +0x385e0
+    "PrefetchPipelineStateX", // 0x440 +0x385f0
+    "Write32BitValueBottomOfPipe2X", // 0x448 +0x38900
+    "Write64BitValueBottomOfPipe2X", // 0x450 +0x38a30
+    "(console X-method, unnamed: no messages in either driver build)", // 0x458 +0x387d0
+    "ResourceBarrierX", // 0x460 +0x387f0
+    "SetShaderScratchSpaceX", // 0x468 +0x38870
+    "SetSampleMaskX", // 0x470 +0x38580
+    "WritePRTLODStatisticsX", // 0x478 +0x6cf20
+    "(console X-method, unnamed: no messages in either driver build)", // 0x480 +0x40e0
+    "SetComputeShaderLaunchParametersX", // 0x488 +0x38820
+    "Barrier (enhanced barrier groups)", // 0x490 +0xa59b0
+    "(console method: returns at once)", // 0x498 +0xa880
+    "AllocateFromCommandAllocatorX", // 0x4a0 +0x38b30
+    "RehydrateRaytracingAccelerationStructureBatchedX", // 0x4a8 +0x38b70
+];
+
 #[cfg(test)]
 mod tests {
     //! Every slot of every console object the layer makes, against the
@@ -262,7 +421,11 @@ mod tests {
             }
         }
         let known: Vec<(&str, usize)> = NOT_WRITTEN.iter().map(|&(n, s)| (n, s)).collect();
-        assert_eq!(gaps, known);
+        let named: Vec<String> = gaps
+            .iter()
+            .map(|&(n, o)| if n == "list" { format!("{n} {o:#x} {}", LIST_NAMES[o / 8]) } else { format!("{n} {o:#x}") })
+            .collect();
+        assert_eq!(gaps, known, "not written now: {named:?}");
     }
 
     /// Every table is at least as long as the driver's, so a call to its
