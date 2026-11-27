@@ -1351,3 +1351,26 @@ fn create_xvd() {
         }
     }
 }
+
+#[test]
+fn create_xvd_pointer() {
+    let s = session();
+    trace_all(&s);
+    let (r, l) = both!("XCrdCreateXvdPointer": extern "system" fn(*const Adapter, *const u16, *const u16, u64, u32, *const u8, *const u8, *const u8) -> HRESULT);
+    let a = adapter();
+    let paths = [wz("[XUC:]\\ptr"), wz("")];
+    let target = wz("[XTE:]\\target.xvd");
+    let parts: Vec<Vec<u8>> = (0..3).map(|k| (0..0xe00).map(|i| (i as u8).wrapping_mul(k + 3)).collect()).collect();
+    for flags in 0..9u32 {
+        for mask in 0..8 {
+            for (with_target, blob, path) in [(true, 0x1000u64, 0), (false, 0x1000, 0), (true, 0, 0), (true, 0x1000, 1)] {
+                let part = |k: usize| if mask & (1 << k) != 0 { parts[k].as_ptr() } else { std::ptr::null() };
+                same(&format!("{flags} {mask} {with_target} {blob} {path}"), run(&s, |s| s.reply(accepting(|_, _| {})), |side| {
+                    let t = if with_target { target.as_ptr() } else { std::ptr::null() };
+                    let f = if side { r } else { l };
+                    f(&a, paths[path].as_ptr(), t, blob, flags, part(0), part(1), part(2))
+                }));
+            }
+        }
+    }
+}

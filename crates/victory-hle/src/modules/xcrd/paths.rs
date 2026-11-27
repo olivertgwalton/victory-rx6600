@@ -756,6 +756,105 @@ pub extern "system" fn XCrdCreateXVD(
     })())
 }
 
+/// 0x1800026b0: a pointer XVD: the CRD path, the path it points to,
+/// optional XVD header (0xe00 bytes), XVC information (0xda8) and embedded
+/// header (0xe00). Flags: 1 mark as streamed, 2 skip the pointer, 4.
+/// Each part's offset follows the one before it, given or not (as the
+/// library's: an embedded header without XVC information lands at 0).
+pub extern "system" fn XCrdCreateXvdPointer(
+    adapter: *const Adapter,
+    path: *const u16,
+    pointer: *const u16,
+    blob_size: u64,
+    flags: u32,
+    header: *const u8,
+    xvc: *const u8,
+    embedded: *const u8,
+) -> HRESULT {
+    result((|| {
+        check(flags & !7 == 0, "Invalid Create Pointer Flags.\n")?;
+        let (streamed, skip) = (flags & 1 != 0, flags & 2 != 0);
+        check(!adapter.is_null(), "Invalid Adapter Handle.\n")?;
+        check(!path.is_null(), "Invalid XcrdPath.\n")?;
+        if streamed {
+            check(header.is_null() == xvc.is_null(), "Header & XvcInfo must be either NULL or valid.\n")?;
+        }
+        check(xvc.is_null() || streamed, "XvcInfo only supported with MarkAsStreamed.\n")?;
+        check(header.is_null() || blob_size != 0, "BlobSize must not be 0, if Header is supplied.\n")?;
+        check(embedded.is_null() || !header.is_null(), "Xvd Header must be supplied, if Embedded Header is supplied.\n")?;
+        if pointer.is_null() {
+            check(skip, "Pointer path null is only supported for SkipPointer flag.\n")?;
+            check(streamed, "SkipPointer is only supported for MarkAsStreamable flag.\n")?;
+        } else {
+            check(!skip, "Pointer path should be null for SkipPointer flag.\n")?;
+        }
+        let path = text(path);
+        if path.is_empty() {
+            return Err(E_INVALIDARG);
+        }
+        let target = if pointer.is_null() { &[][..] } else { text(pointer) };
+        let mut size = (path.len() + target.len()) * 2 + 0x3c;
+        for (part, n) in [(header, 0xe00), (xvc, 0xda8), (embedded, 0xe00)] {
+            if !part.is_null() {
+                size += n;
+            }
+        }
+        let mut p = Payload::new(0x7800_00e0, size);
+        p.u32(0, size as u32);
+        if !target.is_empty() {
+            p.u32(0xc, 0x38);
+            p.u32(0x10, (target.len() * 2) as u32);
+        }
+        let path_at = p.read_u32(0x10) + 0x3a;
+        p.u32(4, path_at);
+        p.u32(8, (path.len() * 2) as u32);
+        p.u64(0x28, blob_size);
+        if !header.is_null() {
+            p.u32(0x14, path_at + 2 + (path.len() * 2) as u32);
+            p.u32(0x18, 0xe00);
+        }
+        if !xvc.is_null() {
+            let at = p.read_u32(0x18) + p.read_u32(0x14);
+            p.u32(0x1c, at);
+            p.u32(0x20, 0xda8);
+        }
+        if !embedded.is_null() {
+            let at = p.read_u32(0x20) + p.read_u32(0x1c);
+            p.u32(0x30, at);
+            p.u32(0x34, 0xe00);
+        }
+        let mut mode = 0;
+        if streamed {
+            mode |= 1;
+        }
+        if skip {
+            mode |= 2;
+        }
+        if flags & 4 != 0 {
+            mode |= 4;
+        }
+        p.u32(0x24, mode);
+        if !target.is_empty() {
+            let status = copy_string(p.body(), 0x38, target.len() * 2 + 2, target);
+            if status < 0 {
+                return Ok(status);
+            }
+        }
+        let status = copy_string(p.body(), path_at as usize, path.len() * 2 + 2, path);
+        if status < 0 {
+            return Ok(status);
+        }
+        for (part, field) in [(header, 0x14), (xvc, 0x1c), (embedded, 0x30)] {
+            if !part.is_null() {
+                let (at, n) = (p.read_u32(field) as usize, p.read_u32(field + 4) as usize);
+                // SAFETY: the caller's part of its fixed size.
+                p.put(at, unsafe { std::slice::from_raw_parts(part, n) });
+            }
+        }
+        Ok(send(handle_of(adapter), &mut p))
+    })())
+}
+
 pub(crate) fn exports() -> Vec<crate::HleExport> {
     use crate::hle_export;
     vec![
@@ -777,6 +876,7 @@ pub(crate) fn exports() -> Vec<crate::HleExport> {
         hle_export!(XCrdTrimXvd),
         hle_export!(XCrdTrimXvc),
         hle_export!(XCrdCreateXVD),
+        hle_export!(XCrdCreateXvdPointer),
         hle_export!(XCrdSetFlatContentPath),
         hle_export!(XCrdStorageQueryBlobAttributes),
         hle_export!(XCrdStreamingAdjustStreamingFlags),
