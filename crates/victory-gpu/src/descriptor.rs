@@ -1652,6 +1652,17 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     }
 }
 
+/// The unordered access view recorded at `handle`: its resource and its
+/// description in the host's layout (none: the resource's own), if the
+/// record holds one.
+pub(crate) fn unordered_view(handle: u64) -> Option<(usize, Option<[u32; 10]>)> {
+    let [_, i, generation] = record_at(handle)?;
+    match view_at(i, generation)? {
+        View::Unordered(resource, _, desc) => Some((resource, desc)),
+        _ => None,
+    }
+}
+
 /// The words of the record at `handle`, if they are a view's.
 pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
     if handle == 0 {

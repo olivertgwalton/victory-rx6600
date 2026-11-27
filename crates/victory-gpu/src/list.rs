@@ -1455,6 +1455,165 @@ extern "system" fn clear_dsv(
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
+/// List methods 0x1a8 and 0x1b0, `ClearUnorderedAccessViewUint/Float(gpu
+/// handle, cpu handle, resource, values, rect count, rects)`. The console's
+/// driver (GameOS `xgs12_10.dll` +0x178d0 and +0x17920) clears the view the
+/// CPU handle describes, with zeros for no values (+0xe5340), over the
+/// rectangles or all of it.
+extern "system" fn clear_uav_uint(
+    this: This,
+    _gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    // SAFETY: the title passes four values or none.
+    let values = unsafe { values.as_ref() }.copied().unwrap_or([0; 4]);
+    clear_uav(this, cpu, resource, values, false, count, rects);
+}
+
+extern "system" fn clear_uav_float(
+    this: This,
+    _gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    // SAFETY: the title passes four values or none.
+    let values = unsafe { values.as_ref() }.map_or([0; 4], |v| v.map(f32::to_bits));
+    clear_uav(this, cpu, resource, values, true, count, rects);
+}
+
+/// The host's half of the clears: the view (from the title's record at
+/// `record`) is made again in a ring of our own heaps, which the clear binds
+/// (it needs its view in the bound shader-visible heap); the next draw binds
+/// the title's heaps again.
+pub(super) fn clear_uav(
+    this: This,
+    record: u64,
+    resource: This,
+    values: [u32; 4],
+    float: bool,
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Direct3D12::D3D12_UNORDERED_ACCESS_VIEW_DESC;
+        let (Some(list), Some(host)) = (host_list(this), crate::host::host()) else {
+            return;
+        };
+        let Some((_, desc)) = crate::descriptor::unordered_view(record) else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("a UAV clear of a handle that holds no unordered view: left out"));
+            return;
+        };
+        let Some(texture) = crate::resource::host_resource(resource) else {
+            return;
+        };
+        let Some(ring) = uav_ring() else { return };
+        const UNORDERED_ACCESS: u32 = 0x8;
+        ensure_state(list, resource, UNORDERED_ACCESS);
+        let (cpu, visible, gpu) = ring.next();
+        let desc = desc.as_ref().map(|d| d.as_ptr().cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>());
+        let rects = (count > 0 && !rects.is_null()).then(|| {
+            // SAFETY: the title passes `count` rectangles, laid out as the host's.
+            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+        });
+        list.keep(&ring.visible);
+        // SAFETY: slots of our heaps, a live resource, an open list.
+        unsafe {
+            host.device.CreateUnorderedAccessView(texture, None, desc, cpu);
+            host.device.CreateUnorderedAccessView(texture, None, desc, visible);
+            list.list.SetDescriptorHeaps(&[Some(ring.visible.clone())]);
+            if float {
+                let v = values.map(f32::from_bits);
+                list.list.ClearUnorderedAccessViewFloat(gpu, cpu, texture, &v, rects.unwrap_or(&[]));
+            } else {
+                list.list.ClearUnorderedAccessViewUint(gpu, cpu, texture, &values, rects.unwrap_or(&[]));
+            }
+        }
+        with_state(this, |_, state| state.heaps_changed());
+    }
+    #[cfg(not(windows))]
+    let _ = (this, record, resource, values, float, count, rects);
+}
+
+/// Our heaps for UAV clears: a CPU-only one and a shader-visible one, used
+/// in turn (a slot comes round again after [`UAV_RING`] clears, long after
+/// the clear that had it ran).
+#[cfg(windows)]
+struct UavRing {
+    cpu: windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap,
+    visible: windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap,
+    size: u32,
+    next: std::sync::atomic::AtomicU32,
+}
+// SAFETY: descriptor heaps are free-threaded.
+#[cfg(windows)]
+unsafe impl Send for UavRing {}
+// SAFETY: as above; the counter is atomic.
+#[cfg(windows)]
+unsafe impl Sync for UavRing {}
+#[cfg(windows)]
+const UAV_RING: u32 = 4096;
+
+#[cfg(windows)]
+impl UavRing {
+    fn next(
+        &self,
+    ) -> (
+        windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE,
+        windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE,
+        windows::Win32::Graphics::Direct3D12::D3D12_GPU_DESCRIPTOR_HANDLE,
+    ) {
+        let at = (self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % UAV_RING * self.size) as usize;
+        // SAFETY: plain queries of heaps we made.
+        unsafe {
+            let mut cpu = self.cpu.GetCPUDescriptorHandleForHeapStart();
+            let mut visible = self.visible.GetCPUDescriptorHandleForHeapStart();
+            let mut gpu = self.visible.GetGPUDescriptorHandleForHeapStart();
+            cpu.ptr += at;
+            visible.ptr += at;
+            gpu.ptr += at as u64;
+            (cpu, visible, gpu)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn uav_ring() -> Option<&'static UavRing> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    static RING: std::sync::OnceLock<Option<UavRing>> = std::sync::OnceLock::new();
+    RING.get_or_init(|| {
+        let host = crate::host::host()?;
+        let heap = |flags| -> Option<ID3D12DescriptorHeap> {
+            // SAFETY: a plain heap description.
+            unsafe {
+                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: UAV_RING,
+                    Flags: flags,
+                    NodeMask: 0,
+                })
+            }
+            .ok()
+        };
+        Some(UavRing {
+            cpu: heap(D3D12_DESCRIPTOR_HEAP_FLAG_NONE)?,
+            visible: heap(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)?,
+            // SAFETY: a plain query.
+            size: unsafe { host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) },
+            next: std::sync::atomic::AtomicU32::new(0),
+        })
+    })
+    .as_ref()
+}
+
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
@@ -2275,7 +2434,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 52] = [
+const METHODS: [(usize, *const ()); 54] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -2316,6 +2475,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
+    (53, clear_uav_uint as *const ()),            // 0x1a8
+    (54, clear_uav_float as *const ()),           // 0x1b0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
     (68, state::depth_bounds as *const ()),       // 0x220 depth bounds

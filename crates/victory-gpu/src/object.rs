@@ -483,6 +483,11 @@ pub(crate) const fn stub_for(value: u32) -> Option<*const ()> {
     })
 }
 
+/// The S_OK stub, for tables that use it outside [`reference_stubs`].
+pub(crate) const fn stub_s_ok() -> *const () {
+    stub_ok as *const ()
+}
+
 /// The void stub (the driver's +0xa880).
 pub(crate) const VOID_STUB: *const () = stub_void as *const ();
 

@@ -497,6 +497,63 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     E_NOTIMPL
 }
 
+/// Device method 0x3a8 (GameOS `xgs12_10.dll` +0x6ca70): of the 32-byte
+/// description at `desc`, byte 0x18 when bit 31 of word 0xc, bits 20-28 of
+/// word 4 and bit 25 of word 0x14 are all set; -1 otherwise.
+pub(crate) extern "system" fn description_byte(_: This, desc: *const [u32; 8]) -> u32 {
+    // SAFETY: the title passes a description (null is tolerated here; the
+    // driver reads it unchecked).
+    let Some(d) = (unsafe { desc.as_ref() }) else { return u32::MAX };
+    if d[3] >> 31 != 0 && d[1] & 0x1ff0_0000 != 0 && d[5] & 0x0200_0000 != 0 {
+        d[6] & 0xff
+    } else {
+        u32::MAX
+    }
+}
+
+/// Device method 0x3b8 (+0xa1a00), trace data `(data, size)`: E_INVALIDARG
+/// without data or size; otherwise the driver writes it to its trace
+/// (+0xa1220), which answers E_FAIL while no capture tool has started one,
+/// as here.
+pub(crate) extern "system" fn trace_data(_: This, data: *const u8, size: u32) -> HRESULT {
+    if data.is_null() || size == 0 {
+        return E_INVALIDARG;
+    }
+    0x8000_4005_u32 as i32
+}
+
+/// What the device's setters keep (the driver keeps them in the device, or
+/// for 0x3c8 in a global): 0x190's three words, 0x198/0x420's capture
+/// flags, 0x3c8's word.
+pub(crate) static KEPT: std::sync::Mutex<([u64; 3], u32, u64)> = std::sync::Mutex::new(([0; 3], 0, 0));
+
+fn kept() -> std::sync::MutexGuard<'static, ([u64; 3], u32, u64)> {
+    KEPT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Device method 0x190 (+0xa1a70): keeps three words, returns nothing.
+pub(crate) extern "system" fn keep_three(_: This, a: u64, b: u64, c: u64) {
+    kept().0 = [a, b, c];
+}
+
+/// Device methods 0x198 (+0xa1a40: flag = bit 0) and 0x420 (+0xa1a20:
+/// flags as given): the driver keeps the flags and, with bit 0, begins a
+/// GPU capture (+0xa1450), else ends one (+0xa13c0), which is nothing
+/// without one going.
+/// shortcut: no capture is made here (no capture tool).
+pub(crate) extern "system" fn capture_bit(_: This, on: u8) {
+    kept().1 = u32::from(on & 1);
+}
+pub(crate) extern "system" fn capture_flags(_: This, flags: u32) {
+    kept().1 = flags;
+}
+
+/// Device method 0x3c8 (+0x4cbd0): keeps a word in a global, returns
+/// nothing.
+pub(crate) extern "system" fn keep_global(_: This, word: u64) {
+    kept().2 = word;
+}
+
 /// The host device's state: the console's device is removed when the host's is
 /// (VIctory 13185f5: the default answer, E_NOTIMPL, reads as a lost device).
 extern "system" fn removed_reason(_: This) -> HRESULT {
@@ -548,6 +605,12 @@ pub(crate) static FUNCTIONS: Table<160> = {
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
     f[55] = pipeline::create_variant as *const (); // 0x1b8 pipeline variant
+    f[50] = keep_three as *const (); // 0x190
+    f[51] = capture_bit as *const (); // 0x198
+    f[117] = description_byte as *const (); // 0x3a8
+    f[119] = trace_data as *const (); // 0x3b8
+    f[121] = keep_global as *const (); // 0x3c8
+    f[132] = capture_flags as *const (); // 0x420
     f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0

@@ -207,41 +207,27 @@ mod tests {
         ]
     }
 
-    fn stubs() -> Vec<*const ()> {
-        let mut s: Vec<*const ()> =
-            [0, 0x8000_4001, 0x8000_4005, 0x8007_0005, 1, u32::MAX, 0x887A_0004, 0x8000_4002].iter().filter_map(|&v| object::stub_for(v)).collect();
-        s.push(object::VOID_STUB);
-        s
-    }
-
     /// Every method the driver only answers a constant from answers it here
-    /// (called through the table, as a title calls it), unless the layer has
-    /// a method of its own there, which [`OWN_AT_CONSTANT`] names and says why.
+    /// (called through the layer's table, as a title calls it), but for the
+    /// methods of the layer's own [`OWN_AT_CONSTANT`] names and says why.
+    /// (Function addresses are not compared: thin LTO folds and copies them.)
     #[test]
     fn constant_methods_answer_as_the_driver() {
-        let stubs = stubs();
-        let mut own = Vec::new();
         for (name, spec, table, missing) in tables() {
             let t = table();
             for (i, s) in spec.iter().enumerate() {
                 let Kind::Const(v) = s.kind else { continue };
-                let Some(&f) = t.get(i) else {
-                    own.push((name, i, "beyond the table"));
+                if OWN_AT_CONSTANT.iter().any(|&(n, o, _)| n == name && o == i * 8) {
                     continue;
-                };
-                if stubs.contains(&f) {
-                    // SAFETY: a stub: it takes no arguments it reads.
-                    let call: extern "system" fn() -> u32 = unsafe { std::mem::transmute(f) };
-                    assert_eq!(call(), v, "{name} slot {:#x} (driver +{:#x})", i * 8, s.rva);
-                } else if missing(f, i) {
-                    own.push((name, i, "not written"));
-                } else {
-                    own.push((name, i, "own"));
                 }
+                let f = *t.get(i).unwrap_or_else(|| panic!("{name} slot {:#x} beyond the table", i * 8));
+                assert!(!missing(f, i), "{name} slot {:#x} (driver +{:#x}) not written", i * 8, s.rva);
+                // SAFETY: not one of the layer's own methods: a stub, which
+                // reads no arguments.
+                let call: extern "system" fn() -> u32 = unsafe { std::mem::transmute(f) };
+                assert_eq!(call(), v, "{name} slot {:#x} (driver +{:#x})", i * 8, s.rva);
             }
         }
-        let own: Vec<(&str, usize)> = own.iter().map(|&(n, i, _)| (n, i * 8)).collect();
-        assert_eq!(own, OWN_AT_CONSTANT.iter().map(|&(n, s, _)| (n, s)).collect::<Vec<_>>(), "constant slots with methods of the layer's own");
     }
 
     /// Every void method of the driver's is written (its stub returns at once).
@@ -313,16 +299,16 @@ const OWN_AT_CONSTANT: &[(&str, usize, &str)] = &[
 #[cfg(test)]
 #[rustfmt::skip]
 const NOT_WRITTEN: &[(&str, usize)] = &[
-    // device: 44
-    ("device", 0xf0), ("device", 0x150), ("device", 0x160), ("device", 0x168), ("device", 0x170), ("device", 0x178), ("device", 0x188), ("device", 0x190), ("device", 0x198), ("device", 0x1d8), ("device", 0x1e0), ("device", 0x1f8), ("device", 0x220), ("device", 0x240), ("device", 0x268), ("device", 0x290), ("device", 0x2a0), ("device", 0x2e0), ("device", 0x2e8), ("device", 0x2f0), ("device", 0x2f8), ("device", 0x328), ("device", 0x330), ("device", 0x368), ("device", 0x370), ("device", 0x378), ("device", 0x380), ("device", 0x388), ("device", 0x390), ("device", 0x398), ("device", 0x3a0), ("device", 0x3a8), ("device", 0x3b0), ("device", 0x3b8), ("device", 0x3c0), ("device", 0x3c8), ("device", 0x3d8), ("device", 0x400), ("device", 0x408), ("device", 0x420), ("device", 0x430), ("device", 0x440), ("device", 0x448), ("device", 0x450),
-    // queue: 9
-    ("queue", 0x40), ("queue", 0x48), ("queue", 0x70), ("queue", 0x98), ("queue", 0xc8), ("queue", 0xd8), ("queue", 0xe8), ("queue", 0xf0), ("queue", 0x128),
-    // list: 66
-    ("list", 0x58), ("list", 0x90), ("list", 0xd8), ("list", 0xf8), ("list", 0x188), ("list", 0x1a8), ("list", 0x1b0), ("list", 0x1b8), ("list", 0x1c0), ("list", 0x1c8), ("list", 0x1d0), ("list", 0x1d8), ("list", 0x1f8), ("list", 0x200), ("list", 0x208), ("list", 0x210), ("list", 0x218), ("list", 0x228), ("list", 0x260), ("list", 0x268), ("list", 0x270), ("list", 0x278), ("list", 0x288), ("list", 0x290), ("list", 0x298), ("list", 0x2a0), ("list", 0x2d0), ("list", 0x2d8), ("list", 0x2e0), ("list", 0x2e8), ("list", 0x2f0), ("list", 0x2f8), ("list", 0x300), ("list", 0x308), ("list", 0x310), ("list", 0x318), ("list", 0x330), ("list", 0x338), ("list", 0x340), ("list", 0x348), ("list", 0x350), ("list", 0x368), ("list", 0x370), ("list", 0x378), ("list", 0x388), ("list", 0x3b8), ("list", 0x3c0), ("list", 0x3c8), ("list", 0x3d0), ("list", 0x3d8), ("list", 0x3e0), ("list", 0x3e8), ("list", 0x3f8), ("list", 0x400), ("list", 0x410), ("list", 0x428), ("list", 0x430), ("list", 0x438), ("list", 0x440), ("list", 0x448), ("list", 0x450), ("list", 0x460), ("list", 0x468), ("list", 0x478), ("list", 0x488), ("list", 0x4a8),
+    // device: 38
+    ("device", 0xf0), ("device", 0x150), ("device", 0x160), ("device", 0x168), ("device", 0x170), ("device", 0x178), ("device", 0x188), ("device", 0x1d8), ("device", 0x1e0), ("device", 0x1f8), ("device", 0x220), ("device", 0x240), ("device", 0x268), ("device", 0x290), ("device", 0x2a0), ("device", 0x2e0), ("device", 0x2e8), ("device", 0x2f0), ("device", 0x2f8), ("device", 0x328), ("device", 0x330), ("device", 0x368), ("device", 0x370), ("device", 0x378), ("device", 0x380), ("device", 0x388), ("device", 0x390), ("device", 0x398), ("device", 0x3a0), ("device", 0x3b0), ("device", 0x3c0), ("device", 0x3d8), ("device", 0x400), ("device", 0x408), ("device", 0x430), ("device", 0x440), ("device", 0x448), ("device", 0x450),
+    // queue: 8
+    ("queue", 0x40), ("queue", 0x48), ("queue", 0x70), ("queue", 0xc8), ("queue", 0xd8), ("queue", 0xe8), ("queue", 0xf0), ("queue", 0x128),
+    // list: 64
+    ("list", 0x58), ("list", 0x90), ("list", 0xd8), ("list", 0xf8), ("list", 0x188), ("list", 0x1b8), ("list", 0x1c0), ("list", 0x1c8), ("list", 0x1d0), ("list", 0x1d8), ("list", 0x1f8), ("list", 0x200), ("list", 0x208), ("list", 0x210), ("list", 0x218), ("list", 0x228), ("list", 0x260), ("list", 0x268), ("list", 0x270), ("list", 0x278), ("list", 0x288), ("list", 0x290), ("list", 0x298), ("list", 0x2a0), ("list", 0x2d0), ("list", 0x2d8), ("list", 0x2e0), ("list", 0x2e8), ("list", 0x2f0), ("list", 0x2f8), ("list", 0x300), ("list", 0x308), ("list", 0x310), ("list", 0x318), ("list", 0x330), ("list", 0x338), ("list", 0x340), ("list", 0x348), ("list", 0x350), ("list", 0x368), ("list", 0x370), ("list", 0x378), ("list", 0x388), ("list", 0x3b8), ("list", 0x3c0), ("list", 0x3c8), ("list", 0x3d0), ("list", 0x3d8), ("list", 0x3e0), ("list", 0x3e8), ("list", 0x3f8), ("list", 0x400), ("list", 0x410), ("list", 0x428), ("list", 0x430), ("list", 0x438), ("list", 0x440), ("list", 0x448), ("list", 0x450), ("list", 0x460), ("list", 0x468), ("list", 0x478), ("list", 0x488), ("list", 0x4a8),
     // allocator: 2
     ("allocator", 0x50), ("allocator", 0x58),
-    // pipeline: 3
-    ("pipeline", 0x58), ("pipeline", 0x60), ("pipeline", 0x68),
+    // pipeline: 2
+    ("pipeline", 0x58), ("pipeline", 0x68),
     // descriptor heap: 1
     ("descriptor heap", 0x58),
     // resource: 1
@@ -545,5 +531,79 @@ mod bench_d3d12 {
             let release = slot::<extern "system" fn(This) -> u32>(v, 0x10);
             black_box(release(v));
         });
+    }
+}
+
+/// The small device, queue and pipeline methods, as the driver's code has
+/// them (the function cited in each).
+#[cfg(test)]
+mod small_methods {
+    use crate::object::{E_INVALIDARG, E_NOTIMPL, HRESULT, S_OK, This, slot};
+
+    /// Device 0x3a8 (+0x6ca70).
+    #[test]
+    fn device_description_byte() {
+        let d = crate::device::device();
+        let f = slot::<extern "system" fn(This, *const [u32; 8]) -> u32>(d, 0x3a8);
+        let mut w = [0u32; 8];
+        w[3] = 1 << 31;
+        w[1] = 1 << 20;
+        w[5] = 1 << 25;
+        w[6] = 0x1234_56ab;
+        assert_eq!(f(d, &w), 0xab);
+        for (i, bit) in [(3, 1 << 31), (1, 0x1ff0_0000), (5, 1 << 25)] {
+            let mut v = w;
+            v[i] &= !bit;
+            assert_eq!(f(d, &v), u32::MAX, "word {i}");
+        }
+    }
+
+    /// Device 0x3b8 (+0xa1a00, +0xa1220 without a capture).
+    #[test]
+    fn device_trace_data() {
+        let d = crate::device::device();
+        let f = slot::<extern "system" fn(This, *const u8, u32) -> HRESULT>(d, 0x3b8);
+        assert_eq!(f(d, std::ptr::null(), 4), E_INVALIDARG);
+        assert_eq!(f(d, [0u8; 4].as_ptr(), 0), E_INVALIDARG);
+        assert_eq!(f(d, [0u8; 4].as_ptr(), 4), 0x8000_4005_u32 as i32);
+    }
+
+    /// Device 0x190 (+0xa1a70), 0x198 (+0xa1a40), 0x420 (+0xa1a20), 0x3c8
+    /// (+0x4cbd0): kept.
+    #[test]
+    fn device_setters_keep_what_they_are_given() {
+        let d = crate::device::device();
+        slot::<extern "system" fn(This, u64, u64, u64)>(d, 0x190)(d, 1, 2, 3);
+        slot::<extern "system" fn(This, u8)>(d, 0x198)(d, 3);
+        let k = *crate::device::KEPT.lock().unwrap();
+        assert_eq!((k.0, k.1), ([1, 2, 3], 1));
+        slot::<extern "system" fn(This, u32)>(d, 0x420)(d, 6);
+        slot::<extern "system" fn(This, u64)>(d, 0x3c8)(d, 9);
+        let k = *crate::device::KEPT.lock().unwrap();
+        assert_eq!((k.1, k.2), (6, 9));
+    }
+
+    /// Queue 0x98 (+0x19460): S_OK whatever the kernel says.
+    #[test]
+    fn queue_kernel_notification_answers_s_ok() {
+        let f: extern "system" fn(This, u64, u64) -> HRESULT = {
+            let p = crate::queue::NEWER_FUNCTIONS.0[0x98 / 8];
+            // SAFETY: the slot's signature.
+            unsafe { std::mem::transmute(p) }
+        };
+        assert_eq!(f(std::ptr::null(), 0, 0), S_OK);
+    }
+
+    /// Pipeline 0x60 (+0x66040): E_NOTIMPL for a pipeline without the
+    /// driver's 0x4005cf00 type (set only by +0x4a3a0, which none of the
+    /// creation methods the layer has goes through).
+    #[test]
+    fn pipeline_0x60_is_not_implemented_for_ours() {
+        let f: extern "system" fn() -> HRESULT = {
+            let p = crate::pipeline::FUNCTIONS.0[0x60 / 8];
+            // SAFETY: the slot reads no arguments here.
+            unsafe { std::mem::transmute(p) }
+        };
+        assert_eq!(f(), E_NOTIMPL);
     }
 }

@@ -940,6 +940,9 @@ pub(crate) static FUNCTIONS: Table<24> = {
     f[0] = query as *const ();
     f[2] = release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
+    // 0x60 (+0x66040): E_NOTIMPL for pipelines without the driver's
+    // 0x4005cf00 type, which none of ours have.
+    f[12] = object::not_implemented as *const (); // 0x60
     Table(f)
 };
 

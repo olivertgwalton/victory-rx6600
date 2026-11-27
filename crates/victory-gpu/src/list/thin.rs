@@ -470,6 +470,7 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+const CLEAR_UAV: u64 = after(17);
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -646,6 +647,47 @@ extern "system" fn clear_dsv(
         &[bytes_of(view.as_ptr(), RECORD), bytes_of(rects, count as usize)],
     );
 }
+extern "system" fn clear_uav_uint(
+    this: This,
+    _gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    // SAFETY: the title passes four values or none.
+    let values = unsafe { values.as_ref() }.copied().unwrap_or([0; 4]);
+    record_uav_clear(this, cpu, resource, values, false, count, rects);
+}
+extern "system" fn clear_uav_float(
+    this: This,
+    _gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    // SAFETY: the title passes four values or none.
+    let values = unsafe { values.as_ref() }.map_or([0; 4], |v| v.map(f32::to_bits));
+    record_uav_clear(this, cpu, resource, values, true, count, rects);
+}
+/// The view's record is copied: the handle may be written again before the
+/// list is played.
+fn record_uav_clear(this: This, cpu: u64, resource: This, values: [u32; 4], float: bool, count: u32, rects: *const Rect) {
+    if cpu == 0 || resource.is_null() {
+        return;
+    }
+    let count = if rects.is_null() { 0 } else { count };
+    let view = record(cpu);
+    let v = |i: usize| u64::from(values[i]) | u64::from(values[i + 1]) << 32;
+    front(this).put_with(
+        CLEAR_UAV,
+        &[u64::from(count), resource as u64, u64::from(float), v(0), v(2)],
+        &[bytes_of(view.as_ptr(), RECORD), bytes_of(rects, count as usize)],
+    );
+}
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -767,6 +809,10 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                     at(w, 3 + RECORD, n),
                 );
             }
+            CLEAR_UAV => {
+                let v = [w[3] as u32, (w[3] >> 32) as u32, w[4] as u32, (w[4] >> 32) as u32];
+                super::clear_uav(list, w[5..].as_ptr() as u64, w[1] as This, v, w[2] != 0, n as u32, at(w, 5 + RECORD, n));
+            }
             COPY_TEXTURE => {
                 let step = size_of::<CopyLocation>().div_ceil(8);
                 let boxed = (w[1] >> 32) as usize;
@@ -803,7 +849,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     f
 }
 
-const MINE: [(usize, *const ()); 50] = [
+const MINE: [(usize, *const ()); 52] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
     (12, draw as *const ()),
@@ -839,6 +885,8 @@ const MINE: [(usize, *const ()); 50] = [
     (50, targets as *const ()),
     (51, clear_dsv as *const ()),
     (52, clear_rtv as *const ()),
+    (53, clear_uav_uint as *const ()),
+    (54, clear_uav_float as *const ()),
     (59, execute_indirect as *const ()),
     (60, copy_memory as *const ()),
     (68, depth_bounds as *const ()),
