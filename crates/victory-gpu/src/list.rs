@@ -1518,29 +1518,50 @@ pub(super) fn clear_uav(
         let Some(ring) = uav_ring() else { return };
         const UNORDERED_ACCESS: u32 = 0x8;
         ensure_state(list, resource, UNORDERED_ACCESS);
-        let (cpu, visible, gpu) = ring.next();
         let desc = desc.as_ref().map(|d| d.as_ptr().cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>());
         let rects = (count > 0 && !rects.is_null()).then(|| {
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         list.keep(&ring.visible);
-        // SAFETY: slots of our heaps, a live resource, an open list.
-        unsafe {
-            host.device.CreateUnorderedAccessView(texture, None, desc, cpu);
-            host.device.CreateUnorderedAccessView(texture, None, desc, visible);
-            list.list.SetDescriptorHeaps(&[Some(ring.visible.clone())]);
-            if float {
-                let v = values.map(f32::from_bits);
-                list.list.ClearUnorderedAccessViewFloat(gpu, cpu, texture, &v, rects.unwrap_or(&[]));
-            } else {
-                list.list.ClearUnorderedAccessViewUint(gpu, cpu, texture, &values, rects.unwrap_or(&[]));
-            }
-        }
+        // SAFETY: an open list and a live resource.
+        unsafe { host_clear_uav(&host.device, &list.list, ring, texture, desc, values, float, rects.unwrap_or(&[])) };
         with_state(this, |_, state| state.heaps_changed());
     }
     #[cfg(not(windows))]
     let _ = (this, record, resource, values, float, count, rects);
+}
+
+/// The clear on the host: the view made in a slot of each of our heaps, the
+/// shader-visible one bound, the clear recorded.
+///
+/// # Safety
+/// `list` is open and `texture` live.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)] // the clear's own arguments
+unsafe fn host_clear_uav(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList,
+    ring: &UavRing,
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    desc: Option<*const windows::Win32::Graphics::Direct3D12::D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+    values: [u32; 4],
+    float: bool,
+    rects: &[windows::Win32::Foundation::RECT],
+) {
+    let (cpu, visible, gpu) = ring.next();
+    // SAFETY: slots of our heaps, a live resource, an open list.
+    unsafe {
+        device.CreateUnorderedAccessView(texture, None, desc, cpu);
+        device.CreateUnorderedAccessView(texture, None, desc, visible);
+        list.SetDescriptorHeaps(&[Some(ring.visible.clone())]);
+        if float {
+            let v = values.map(f32::from_bits);
+            list.ClearUnorderedAccessViewFloat(gpu, cpu, texture, &v, rects);
+        } else {
+            list.ClearUnorderedAccessViewUint(gpu, cpu, texture, &values, rects);
+        }
+    }
 }
 
 /// Our heaps for UAV clears: a CPU-only one and a shader-visible one, used
@@ -2842,5 +2863,82 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+}
+
+/// List 0x1a8/0x1b0 on the host GPU: a buffer cleared through our heaps reads
+/// back as the values, as integers and as floats.
+#[cfg(all(test, windows))]
+mod uav_clear_on_the_card {
+    use super::*;
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    fn buffer(host: &crate::host::Host, kind: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES) -> ID3D12Resource {
+        let props = D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        let mut r: Option<ID3D12Resource> = None;
+        // SAFETY: plain descriptions.
+        unsafe { host.device.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut r) }.unwrap();
+        r.unwrap()
+    }
+
+    fn cleared(values: [u32; 4], float: bool, format: DXGI_FORMAT) -> Option<Vec<u32>> {
+        let host = crate::host::host()?;
+        let ring = uav_ring()?;
+        let target = buffer(host, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        let back = buffer(host, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Buffer: D3D12_BUFFER_UAV { NumElements: 64, ..Default::default() } },
+        };
+        // SAFETY: objects of our own, used in order and waited for.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+            let list: ID3D12GraphicsCommandList = host.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).ok()?;
+            host_clear_uav(&host.device, &list, ring, &target, Some(&desc), values, float, &[]);
+            list.ResourceBarrier(&[crate::host::transition(&target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.CopyBufferRegion(&back, 0, &target, 0, 256);
+            list.Close().ok()?;
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+            host.queue().ExecuteCommandLists(&[Some(list.cast().ok()?)]);
+            host.queue().Signal(&fence, 1).ok()?;
+            let start = std::time::Instant::now();
+            while fence.GetCompletedValue() < 1 {
+                if start.elapsed().as_secs() > 10 {
+                    return None;
+                }
+                std::thread::yield_now();
+            }
+            let mut data = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut data)).ok()?;
+            let out = std::slice::from_raw_parts(data.cast::<u32>(), 64).to_vec();
+            back.Unmap(0, None);
+            Some(out)
+        }
+    }
+
+    #[test]
+    fn a_buffer_cleared_reads_back_as_the_values() {
+        let Some(words) = cleared([0xdead_beef, 0, 0, 0], false, DXGI_FORMAT_R32_UINT) else {
+            eprintln!("no host GPU here: the clear is not run");
+            return;
+        };
+        eprintln!("cleared on the host GPU: {:#x}", words[0]);
+        assert!(words.iter().all(|&w| w == 0xdead_beef), "{words:x?}");
+        let words = cleared([1.5f32.to_bits(), 0, 0, 0], true, DXGI_FORMAT_R32_FLOAT).unwrap();
+        assert!(words.iter().all(|&w| w == 1.5f32.to_bits()), "{words:x?}");
     }
 }
